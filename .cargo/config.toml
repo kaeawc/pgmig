@@ -1,0 +1,10 @@
+[alias]
+# The inner loop: type-check everything (no codegen, no linking).
+c = "check --all-targets"
+# Lint like CI does.
+lint = "clippy --all-targets -- -D warnings"
+# Tests through nextest (one process per test, parallel across binaries).
+t = "nextest run"
+
+[env]
+RUST_BACKTRACE = { value = "short", force = false }

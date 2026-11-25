@@ -1,0 +1,20 @@
+[package]
+name = "pgmig-conn"
+description = "Synchronous Postgres connection used for targets and shadow databases, with SQLSTATE errors."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+# Doctests compile and link one binary per example; unit tests cover the same ground far faster.
+doctest = false
+
+[dependencies]
+postgres = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

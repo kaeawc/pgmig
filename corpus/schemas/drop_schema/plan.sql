@@ -1,0 +1,2 @@
+DROP TABLE old.t;
+DROP SCHEMA old;

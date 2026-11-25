@@ -1,0 +1,2 @@
+# Corpus cases that fail on pgmem but pass on Postgres, one per line: `<area>/<case>  # <pgmem issue>`.
+# CI fails when this list is out of date in either direction.

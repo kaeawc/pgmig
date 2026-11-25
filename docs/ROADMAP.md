@@ -94,6 +94,7 @@ fix or document using a real Postgres shadow in the meantime.
 | pgmem issue | Needed by |
 |---|---|
 | [kaeawc/pgmem#145](https://github.com/kaeawc/pgmem/issues/145) Stable in-process embedding API | M0 |
+| [kaeawc/pgmem#164](https://github.com/kaeawc/pgmem/issues/164) `pg_get_keywords()` (keyword quoting test runs on Postgres only until then) | M0 |
 | [kaeawc/pgmem#162](https://github.com/kaeawc/pgmem/issues/162) LICENSE file and crate publishing | first crates.io release |
 | [kaeawc/pgmem#147](https://github.com/kaeawc/pgmem/issues/147) `pg_constraint.connamespace` is always `public` | M1 |
 | [kaeawc/pgmem#148](https://github.com/kaeawc/pgmem/issues/148) `pg_get_indexdef` drops `INCLUDE` | M1 |

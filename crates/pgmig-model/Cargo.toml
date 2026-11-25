@@ -1,0 +1,18 @@
+[package]
+name = "pgmig-model"
+description = "pgmig's schema model: objects, identities and SQL identifier quoting. No I/O."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+# Doctests compile and link one binary per example; unit tests cover the same ground far faster.
+doctest = false
+
+[dependencies]
+
+[lints]
+workspace = true

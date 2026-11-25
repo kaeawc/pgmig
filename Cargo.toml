@@ -1,0 +1,73 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "apps/pgmig"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+license = "Apache-2.0"
+repository = "https://github.com/kaeawc/pgmig"
+publish = false
+
+# Every crate inherits deps from here, so each dependency is built with one feature set no matter
+# which `-p` subset you build. New deps: `default-features = false` plus only the features used.
+[workspace.dependencies]
+pgmig = { path = "crates/pgmig" }
+pgmig-conn = { path = "crates/pgmig-conn" }
+pgmig-diff = { path = "crates/pgmig-diff" }
+pgmig-inspect = { path = "crates/pgmig-inspect" }
+pgmig-model = { path = "crates/pgmig-model" }
+pgmig-plan = { path = "crates/pgmig-plan" }
+pgmig-shadow = { path = "crates/pgmig-shadow" }
+
+# Pinned to a revision until pgmem publishes to crates.io (kaeawc/pgmem#162). Versions of shared
+# dependencies (postgres, tokio) must match pgmem's or `cargo deny` fails on duplicates.
+pgmem = { git = "https://github.com/kaeawc/pgmem", rev = "351ededb9aa02d95aad06c3d316d736bb2ca5c94" }
+
+anyhow = { version = "1", default-features = false, features = ["std"] }
+clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+postgres = { version = "0.19", default-features = false }
+thiserror = { version = "2", default-features = false, features = ["std"] }
+
+[workspace.lints.rust]
+# `deny`, not `forbid`: the C ABI crate for the Go package needs a local `allow`.
+unsafe_code = "deny"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "warn"
+unwrap_used = "warn"
+await_holding_lock = "deny"
+
+[profile.dev]
+# Line tables keep backtraces useful at a fraction of full debuginfo's codegen + link time.
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.dev.build-override]
+opt-level = 0
+debug = false
+
+[profile.release]
+codegen-units = 16
+incremental = true
+strip = "debuginfo"
+
+# What ships.
+[profile.dist]
+inherits = "release"
+codegen-units = 1
+incremental = false
+lto = "thin"
+strip = true
+
+# CI: from-scratch builds where incremental state is never reused.
+# `cargo nextest run --cargo-profile ci`.
+[profile.ci]
+inherits = "dev"
+debug = false
+incremental = false

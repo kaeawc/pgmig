@@ -61,7 +61,7 @@ one integration-test binary per crate, injected clock, doctests off).
 |---|---|
 | `pgmig-model` | The schema model: object kinds, identities, references; canonical serialization and the schema fingerprint (`INS-4`). No I/O. |
 | `pgmig-sql` | Statement splitting (dollar quotes, `-- pgmig:` directives), SQL quoting and printing helpers, source positions for diagnostics. |
-| `pgmig-conn` | A small synchronous `Conn` trait (`execute`, `query` returning text values, transactions, SQLSTATE errors) with two implementations: real Postgres over the `postgres` crate with rustls, and embedded pgmem. |
+| `pgmig-conn` | A synchronous `Conn` (`batch`, `query` returning text values, SQLSTATE errors) over the `postgres` crate, used for real servers and for pgmem alike. TLS (rustls) comes in M1. |
 | `pgmig-shadow` | The shadow database: create, wipe, load SQL files with errors mapped back to file and line, and fork (`SHD-1..4`). |
 | `pgmig-inspect` | Catalog queries → `Model`, per Postgres major version, scoped by include/exclude filters. |
 | `pgmig-diff` | `Model × Model → Vec<Change>`. |
@@ -78,15 +78,17 @@ one integration-test binary per crate, injected clock, doctests off).
 
 Migration work is a handful of sequential round trips; async buys nothing and complicates every
 binding (no runtime to carry across the C ABI, no `Send` puzzles in PyO3/napi). The core is
-synchronous. pgmem's embedded path is synchronous too, and the `postgres` crate (which pgmem also
-uses, at the same version) gives a synchronous client for real servers.
+synchronous. The `postgres` crate (which pgmem also uses, at the same version) gives a synchronous
+client for both real servers and pgmem.
 
 ## Shadow database and pgmem
 
-pgmem is a pure-Rust, in-memory, Postgres-compatible database. pgmig embeds it in-process through
-its execution crates (`pgmem-exec`, `pgmem-storage`, `pgmem-parse`, `pgmem-types`), without the wire
-protocol layer or tokio. pgmig wraps it behind `pgmig-conn`'s `Conn` trait, so the inspector, planner
-and tests never know which backend they're on.
+pgmem is a pure-Rust, in-memory, Postgres-compatible database. pgmig starts it in-process through
+its public `pgmem::Server` API (a server on a loopback port, with its own small runtime thread) and
+connects with the same `postgres` client it uses for real servers. One client code path for both
+backends means the inspector, planner and tests never know which one they're on. When pgmem offers
+a stable embedding API without the wire layer (kaeawc/pgmem#145), `pgmig-conn` can switch to it
+without changing its callers.
 
 Rules:
 
@@ -97,9 +99,8 @@ Rules:
 - **Fall back to a real server.** If desired-state SQL needs something pgmem lacks (an extension like
   PostGIS, an unsupported statement), the user points `shadow` at a real Postgres DSN. Errors from
   pgmem for unsupported features say so and suggest this.
-- **Stable surface.** pgmig depends on a small embedding facade in pgmem rather than on its executor
-  internals (pgmem issue: stable embedding API). Until that exists, the dependency is pinned to a git
-  revision and confined to `pgmig-conn`.
+- **Stable surface.** pgmig uses only pgmem's public `Server` API, never its executor internals.
+  The dependency is pinned to a git revision until pgmem is on crates.io (kaeawc/pgmem#162).
 
 pgmem gaps that block pgmig features are tracked in [docs/ROADMAP.md](docs/ROADMAP.md#pgmem-dependencies).
 

@@ -1,0 +1,23 @@
+[package]
+name = "pgmig-cli"
+description = "The pgmig command-line tool."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "pgmig"
+path = "src/main.rs"
+test = false
+doctest = false
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+pgmig = { workspace = true }
+
+[lints]
+workspace = true

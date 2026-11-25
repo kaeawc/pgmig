@@ -1,0 +1,21 @@
+[package]
+name = "pgmig-shadow"
+description = "The shadow database pgmig executes desired-state SQL in: embedded pgmem or an empty real Postgres."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+# Doctests compile and link one binary per example; unit tests cover the same ground far faster.
+doctest = false
+
+[dependencies]
+pgmig-conn = { workspace = true }
+pgmem = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

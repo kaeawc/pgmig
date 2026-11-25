@@ -1,0 +1,19 @@
+[package]
+name = "pgmig-diff"
+description = "Compares two schema models and lists the changes between them."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+# Doctests compile and link one binary per example; unit tests cover the same ground far faster.
+doctest = false
+
+[dependencies]
+pgmig-model = { workspace = true }
+
+[lints]
+workspace = true
