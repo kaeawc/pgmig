@@ -17,6 +17,10 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
   that directory, first. Paths are relative to the importing file, each file loads once, and an
   import cycle is an error naming the files. Files without imports keep lexical order.
 - `-- pgmig:<name> args` directive comments are parsed (new crate `pgmig-sql`).
+- `pgmig schema apply --url <target> --to <desired>`: plan, show, confirm and execute. Each batch
+  runs in a transaction; a failure rolls it back and names the statement and how many earlier
+  batches stayed applied. `--dry-run` prints the plan; without a terminal it needs
+  `--auto-approve`.
 - Enum types: create, drop, add values at a position, and rename a value (planned only when one
   label changes in place; the statement carries a comment saying stored values change). Removing
   or reordering values is reported as unsupported. `ADD VALUE` is planned first, and the plan marks
