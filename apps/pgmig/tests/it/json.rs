@@ -75,6 +75,31 @@ fn inspect_prints_the_model() {
 }
 
 #[test]
+fn fingerprint_prints_one_value_for_a_database_and_its_sql() {
+    let (shadow, _keep) = shadow_arg();
+    let a = SqlFile::new(A);
+    let text = pgmig(&["schema", "fingerprint", &a.path(), "--shadow", &shadow]);
+    assert_eq!(code(&text), Some(0));
+    assert!(text.stderr.is_empty());
+    let printed = String::from_utf8(text.stdout).expect("utf-8");
+    let fp = printed.strip_suffix('\n').expect("one line");
+    assert!(fp.starts_with("h1:") && !fp.contains('\n'), "{printed}");
+
+    let db = TestDb::new();
+    db.connect().batch(A).expect("load");
+    let out = pgmig(&["schema", "fingerprint", &db.conninfo, "--format", "json"]);
+    assert_eq!(code(&out), Some(0));
+    assert_eq!(parse(&out), json!({ "fingerprint": fp }));
+
+    // Scope flags apply: excluding the only table leaves an empty database's fingerprint.
+    let empty = SqlFile::new("");
+    let none = pgmig(&["schema", "fingerprint", &empty.path(), "--shadow", &shadow]);
+    let excluded = pgmig(&["schema", "fingerprint", &a.path(), "--shadow", &shadow, "--exclude", "public.t"]);
+    assert_eq!(String::from_utf8_lossy(&excluded.stdout), String::from_utf8_lossy(&none.stdout));
+    assert_ne!(String::from_utf8_lossy(&none.stdout), printed);
+}
+
+#[test]
 fn diff_prints_changes_and_statements() {
     let (shadow, _keep) = shadow_arg();
     let (a, b) = (SqlFile::new(A), SqlFile::new(B));

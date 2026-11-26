@@ -59,6 +59,23 @@ pub struct InspectResponse {
     pub sql: String,
 }
 
+/// `schema fingerprint`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FingerprintRequest {
+    pub source: Source,
+    #[serde(default)]
+    pub shadow: ShadowSpec,
+    #[serde(default)]
+    pub options: Options,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FingerprintResponse {
+    /// `h1:<base64 SHA-256>` of the managed objects' canonical form ([`pgmig_model::canonical`]).
+    pub fingerprint: String,
+}
+
 /// `schema validate`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -870,6 +887,11 @@ pub fn schema_inspect(req: &InspectRequest) -> Result<InspectResponse, ApiError>
     Ok(InspectResponse { sql: plan.to_sql(), plan, model })
 }
 
+/// [`crate::schema_fingerprint`].
+pub fn schema_fingerprint(req: &FingerprintRequest) -> Result<FingerprintResponse, ApiError> {
+    Ok(FingerprintResponse { fingerprint: crate::schema_fingerprint(&req.source, &req.shadow, &req.options)? })
+}
+
 /// [`crate::schema_validate`]: errors in the files are diagnostics; an `Err` means they could not
 /// be checked.
 pub fn schema_validate(req: &ValidateRequest) -> Result<ValidateResponse, ApiError> {
@@ -1001,7 +1023,10 @@ mod tests {
         let db = Source::Database("postgres://localhost/db".into());
         let pg = ShadowSpec::Postgres("host=localhost dbname=shadow".into());
         round_trip(&DiffRequest { from: db.clone(), to: sql.clone(), shadow: pg.clone(), options: options() });
-        round_trip(&InspectRequest { source: db, shadow: ShadowSpec::Pgmem, options: Options::default() });
+        round_trip(&InspectRequest { source: db.clone(), shadow: ShadowSpec::Pgmem, options: Options::default() });
+        round_trip(&FingerprintRequest { source: db, shadow: pg.clone(), options: options() });
+        let req: FingerprintRequest = serde_json::from_str(r#"{"source":{"kind":"sql","data":"s.sql"}}"#).expect("request");
+        assert_eq!((req.shadow, req.options), (ShadowSpec::Pgmem, Options::default()));
         round_trip(&ValidateRequest { source: sql.clone(), shadow: pg.clone() });
         round_trip(&PlanApplyRequest { target: "host=localhost".into(), desired: sql, shadow: pg, options: options() });
         round_trip(&ApplyRequest { target: "host=localhost".into(), plan: plan() });
@@ -1058,6 +1083,8 @@ mod tests {
             vec![Change::CreateSchema("app".into()), Change::SetNotNull { table: QualName::new("app", "t"), column: "id".into() }];
         round_trip(&DiffResponse { plan: plan(), sql: plan().to_sql(), changes: changes.clone() });
         round_trip(&InspectResponse { plan: plan(), sql: plan().to_sql(), model: Model::empty_database() });
+        let fp = FingerprintResponse { fingerprint: crate::fingerprint(&Model::empty_database()) };
+        assert_eq!(round_trip(&fp), format!(r#"{{"fingerprint":"{}"}}"#, fp.fingerprint));
         round_trip(&PlanApplyResponse { plan: plan(), sql: plan().to_sql(), changes });
         round_trip(&ApplyReport { batches: 2, statements: 5 });
         round_trip(&MigrateDiffResponse {

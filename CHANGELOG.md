@@ -8,6 +8,8 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
 
 ### Added
 
+- `pgmig schema fingerprint <source>`: a stable `h1:` hash of the managed schema, the same for a
+  live database, SQL files or a migration replay, on pgmem and Postgres 15–18.
 - `migrate apply --format json` reports pending files, per-file status and per-statement timings
   (index, line, hash, milliseconds; no SQL text), and a failure carries the partial report.
 - Adopting existing databases: `pgmig migrate baseline <name>` writes the live schema as the first
