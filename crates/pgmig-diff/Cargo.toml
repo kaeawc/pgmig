@@ -16,6 +16,10 @@ doctest = false
 
 [dependencies]
 pgmig-model = { workspace = true }
+serde = { workspace = true }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+serde_json = { workspace = true }

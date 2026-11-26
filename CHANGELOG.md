@@ -21,6 +21,9 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
   runs in a transaction; a failure rolls it back and names the statement and how many earlier
   batches stayed applied. `--dry-run` prints the plan; without a terminal it needs
   `--auto-approve`.
+- Library API with serde types (`pgmig::api`): one request and response per command, `Model`,
+  `Change` and `Plan` serializable, structured errors (including apply outcomes), and unknown request
+  fields refused. The CLI is a thin formatter over it.
 - `--include` / `--exclude` globs over `[kind:]schema.object[.column]` on `schema diff`, `inspect`
   and `apply`, applied to both sides. `--schema <name>` manages one schema and prints unqualified
   names; `apply` always executes qualified names.
