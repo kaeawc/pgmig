@@ -1,6 +1,20 @@
 //! `diff(a, b)`: the changes that turn model `a` into model `b`.
+//!
+//! # Enum values
+//!
+//! The catalog cannot say whether a value was renamed or dropped and another added, so the diff
+//! follows one conservative rule. Comparing an enum's values in sort order:
+//!
+//! - the old values appear, in order, among the new ones: each new value is added at its position
+//!   ([`Change::AddEnumValue`], left to right, `BEFORE` the first old value for a new first value
+//!   and `AFTER` its predecessor otherwise);
+//! - the same number of values, and exactly one position holds a different value that is not among
+//!   the old ones: that value is renamed ([`Change::RenameEnumValue`]);
+//! - anything else (a value removed, values reordered, a rename together with an addition) is
+//!   [`Change::UnsupportedEnumChange`], which the planner refuses: Postgres cannot remove or
+//!   reorder enum values in place.
 
-use pgmig_model::{Column, Model, QualName, Table};
+use pgmig_model::{Column, Enum, Model, QualName, Table};
 
 /// An object that can carry a comment. New kinds (constraints, indexes) add a variant here, a
 /// matching `Object` in the planner, and a comparison in [`diff`].
@@ -9,6 +23,17 @@ pub enum CommentTarget {
     Schema(String),
     Table(QualName),
     Column(QualName, String),
+    /// A type that is not a table's row type (an enum).
+    Type(QualName),
+}
+
+/// Where [`Change::AddEnumValue`] puts the new value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnumPosition {
+    Before(String),
+    After(String),
+    /// After the last value (only used when the enum has no values yet).
+    End,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +78,25 @@ pub enum Change {
         table: QualName,
         column: String,
     },
+    CreateEnum(Enum),
+    DropEnum(Enum),
+    AddEnumValue {
+        name: QualName,
+        value: String,
+        position: EnumPosition,
+    },
+    RenameEnumValue {
+        name: QualName,
+        from: String,
+        to: String,
+    },
+    /// The values changed in a way that cannot be planned (see the module doc); the planner
+    /// reports it as an error.
+    UnsupportedEnumChange {
+        name: QualName,
+        from: Vec<String>,
+        to: Vec<String>,
+    },
     /// `COMMENT ON ... IS <comment>`; `None` removes the comment. Never emitted for an object
     /// that is being dropped.
     SetComment {
@@ -73,6 +117,18 @@ pub fn diff(a: &Model, b: &Model) -> Vec<Change> {
     }
     for name in a.schemas.keys().filter(|n| !b.schemas.contains_key(*n)) {
         changes.push(Change::DropSchema(name.clone()));
+    }
+
+    for (name, e) in &b.enums {
+        let old = a.enums.get(name);
+        match old {
+            None => changes.push(Change::CreateEnum(e.clone())),
+            Some(old) => diff_enum_values(old, e, &mut changes),
+        }
+        set_comment(CommentTarget::Type(name.clone()), old.and_then(|o| o.comment.as_ref()), e.comment.as_ref(), &mut changes);
+    }
+    for e in a.enums.values().filter(|e| !b.enums.contains_key(&e.name)) {
+        changes.push(Change::DropEnum(e.clone()));
     }
 
     for (name, table) in &b.tables {
@@ -99,6 +155,35 @@ fn set_comment(target: CommentTarget, old: Option<&String>, new: Option<&String>
     if old != new {
         changes.push(Change::SetComment { target, comment: new.cloned() });
     }
+}
+
+fn diff_enum_values(a: &Enum, b: &Enum, changes: &mut Vec<Change>) {
+    let (old, new) = (&a.labels, &b.labels);
+    if old == new {
+        return;
+    }
+    let name = || b.name.clone();
+    let kept: Vec<&String> = new.iter().filter(|l| old.contains(l)).collect();
+    if kept.len() == old.len() && kept.iter().zip(old).all(|(k, o)| *k == o) {
+        for (i, value) in new.iter().enumerate().filter(|(_, l)| !old.contains(l)) {
+            let position = match (i, old.first()) {
+                (0, Some(first)) => EnumPosition::Before(first.clone()),
+                (0, None) => EnumPosition::End,
+                _ => EnumPosition::After(new[i - 1].clone()),
+            };
+            changes.push(Change::AddEnumValue { name: name(), value: value.clone(), position });
+        }
+        return;
+    }
+    let differing: Vec<usize> = (0..old.len().min(new.len())).filter(|&i| old[i] != new[i]).collect();
+    if old.len() == new.len()
+        && let [i] = differing[..]
+        && !old.contains(&new[i])
+    {
+        changes.push(Change::RenameEnumValue { name: name(), from: old[i].clone(), to: new[i].clone() });
+        return;
+    }
+    changes.push(Change::UnsupportedEnumChange { name: name(), from: old.clone(), to: new.clone() });
 }
 
 fn diff_table(a: &Table, b: &Table, changes: &mut Vec<Change>) {
@@ -251,5 +336,75 @@ mod tests {
     #[test]
     fn the_public_schemas_default_comment_is_not_a_difference() {
         assert!(diff(&Model::empty_database(), &Model::empty_database()).is_empty());
+    }
+
+    fn enums(labels: &[&str]) -> Model {
+        let mut m = Model::empty_database();
+        let name = QualName::new("public", "mood");
+        m.enums.insert(name.clone(), Enum { name, labels: labels.iter().map(|l| l.to_string()).collect(), comment: None });
+        m
+    }
+
+    fn mood() -> QualName {
+        QualName::new("public", "mood")
+    }
+
+    fn add(value: &str, position: EnumPosition) -> Change {
+        Change::AddEnumValue { name: mood(), value: value.into(), position }
+    }
+
+    #[test]
+    fn enums_are_created_and_dropped() {
+        let m = enums(&["a"]);
+        let e = m.enums[&mood()].clone();
+        assert_eq!(diff(&Model::empty_database(), &m), vec![Change::CreateEnum(e.clone())]);
+        assert_eq!(diff(&m, &Model::empty_database()), vec![Change::DropEnum(e)]);
+        assert!(diff(&m, &m).is_empty());
+    }
+
+    #[test]
+    fn new_values_are_added_at_their_positions_left_to_right() {
+        use EnumPosition::{After, Before, End};
+        assert_eq!(
+            diff(&enums(&["b", "d"]), &enums(&["a0", "a1", "b", "c", "d", "e"])),
+            vec![add("a0", Before("b".into())), add("a1", After("a0".into())), add("c", After("b".into())), add("e", After("d".into())),]
+        );
+        assert_eq!(diff(&enums(&[]), &enums(&["x", "y"])), vec![add("x", End), add("y", After("x".into()))]);
+    }
+
+    #[test]
+    fn one_value_replaced_in_place_is_a_rename() {
+        assert_eq!(
+            diff(&enums(&["a", "b", "c"]), &enums(&["a", "x", "c"])),
+            vec![Change::RenameEnumValue { name: mood(), from: "b".into(), to: "x".into() }]
+        );
+    }
+
+    #[test]
+    fn removals_reorders_and_mixed_changes_are_unsupported() {
+        for (from, to) in [
+            (&["a", "b"][..], &["a"][..]),
+            (&["a", "b"], &["b", "a"]),
+            (&["a", "b", "c"], &["a", "x", "y"]),
+            (&["a", "b"], &["x", "b", "c"]),
+            (&["a", "b", "c"], &["a", "c", "x"]),
+        ] {
+            let unsupported = Change::UnsupportedEnumChange {
+                name: mood(),
+                from: from.iter().map(|l| l.to_string()).collect(),
+                to: to.iter().map(|l| l.to_string()).collect(),
+            };
+            assert_eq!(diff(&enums(from), &enums(to)), vec![unsupported], "{from:?} -> {to:?}");
+        }
+    }
+
+    #[test]
+    fn enum_comments_are_diffed() {
+        let mut b = enums(&["a"]);
+        b.enums.get_mut(&mood()).expect("mood").comment = Some("c".into());
+        assert_eq!(diff(&enums(&["a"]), &b), vec![set(CommentTarget::Type(mood()), Some("c"))]);
+        let created = diff(&Model::empty_database(), &b);
+        assert_eq!(created[1], set(CommentTarget::Type(mood()), Some("c")));
+        assert!(!diff(&b, &Model::empty_database()).iter().any(|c| matches!(c, Change::SetComment { .. })));
     }
 }

@@ -10,6 +10,7 @@ use std::fmt;
 pub struct Model {
     pub schemas: BTreeMap<String, Schema>,
     pub tables: BTreeMap<QualName, Table>,
+    pub enums: BTreeMap<QualName, Enum>,
 }
 
 impl Model {
@@ -63,6 +64,16 @@ impl Table {
     pub fn column(&self, name: &str) -> Option<&Column> {
         self.columns.iter().find(|c| c.name == name)
     }
+}
+
+/// An enum type (`pg_type.typtype = 'e'`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Enum {
+    pub name: QualName,
+    /// `pg_enum.enumlabel` in `enumsortorder` order.
+    pub labels: Vec<String>,
+    /// `obj_description` of the type.
+    pub comment: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
