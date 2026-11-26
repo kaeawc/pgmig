@@ -6,7 +6,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-publish.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
 
 [[bin]]
 name = "pgmig"
@@ -21,3 +23,13 @@ pgmig = { workspace = true }
 
 [lints]
 workspace = true
+
+# `cargo binstall pgmig-cli`: the archives attached to each GitHub release by .github/workflows/release.yml.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/pgmig-v{ version }-{ target }.tar.gz"
+bin-dir = "pgmig-v{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/pgmig-v{ version }-{ target }.zip"
+pkg-fmt = "zip"

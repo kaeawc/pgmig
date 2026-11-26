@@ -11,7 +11,7 @@ Milestones: [docs/ROADMAP.md](docs/ROADMAP.md).
   the features used; crates reference them with `{ workspace = true }`.
 - One version of every crate (`deny.toml`, enforced by the CI `deny` job). Versions shared with
   pgmem (`postgres`, `tokio`) must match pgmem's. Pure Rust only: no C toolchain, no OpenSSL.
-- pgmem is a git dependency pinned to a revision in the root `Cargo.toml`, until it is on crates.io.
+- pgmem comes from crates.io. Bump it in root `Cargo.toml` when pgmig needs a newer release.
 - Every behaviour is checked against real Postgres: tests run on pgmem by default and on real
   Postgres when `PGMIG_TEST_DSN` is set (CI job `postgres`, versions 15 and later). A test that
   passes on pgmem but fails on Postgres is a bug in the test or in pgmig.
@@ -47,6 +47,17 @@ PGMIG_TEST_DSN="host=127.0.0.1 port=5432 user=postgres" cargo t   # against real
 ```
 
 After any change: `cargo c && cargo lint && cargo t`.
+
+## Releasing
+
+Add user-visible changes to `CHANGELOG.md` under `## [Unreleased]`. `scripts/release.sh X.Y.Z`
+opens a release PR: it bumps the workspace version (and the `=X.Y.Z` pins on the internal path
+dependencies in root `Cargo.toml`) and moves the Unreleased entries under the new version. Merging
+it runs `.github/workflows/release.yml`: `pgmig` binaries for Linux (gnu + musl) / macOS / Windows,
+`scripts/publish.sh` to crates.io via trusted publishing (environment `crates-io`; skips crates
+already published, so reruns are safe), then the tag and GitHub release with the changelog section
+as notes. Every crate is published and they share one version. Run the workflow by hand for a dry
+run.
 
 ## Map
 

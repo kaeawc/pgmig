@@ -8,7 +8,7 @@ Postgres. Feature IDs refer to [FEATURES.md](FEATURES.md); architecture is in [.
 - Cargo workspace (`crates/`, `apps/pgmig`, `bindings/`), toolchain, rustfmt, clippy, deny, nextest
   and bacon configs, Makefile, `AGENTS.md`, Apache-2.0 `LICENSE`.
 - CI: fmt, clippy, deny, tests on pgmem, tests on real Postgres (version matrix), SHA-pinned actions.
-- pgmem as a git dependency pinned to a revision, behind `pgmig-conn`.
+- pgmem from crates.io, behind `pgmig-conn`.
 - Corpus test harness with the round-trip check and the pgmem known-failures ratchet.
 
 **Done when:** an empty `pgmig` CLI builds, and one corpus case (create a table) passes on both
