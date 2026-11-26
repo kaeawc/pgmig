@@ -10,6 +10,10 @@
 //! files without the `.sql` extension, names starting with `.` (editor lock and swap files), the
 //! sum file and subdirectories.
 //!
+//! A new migration's version is the UTC time as `YYYYMMDDHHMMSS`, or one more than the newest
+//! file's when the clock does not give a greater one ([`next_version`]), so it always sorts last;
+//! its description is the name it was given made of `[a-z0-9_]` ([`sanitize_description`]).
+//!
 //! # Sum file
 //!
 //! [`SUM_FILE`] (`pgmig.sum`) sits next to the migrations:
@@ -380,9 +384,116 @@ pub fn check(dir: &Dir, sum: &SumFile) -> std::result::Result<(), ValidateError>
     Ok(())
 }
 
+/// The version of a new migration written at `now`: the UTC timestamp `YYYYMMDDHHMMSS`, or, when
+/// that is not greater than `last` (a clock behind the newest file, or two files in one second),
+/// `last + 1`. Either way it sorts after every existing file.
+pub fn next_version(last: Option<&str>, now: std::time::SystemTime) -> String {
+    let stamp = timestamp(now);
+    match last {
+        Some(l) if compare_versions(&stamp, l) != Ordering::Greater => increment(l),
+        _ => stamp,
+    }
+}
+
+/// `t` in UTC as `YYYYMMDDHHMMSS`; a time before 1970 counts as 1970.
+pub fn timestamp(t: std::time::SystemTime) -> String {
+    let secs = t.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let (days, rem) = (secs / 86_400, secs % 86_400);
+    // Days since 1970-01-01 to a civil date (proleptic Gregorian), from Howard Hinnant's algorithm.
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + u64::from(month <= 2);
+    format!("{year:04}{month:02}{day:02}{:02}{:02}{:02}", rem / 3600, rem % 3600 / 60, rem % 60)
+}
+
+/// A version (digits) plus one, without leading zeros.
+fn increment(v: &str) -> String {
+    let mut digits: Vec<u8> = v.trim_start_matches('0').bytes().collect();
+    let mut i = digits.len();
+    loop {
+        if i == 0 {
+            digits.insert(0, b'1');
+            break;
+        }
+        i -= 1;
+        if digits[i] == b'9' {
+            digits[i] = b'0';
+        } else {
+            digits[i] += 1;
+            break;
+        }
+    }
+    String::from_utf8(digits).unwrap_or_default()
+}
+
+/// A migration description made from `name`: ASCII letters lowercased, digits kept, every run of
+/// anything else one `_`, none at either end. `None` when nothing is left.
+pub fn sanitize_description(name: &str) -> Option<String> {
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+        } else if !out.is_empty() && !out.ends_with('_') {
+            out.push('_');
+        }
+    }
+    while out.ends_with('_') {
+        out.pop();
+    }
+    (!out.is_empty()).then_some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn at(secs: u64) -> std::time::SystemTime {
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn timestamps_are_utc() {
+        assert_eq!(timestamp(at(0)), "19700101000000");
+        assert_eq!(timestamp(at(1_795_689_000)), "20261126103000");
+        assert_eq!(timestamp(at(1_709_251_199)), "20240229235959");
+        assert_eq!(timestamp(at(951_868_800)), "20000301000000");
+        assert_eq!(timestamp(std::time::UNIX_EPOCH - std::time::Duration::from_secs(5)), "19700101000000");
+    }
+
+    #[test]
+    fn next_version_is_after_the_last() {
+        let now = at(1_795_689_000);
+        assert_eq!(next_version(None, now), "20261126103000");
+        assert_eq!(next_version(Some("20261125000000"), now), "20261126103000");
+        assert_eq!(next_version(Some("9"), now), "20261126103000");
+        // The same second, or a clock behind the newest file: one more than it.
+        assert_eq!(next_version(Some("20261126103000"), now), "20261126103001");
+        assert_eq!(next_version(Some("99991231235959"), now), "99991231235960");
+        assert_eq!(next_version(Some("99999999999999"), now), "100000000000000");
+        assert_eq!(next_version(Some("0099999999999999"), now), "100000000000000");
+        assert_eq!(increment("0"), "1");
+        assert_eq!(increment("009"), "10");
+    }
+
+    #[test]
+    fn descriptions_are_sanitized() {
+        assert_eq!(sanitize_description("add_users").as_deref(), Some("add_users"));
+        assert_eq!(sanitize_description("Add Users!").as_deref(), Some("add_users"));
+        assert_eq!(sanitize_description("  --orders.v2--  ").as_deref(), Some("orders_v2"));
+        assert_eq!(sanitize_description("café crème").as_deref(), Some("caf_cr_me"));
+        assert_eq!(sanitize_description("__a__b__").as_deref(), Some("a_b"));
+        assert_eq!(sanitize_description("2fa").as_deref(), Some("2fa"));
+        assert_eq!(sanitize_description(""), None);
+        assert_eq!(sanitize_description("!!! ---"), None);
+        let name = format!("{}_{}.sql", next_version(None, at(0)), sanitize_description("x y").expect("name"));
+        assert_eq!(parse_name(&name), Ok(("19700101000000", "x_y")));
+    }
 
     fn dir(files: &[(&str, &str)]) -> Dir {
         let files = files.iter().map(|(n, t)| File::new(n, t.as_bytes()).expect("name")).collect();

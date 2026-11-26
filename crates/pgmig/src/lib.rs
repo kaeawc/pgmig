@@ -2,10 +2,12 @@
 //! returning serde types (what the CLI, JSON output and language packages call).
 //!
 //! [`Source`] and [`ShadowSpec`] serialize adjacently tagged, like the changes of a plan:
-//! `{"kind": "sql", "data": "schema/"}`, `{"kind": "database", "data": "postgres://..."}`,
-//! `{"kind": "pgmem"}`, `{"kind": "postgres", "data": "host=..."}`.
+//! `{"kind": "sql", "data": "schema/"}`, `{"kind": "migrations", "data": "migrations/"}`,
+//! `{"kind": "database", "data": "postgres://..."}`, `{"kind": "pgmem"}`,
+//! `{"kind": "postgres", "data": "host=..."}`.
 
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
@@ -47,6 +49,9 @@ pub enum Error {
     ImportEmpty { path: PathBuf, pos: pgmig_sql::Pos, target: String },
     #[error("{path}:{pos}: pgmig:import is not allowed in a migration: migrations are self-contained")]
     MigrationImport { path: PathBuf, pos: pgmig_sql::Pos },
+    /// A `migrate diff` or `migrate new` name with no ASCII letters or digits.
+    #[error("migration name {name:?} has no letters or digits; names are made of a-z, 0-9 and _")]
+    MigrationDescription { name: String },
     #[error("import cycle: {cycle}")]
     ImportCycle { cycle: String },
     /// The migration directory cannot be read: a malformed file name, two files with one version.
@@ -107,15 +112,21 @@ pub enum Source {
     /// A `.sql` file, or a directory of them loaded in lexical order, after the files they
     /// `-- pgmig:import`.
     Sql(PathBuf),
+    /// A migration directory: checked against its sum file, then every migration replayed in
+    /// version order. A directory with no migrations and no sum file is an empty state.
+    Migrations(PathBuf),
     /// A connection string (URL or key/value).
     Database(String),
 }
 
 impl Source {
-    /// URLs and key/value connection strings are databases; anything else is a path.
+    /// URLs and key/value connection strings are databases; a directory holding a sum file
+    /// ([`SUM_FILE`]) is a migration directory; anything else is a path to SQL files.
     pub fn parse(s: &str) -> Source {
         if s.starts_with("postgres://") || s.starts_with("postgresql://") || s.contains('=') {
             Source::Database(s.to_owned())
+        } else if Path::new(s).join(SUM_FILE).is_file() {
+            Source::Migrations(PathBuf::from(s))
         } else {
             Source::Sql(PathBuf::from(s))
         }
@@ -207,6 +218,7 @@ fn open_model(source: &Source, shadow: &ShadowSpec) -> Result<(Model, Loaded)> {
     let mut loaded = match source {
         Source::Database(dsn) => Loaded::Database(Conn::connect(dsn)?),
         Source::Sql(path) => Loaded::Shadow(load_sql(path, shadow)?),
+        Source::Migrations(path) => Loaded::Shadow(replay(&open_checked(path)?, shadow)?),
     };
     Ok((inspect(loaded.conn())?, loaded))
 }
@@ -252,6 +264,109 @@ pub fn migrate_validate(dir: &Path, shadow: Option<&ShadowSpec>) -> Result<()> {
     Ok(())
 }
 
+/// The migration directory at `path`, checked against its sum file and for imports, ready to
+/// replay. A directory with no migrations and no sum file has nothing to check.
+fn open_checked(path: &Path) -> Result<MigrationDir> {
+    let dir = MigrationDir::open(path)?;
+    if !dir.files().is_empty() || dir.read_sum()?.is_some() {
+        pgmig_migrate::validate(&dir)?;
+    }
+    check_no_imports(&dir)?;
+    Ok(dir)
+}
+
+/// A migration file written by [`migrate_diff`] or [`migrate_new`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewMigration {
+    /// The file's path: the directory joined with `<version>_<description>.sql`.
+    pub path: PathBuf,
+    pub version: String,
+}
+
+/// What [`migrate_diff`] found and wrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrateDiff {
+    /// The file written; `None` when there were no changes and nothing was written.
+    pub written: Option<NewMigration>,
+    /// The changes from the replayed directory to the desired state.
+    pub changes: Vec<Change>,
+    /// The plan written to the file.
+    pub plan: Plan,
+}
+
+/// `migrate diff`: the next migration of the directory at `dir`. The directory is checked against
+/// its sum file (it may be missing or empty: nothing to check) and replayed in a fresh shadow
+/// database, `to` is loaded in another, and the plan between them, for the objects `opts` manages,
+/// is written as `<version>_<name>.sql` ([`Plan::to_sql`], commit points included) and the sum
+/// file rehashed. With no changes nothing is written.
+///
+/// The file will be executed, so its names are schema-qualified in schema mode too (see
+/// [`schema_plan_apply`]). The version is the UTC time, or one more than the newest file's when
+/// that is not greater ([`pgmig_migrate::next_version`]); `name` is sanitized to `[a-z0-9_]`.
+pub fn migrate_diff(dir: &Path, name: &str, to: &Source, shadow: &ShadowSpec, opts: &Options) -> Result<MigrateDiff> {
+    migrate_diff_at(dir, name, to, shadow, opts, SystemTime::now())
+}
+
+fn migrate_diff_at(dir: &Path, name: &str, to: &Source, shadow: &ShadowSpec, opts: &Options, now: SystemTime) -> Result<MigrateDiff> {
+    let description = description(name)?;
+    // A directory that does not exist yet is an empty one; it is created when a file is written.
+    let existing = if dir.exists() { Some(open_checked(dir)?) } else { None };
+    // The replay's shadow is wiped (dropped) before `to`'s opens: a real Postgres shadow must start
+    // empty.
+    let a = {
+        let mut sh = match &existing {
+            Some(d) => replay(d, shadow)?,
+            None => shadow.open()?,
+        };
+        opts.managed(&inspect(sh.conn())?)
+    };
+    let (b, mut loaded) = open_model(to, shadow)?;
+    let b = opts.managed(&b);
+    let changes = diff_with_casts(&a, &b, loaded.conn());
+    let plan = plan_with(&changes, &PlanOptions::default())?;
+    drop(loaded);
+    let written = if plan.is_empty() { None } else { Some(write_migration(dir, existing, &description, plan.to_sql(), now)?) };
+    Ok(MigrateDiff { written, changes, plan })
+}
+
+/// `migrate new`: write an empty migration `<version>_<name>.sql` to the directory at `dir` (created
+/// when missing) and rehash the sum file. The directory is checked against its sum file first.
+pub fn migrate_new(dir: &Path, name: &str) -> Result<NewMigration> {
+    migrate_new_at(dir, name, SystemTime::now())
+}
+
+fn migrate_new_at(dir: &Path, name: &str, now: SystemTime) -> Result<NewMigration> {
+    let description = description(name)?;
+    let existing = if dir.exists() { Some(open_checked(dir)?) } else { None };
+    write_migration(dir, existing, &description, String::new(), now)
+}
+
+fn description(name: &str) -> Result<String> {
+    pgmig_migrate::sanitize_description(name).ok_or_else(|| Error::MigrationDescription { name: name.to_owned() })
+}
+
+/// Write the next migration after the checked files of `existing`, then the sum file for those
+/// files and the new one only: a file that appeared in the meantime is left unhashed, so the
+/// next check reports it instead of hashing it unseen.
+fn write_migration(path: &Path, existing: Option<MigrationDir>, description: &str, sql: String, now: SystemTime) -> Result<NewMigration> {
+    let files = existing.map(|d| d.files().to_vec()).unwrap_or_default();
+    let version = pgmig_migrate::next_version(files.last().map(|f| f.version.as_str()), now);
+    let name = format!("{version}_{description}.sql");
+    std::fs::create_dir_all(path).map_err(|source| Error::Io { path: path.to_owned(), source })?;
+    let file = path.join(&name);
+    let io = |source| Error::Io { path: file.clone(), source };
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&file).map_err(io)?;
+        f.write_all(sql.as_bytes()).map_err(io)?;
+    }
+    let new = pgmig_migrate::File::new(&name, sql).map_err(|reason| pgmig_migrate::Error::Name { path: file.clone(), reason })?;
+    let mut all = files;
+    all.push(new);
+    MigrationDir::from_files(path, all)?.write_sum()?;
+    Ok(NewMigration { path: file, version })
+}
+
 /// Reject any `-- pgmig:import` in a migration, file-level or on a statement: migrations are
 /// self-contained. A file that is not UTF-8 or does not split is left to the replay to report.
 fn check_no_imports(dir: &MigrationDir) -> Result<()> {
@@ -285,6 +400,7 @@ pub fn schema_validate(source: &Source, shadow: &ShadowSpec) -> Result<()> {
     match source {
         Source::Database(_) => Err(Error::NotSql),
         Source::Sql(path) => load_sql(path, shadow).map(drop),
+        Source::Migrations(path) => replay(&open_checked(path)?, shadow).map(drop),
     }
 }
 
@@ -436,6 +552,15 @@ mod tests {
         assert_eq!(Source::parse("schema.sql"), Source::Sql("schema.sql".into()));
         assert_eq!(Source::parse("postgres://localhost/db"), Source::Database("postgres://localhost/db".into()));
         assert_eq!(Source::parse("host=localhost user=me"), Source::Database("host=localhost user=me".into()));
+        // A directory without a sum file is SQL; with one it is a migration directory.
+        let dir = std::env::temp_dir().join(format!("pgmig-source-parse-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let s = dir.to_string_lossy().into_owned();
+        assert_eq!(Source::parse(&s), Source::Sql(dir.clone()));
+        std::fs::write(dir.join(SUM_FILE), "").expect("sum");
+        assert_eq!(Source::parse(&s), Source::Migrations(dir.clone()));
+        let _ = std::fs::remove_file(dir.join(SUM_FILE));
+        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]
