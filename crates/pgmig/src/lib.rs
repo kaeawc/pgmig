@@ -13,6 +13,8 @@ pub use pgmig_shadow::Shadow;
 pub enum Error {
     #[error("reading {path}: {source}")]
     Io { path: PathBuf, source: std::io::Error },
+    #[error("validate takes SQL files or a directory, not a database")]
+    NotSql,
     #[error("{path}: no .sql files")]
     NoSql { path: PathBuf },
     #[error("{path}:{source}")]
@@ -77,21 +79,36 @@ pub fn load_model(source: &Source, shadow: &ShadowSpec) -> Result<Model> {
     match source {
         Source::Database(dsn) => Ok(inspect(&mut Conn::connect(dsn)?)?),
         Source::Sql(path) => {
-            let mut sh = shadow.open()?;
-            for file in sql_files(path)? {
-                let text = std::fs::read_to_string(&file).map_err(|source| Error::Io { path: file.clone(), source })?;
-                let parsed = pgmig_sql::split(&text).map_err(|source| Error::Split { path: file.clone(), source })?;
-                // One statement at a time, so an error points at its statement.
-                for stmt in &parsed.statements {
-                    sh.conn().batch(&stmt.sql).map_err(|source| Error::Load {
-                        path: file.clone(),
-                        pos: source.position.map_or(stmt.pos, |n| stmt.locate(n)),
-                        source,
-                    })?;
-                }
-            }
+            let mut sh = load_sql(path, shadow)?;
             Ok(inspect(sh.conn())?)
         }
+    }
+}
+
+/// Execute the SQL files at `path` in a fresh shadow database, one statement at a time so an
+/// error points at its statement.
+fn load_sql(path: &Path, shadow: &ShadowSpec) -> Result<Shadow> {
+    let mut sh = shadow.open()?;
+    for file in sql_files(path)? {
+        let text = std::fs::read_to_string(&file).map_err(|source| Error::Io { path: file.clone(), source })?;
+        let parsed = pgmig_sql::split(&text).map_err(|source| Error::Split { path: file.clone(), source })?;
+        for stmt in &parsed.statements {
+            sh.conn().batch(&stmt.sql).map_err(|source| Error::Load {
+                path: file.clone(),
+                pos: source.position.map_or(stmt.pos, |n| stmt.locate(n)),
+                source,
+            })?;
+        }
+    }
+    Ok(sh)
+}
+
+/// `schema validate`: load SQL files into the shadow database and report the first error.
+/// A database source has nothing to load and is rejected.
+pub fn schema_validate(source: &Source, shadow: &ShadowSpec) -> Result<()> {
+    match source {
+        Source::Database(_) => Err(Error::NotSql),
+        Source::Sql(path) => load_sql(path, shadow).map(drop),
     }
 }
 

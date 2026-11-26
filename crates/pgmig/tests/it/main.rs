@@ -3,3 +3,4 @@ mod corpus;
 mod load;
 mod quoting;
 mod support;
+mod validate;
