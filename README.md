@@ -38,6 +38,15 @@ manages one schema's objects (not the schema itself); `inspect` and `diff` print
 unqualified, while `apply` prints and runs schema-qualified SQL so the target's `search_path` cannot
 redirect a statement to another schema. Without it, every schema is managed and names are qualified.
 
+`--format json` (on `inspect`, `diff`, `validate` and `apply`) prints the command's response as one
+pretty-printed JSON document on stdout and nothing on stderr; a failure prints the error object
+(`code`, `message`, `sqlstate`, `file`, `line`, `col`, `apply`) on stdout instead. Bad flags are
+still reported as text on stderr. `apply` never asks
+in JSON mode: pass `--auto-approve` or `--dry-run`.
+
+Exit codes: `0` success; `1` error (including `validate` finding errors); `2` usage (bad flags, or `apply` with no way to approve);
+`3` with `--exit-code` (`diff`, or `apply --dry-run`) when the plan is not empty.
+
 ## Layout
 
 | Path | What |

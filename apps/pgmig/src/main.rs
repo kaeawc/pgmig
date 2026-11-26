@@ -1,12 +1,25 @@
 use std::io::{BufRead, IsTerminal, Write};
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use pgmig::api::{self, ApiError};
 use pgmig::{Filter, Options, ShadowSpec, Source};
+use serde::Serialize;
+
+const AFTER_HELP: &str = "\
+Exit codes:
+  0  success
+  1  error (also: `schema validate` found errors in the files)
+  2  usage error (unknown flag, missing argument)
+  3  `--exit-code` was given and the plan is not empty
+
+With `--format json`, a command prints one JSON document on stdout, and nothing on stderr. A
+failure prints the error object ({\"code\", \"message\", \"sqlstate\", \"file\", \"line\", \"col\",
+\"apply\"}) on stdout and exits 1, or 2 when its code is \"usage\". Bad flags are reported by the
+argument parser as text on stderr (exit 2).";
 
 #[derive(Parser)]
-#[command(name = "pgmig", version, about = "Postgres schema migrations from plain SQL")]
+#[command(name = "pgmig", version, about = "Postgres schema migrations from plain SQL", after_help = AFTER_HELP)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -33,6 +46,11 @@ enum SchemaCommand {
         shadow: ShadowArg,
         #[command(flatten)]
         scope: ScopeArgs,
+        #[command(flatten)]
+        format: FormatArg,
+        /// Exit with status 3 when there are changes.
+        #[arg(long)]
+        exit_code: bool,
     },
     /// Print SQL that recreates a state's schema in a new database.
     Inspect {
@@ -42,6 +60,8 @@ enum SchemaCommand {
         shadow: ShadowArg,
         #[command(flatten)]
         scope: ScopeArgs,
+        #[command(flatten)]
+        format: FormatArg,
     },
     /// Change a live database to match a desired state: show the plan, ask, execute.
     Apply {
@@ -61,6 +81,11 @@ enum SchemaCommand {
         /// Apply without asking. Required when stdin is not a terminal.
         #[arg(long)]
         auto_approve: bool,
+        #[command(flatten)]
+        format: FormatArg,
+        /// With --dry-run, exit with status 3 when there are changes.
+        #[arg(long, requires = "dry_run")]
+        exit_code: bool,
     },
     /// Load SQL files into the shadow database and report errors; prints nothing on success.
     Validate {
@@ -68,7 +93,22 @@ enum SchemaCommand {
         source: String,
         #[command(flatten)]
         shadow: ShadowArg,
+        #[command(flatten)]
+        format: FormatArg,
     },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Format {
+    Text,
+    Json,
+}
+
+#[derive(clap::Args)]
+struct FormatArg {
+    /// Output format: `text`, or `json` (one JSON document on stdout; errors too).
+    #[arg(long, value_enum, default_value = "text")]
+    format: Format,
 }
 
 #[derive(clap::Args)]
@@ -100,76 +140,159 @@ impl ScopeArgs {
 }
 
 fn main() -> ExitCode {
-    match run(Cli::parse()) {
+    let cli = Cli::parse();
+    let format = cli.format();
+    match run(cli) {
         Ok(code) => code,
         Err(e) => {
-            // Library errors already include their cause in their message; `{e:#}` would repeat it.
-            eprintln!("error: {e}");
-            ExitCode::FAILURE
+            // A usage error found after parsing (no approval in a non-interactive shell) exits 2,
+            // like the usage errors clap reports.
+            let usage = e.downcast_ref::<ApiError>().is_some_and(|a| a.code == api::ErrorCode::Usage);
+            if format == Format::Json {
+                let err = match e.downcast::<ApiError>() {
+                    Ok(err) => err,
+                    Err(e) => ApiError::usage(e.to_string()),
+                };
+                match serde_json::to_string_pretty(&err) {
+                    Ok(json) => println!("{json}"),
+                    Err(e) => eprintln!("error: {e}"),
+                }
+            } else {
+                // Library errors already include their cause in their message; `{e:#}` would repeat it.
+                eprintln!("error: {e}");
+            }
+            if usage { ExitCode::from(2) } else { ExitCode::FAILURE }
         }
     }
 }
+
+impl Cli {
+    fn format(&self) -> Format {
+        let Command::Schema(command) = &self.command;
+        match command {
+            SchemaCommand::Diff { format, .. }
+            | SchemaCommand::Inspect { format, .. }
+            | SchemaCommand::Apply { format, .. }
+            | SchemaCommand::Validate { format, .. } => format.format,
+        }
+    }
+}
+
+fn print_json<T: Serialize>(value: &T) -> anyhow::Result<()> {
+    println!("{}", serde_json::to_string_pretty(value)?);
+    Ok(())
+}
+
+/// Status 3: `--exit-code` and a plan with statements.
+const CHANGES: u8 = 3;
 
 /// Builds each command's request from the flags, calls the library and prints the response.
 fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     let Command::Schema(command) = cli.command;
     match command {
-        SchemaCommand::Apply { url, to, shadow, scope, dry_run, auto_approve } => {
+        SchemaCommand::Apply { url, to, shadow, scope, dry_run, auto_approve, format, exit_code } => {
             let req = api::PlanApplyRequest {
                 target: url,
                 desired: Source::parse(&to),
                 shadow: ShadowSpec::parse(&shadow.shadow),
                 options: scope.options()?,
             };
-            schema_apply(req, dry_run, auto_approve)?;
+            return schema_apply(req, dry_run, auto_approve, format.format, exit_code);
         }
-        SchemaCommand::Diff { from, to, shadow, scope } => {
+        SchemaCommand::Diff { from, to, shadow, scope, format, exit_code } => {
             let req = api::DiffRequest {
                 from: Source::parse(&from),
                 to: Source::parse(&to),
                 shadow: ShadowSpec::parse(&shadow.shadow),
                 options: scope.options()?,
             };
-            print!("{}", api::schema_diff(&req)?.plan.to_sql());
+            let res = api::schema_diff(&req)?;
+            match format.format {
+                Format::Text => print!("{}", res.plan.to_sql()),
+                Format::Json => print_json(&res)?,
+            }
+            if exit_code && !res.plan.is_empty() {
+                return Ok(ExitCode::from(CHANGES));
+            }
         }
-        SchemaCommand::Validate { source, shadow } => {
+        SchemaCommand::Validate { source, shadow, format } => {
             let req = api::ValidateRequest { source: Source::parse(&source), shadow: ShadowSpec::parse(&shadow.shadow) };
             let res = api::schema_validate(&req)?;
-            for d in &res.diagnostics {
-                eprintln!("error: {d}");
+            match format.format {
+                Format::Text => {
+                    for d in &res.diagnostics {
+                        eprintln!("error: {d}");
+                    }
+                }
+                Format::Json => print_json(&res)?,
             }
             if !res.is_valid() {
                 return Ok(ExitCode::FAILURE);
             }
         }
-        SchemaCommand::Inspect { source, shadow, scope } => {
+        SchemaCommand::Inspect { source, shadow, scope, format } => {
             let req = api::InspectRequest {
                 source: Source::parse(&source),
                 shadow: ShadowSpec::parse(&shadow.shadow),
                 options: scope.options()?,
             };
-            print!("{}", api::schema_inspect(&req)?.plan.to_sql());
+            let res = api::schema_inspect(&req)?;
+            match format.format {
+                Format::Text => print!("{}", res.plan.to_sql()),
+                Format::Json => print_json(&res)?,
+            }
         }
     }
     Ok(ExitCode::SUCCESS)
 }
 
-/// Shows the plan, asks (unless told not to), then applies it.
-fn schema_apply(req: api::PlanApplyRequest, dry_run: bool, auto_approve: bool) -> anyhow::Result<()> {
-    let plan = api::schema_plan_apply(&req)?.plan;
-    if plan.is_empty() {
-        eprintln!("no changes");
-        return Ok(());
+/// What `schema apply --format json` prints: the plan, and the report when it was applied.
+#[derive(Serialize)]
+struct ApplyOutput {
+    #[serde(flatten)]
+    plan: api::PlanApplyResponse,
+    applied: bool,
+    report: Option<pgmig::ApplyReport>,
+}
+
+/// Shows the plan, asks (unless told not to), then applies it. In JSON mode it never asks and
+/// prints one document at the end.
+fn schema_apply(
+    req: api::PlanApplyRequest,
+    dry_run: bool,
+    auto_approve: bool,
+    format: Format,
+    exit_code: bool,
+) -> anyhow::Result<ExitCode> {
+    let json = format == Format::Json;
+    let res = api::schema_plan_apply(&req)?;
+    let changes = !res.plan.is_empty();
+    let dry_code = if dry_run && exit_code && changes { ExitCode::from(CHANGES) } else { ExitCode::SUCCESS };
+    if !changes {
+        if json {
+            print_json(&ApplyOutput { plan: res, applied: false, report: None })?;
+        } else {
+            eprintln!("no changes");
+        }
+        return Ok(ExitCode::SUCCESS);
     }
-    print!("{}", plan.to_sql());
-    std::io::stdout().flush()?;
+    if !json {
+        print!("{}", res.plan.to_sql());
+        std::io::stdout().flush()?;
+    }
     if dry_run {
-        return Ok(());
+        if json {
+            print_json(&ApplyOutput { plan: res, applied: false, report: None })?;
+        }
+        return Ok(dry_code);
     }
-    let n = plan.statements.len();
+    let n = res.plan.statements.len();
     if !auto_approve {
         if !std::io::stdin().is_terminal() {
             anyhow::bail!("stdin is not a terminal, so pgmig cannot ask before applying; pass --auto-approve to apply without asking");
+        }
+        if json {
+            anyhow::bail!("--format json never asks before applying; pass --auto-approve to apply without asking, or --dry-run");
         }
         eprint!("Apply these {n} statements? [y/N] ");
         std::io::stderr().flush()?;
@@ -179,7 +302,11 @@ fn schema_apply(req: api::PlanApplyRequest, dry_run: bool, auto_approve: bool) -
             anyhow::bail!("not applied");
         }
     }
-    let report = api::apply(&api::ApplyRequest { target: req.target, plan })?;
-    eprintln!("applied {} statements in {} transaction(s)", report.statements, report.batches);
-    Ok(())
+    let report = api::apply(&api::ApplyRequest { target: req.target, plan: res.plan.clone() })?;
+    if json {
+        print_json(&ApplyOutput { plan: res, applied: true, report: Some(report) })?;
+    } else {
+        eprintln!("applied {} statements in {} transaction(s)", report.statements, report.batches);
+    }
+    Ok(ExitCode::SUCCESS)
 }

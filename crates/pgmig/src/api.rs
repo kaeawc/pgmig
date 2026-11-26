@@ -143,6 +143,8 @@ pub enum ErrorCode {
     Apply,
     /// An `--include` / `--exclude` pattern is invalid.
     Pattern,
+    /// The command line asks for something that cannot be done (applying without approval).
+    Usage,
 }
 
 impl ErrorCode {
@@ -164,6 +166,7 @@ impl ErrorCode {
             ErrorCode::Plan => "plan",
             ErrorCode::Apply => "apply",
             ErrorCode::Pattern => "pattern",
+            ErrorCode::Usage => "usage",
         }
     }
 }
@@ -216,6 +219,11 @@ pub type Diagnostic = ApiError;
 impl ApiError {
     fn new(code: ErrorCode, e: &impl std::fmt::Display) -> ApiError {
         ApiError { code, message: e.to_string(), sqlstate: None, file: None, line: None, col: None, apply: None }
+    }
+
+    /// A command line that cannot be run as given.
+    pub fn usage(message: impl Into<String>) -> ApiError {
+        ApiError { code: ErrorCode::Usage, message: message.into(), sqlstate: None, file: None, line: None, col: None, apply: None }
     }
 
     fn sqlstate(mut self, e: &pgmig_conn::Error) -> ApiError {
@@ -443,6 +451,7 @@ mod tests {
             Plan,
             Apply,
             Pattern,
+            Usage,
         ] {
             assert_eq!(serde_json::to_string(&code).expect("serialize"), format!("\"{}\"", code.as_str()));
         }
