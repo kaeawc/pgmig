@@ -4,5 +4,5 @@ CREATE TABLE public.zpoint (
 );
 CREATE TABLE public.apath (
     id integer NOT NULL,
-    start zpoint
+    start public.zpoint
 );

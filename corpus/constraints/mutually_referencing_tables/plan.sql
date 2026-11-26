@@ -13,6 +13,6 @@ CREATE TABLE public.tree (
     parent integer,
     CONSTRAINT tree_pkey PRIMARY KEY (id)
 );
-ALTER TABLE public.a ADD CONSTRAINT a_b_id_fkey FOREIGN KEY (b_id) REFERENCES b(id);
-ALTER TABLE public.b ADD CONSTRAINT b_a_id_fkey FOREIGN KEY (a_id) REFERENCES a(id);
-ALTER TABLE public.tree ADD CONSTRAINT tree_parent_fkey FOREIGN KEY (parent) REFERENCES tree(id);
+ALTER TABLE public.a ADD CONSTRAINT a_b_id_fkey FOREIGN KEY (b_id) REFERENCES public.b(id);
+ALTER TABLE public.b ADD CONSTRAINT b_a_id_fkey FOREIGN KEY (a_id) REFERENCES public.a(id);
+ALTER TABLE public.tree ADD CONSTRAINT tree_parent_fkey FOREIGN KEY (parent) REFERENCES public.tree(id);

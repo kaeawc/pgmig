@@ -49,6 +49,9 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
 
 ### Changed
 
+- Inspection runs with `search_path = pg_catalog`, so names inside server-printed definitions
+  (defaults, types, constraint definitions) are always schema-qualified, and the same schema reads
+  the same whatever the connection's search path.
 - Plans are ordered by a dependency graph: each statement runs after what it references, and drops
   run before what they reference. A table whose column uses another table's row type is now
   created after that table and dropped before it.

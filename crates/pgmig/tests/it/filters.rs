@@ -83,7 +83,7 @@ fn a_foreign_key_to_an_excluded_table_plans_and_applies() {
         plan.statements,
         [
             "CREATE TABLE public.c (\n    pid integer\n)",
-            "ALTER TABLE public.c ADD CONSTRAINT c_pid_fkey FOREIGN KEY (pid) REFERENCES p(id)"
+            "ALTER TABLE public.c ADD CONSTRAINT c_pid_fkey FOREIGN KEY (pid) REFERENCES public.p(id)"
         ]
     );
     pgmig::apply(&target.conninfo, &plan).expect("apply");
@@ -100,11 +100,12 @@ fn schema_mode_manages_one_schema_with_unqualified_names() {
     let (spec, _db) = shadow_spec();
     let public = Options { schema: Some("public".into()), ..Options::default() };
     let out = pgmig::schema_inspect(&sql.source(), &spec, &public).expect("inspect").to_sql();
+    // Names pgmig prints lose the schema; text the server prints (types, defaults) keeps it.
     assert_eq!(
         out,
         "CREATE TYPE mood AS ENUM ('a');\n\
          CREATE SEQUENCE t_id_seq AS integer;\n\
-         CREATE TABLE t (\n    id integer DEFAULT nextval('t_id_seq'::regclass) NOT NULL,\n    m mood,\n    CONSTRAINT t_pkey PRIMARY KEY (id)\n);\n\
+         CREATE TABLE t (\n    id integer DEFAULT nextval('public.t_id_seq'::regclass) NOT NULL,\n    m public.mood,\n    CONSTRAINT t_pkey PRIMARY KEY (id)\n);\n\
          ALTER SEQUENCE t_id_seq OWNED BY t.id;\n\
          COMMENT ON TABLE t IS 'c';\n"
     );
