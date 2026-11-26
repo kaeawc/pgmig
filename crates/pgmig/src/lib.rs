@@ -12,6 +12,7 @@ use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 
 pub mod api;
+pub mod clean;
 pub mod edit;
 mod files;
 pub mod filter;
@@ -19,6 +20,7 @@ pub mod migrate_apply;
 pub mod migrate_maintain;
 pub mod migrate_status;
 
+pub use clean::{Kept, SchemaClean, clean_confirmed, clean_desired, schema_plan_clean};
 pub use edit::{EDITED_PLAN, edit_sql, plan_from_sql};
 pub use filter::{Filter, Pattern, PatternError, filter_model, scope_model, without_schema};
 pub use migrate_apply::{

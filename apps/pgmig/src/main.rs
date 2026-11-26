@@ -462,6 +462,25 @@ enum SchemaCommand {
         #[arg(long, requires = "dry_run")]
         exit_code: bool,
     },
+    /// Drop every managed object in a database, leaving it as a new database holds it: for local
+    /// development. Shows the plan and asks for the database name to be typed. `public` stays (with
+    /// its standard comment), and so do the revisions schema, unmanaged objects and the managed
+    /// objects they need (reported as kept); extensions are not touched.
+    Clean {
+        /// The database to clean.
+        #[arg(long)]
+        url: Option<String>,
+        #[command(flatten)]
+        scope: ScopeArgs,
+        /// Print the plan and change nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Clean without asking. Required when stdin is not a terminal.
+        #[arg(long)]
+        auto_approve: bool,
+        #[command(flatten)]
+        format: FormatArg,
+    },
     /// Load SQL files into the shadow database and report errors; prints nothing on success.
     Validate {
         /// SQL file, directory of SQL files, or migration directory (config: `to`).
@@ -657,6 +676,7 @@ impl Cli {
                 | SchemaCommand::Inspect { format, .. }
                 | SchemaCommand::Fingerprint { format, .. }
                 | SchemaCommand::Apply { format, .. }
+                | SchemaCommand::Clean { format, .. }
                 | SchemaCommand::Validate { format, .. },
             )
             | Command::Migrate(
@@ -815,6 +835,11 @@ fn run(cli: Cli, loaded: &Loaded, format: Format) -> anyhow::Result<ExitCode> {
             };
             let flags = ApplyFlags { dry_run, auto_approve, edit, exit_code };
             return schema_apply(req, &shown, flags, format);
+        }
+        SchemaCommand::Clean { url, scope, dry_run, auto_approve, format: _ } => {
+            let (target, shown) = target(url, loaded)?;
+            let req = api::CleanPlanRequest { target, options: scope.options(s)? };
+            return schema_clean(req, &shown, dry_run, auto_approve, format);
         }
         SchemaCommand::Diff { from, to, shadow, scope, skip, format: _, exit_code } => {
             let req = api::DiffRequest {
@@ -1272,6 +1297,81 @@ fn schema_apply(req: api::PlanApplyRequest, target: &Target, flags: ApplyFlags, 
         print_json(&ApplyOutput { target, plan: res, applied: true, report: Some(report) })?;
     } else {
         eprintln!("applied {} statements in {} transaction(s)", report.statements, report.batches);
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// What `schema clean --format json` prints: the target, the plan, and the report when it was applied.
+#[derive(Serialize)]
+struct CleanOutput<'a> {
+    target: &'a Target,
+    #[serde(flatten)]
+    plan: api::CleanPlanResponse,
+    applied: bool,
+    report: Option<pgmig::ApplyReport>,
+}
+
+/// Shows the drops and what is kept, asks for the database name (unless told not to), then
+/// applies them. In JSON mode it never asks and prints one document at the end.
+fn schema_clean(
+    req: api::CleanPlanRequest,
+    target: &Target,
+    dry_run: bool,
+    auto_approve: bool,
+    format: Format,
+) -> anyhow::Result<ExitCode> {
+    let json = format == Format::Json;
+    let res = api::schema_plan_clean(&req)?;
+    if !json {
+        for k in &res.kept {
+            eprintln!("kept {}: {}", k.object, k.because);
+        }
+    }
+    if res.plan.is_empty() {
+        if json {
+            print_json(&CleanOutput { target, plan: res, applied: false, report: None })?;
+        } else {
+            eprintln!("nothing to clean");
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    if !json {
+        print!("{}", res.plan.to_sql());
+        std::io::stdout().flush()?;
+        eprintln!("Target: {} (from {}), database {}", target.display, target.source, res.database);
+    }
+    if dry_run {
+        if json {
+            print_json(&CleanOutput { target, plan: res, applied: false, report: None })?;
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    if !auto_approve {
+        if json {
+            return Err(ApiError::usage(
+                "--format json never asks before cleaning; pass --auto-approve to clean without asking, or --dry-run",
+            )
+            .into());
+        }
+        if !std::io::stdin().is_terminal() {
+            return Err(ApiError::usage(
+                "stdin is not a terminal, so pgmig cannot ask before cleaning; pass --auto-approve to clean without asking",
+            )
+            .into());
+        }
+        eprint!("This drops the objects above from database {}. Type its name to confirm: ", res.database);
+        std::io::stderr().flush()?;
+        let mut answer = String::new();
+        std::io::stdin().lock().read_line(&mut answer)?;
+        if !pgmig::clean_confirmed(&answer, &res.database) {
+            anyhow::bail!("not cleaned: the answer is not the database name {}", res.database);
+        }
+    }
+    let report = api::apply(&api::ApplyRequest { target: req.target.clone(), plan: res.plan.clone() })?;
+    if json {
+        print_json(&CleanOutput { target, plan: res, applied: true, report: Some(report) })?;
+    } else {
+        eprintln!("cleaned: {} statements in {} transaction(s)", report.statements, report.batches);
     }
     Ok(ExitCode::SUCCESS)
 }

@@ -8,6 +8,14 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
 
 ### Added
 
+- `pgmig schema clean --url <db>` drops every managed object in a database (for local
+  development), leaving it equal to a new one: `public` stays with its standard comment, the
+  revisions schema is never touched, and extensions are not dropped (tables an extension created,
+  such as `spatial_ref_sys`, are not yet told apart: the clean then fails and rolls back, see #18;
+  indexes are not modelled, so dropping a column drops indexes on it). It shows the drops and the target, and asks
+  for the database name to be typed; `--auto-approve` (required without a terminal), `--dry-run`,
+  `--format json`. Filters and `--schema` apply; managed objects that a kept object needs (its
+  schema, enum, sequence, referenced table) are kept and reported.
 - `--edit` on `schema apply` and `migrate diff` opens the planned SQL in `$VISUAL`/`$EDITOR`; what
   you save is what runs or is written. An emptied plan applies or writes nothing, a failing editor
   aborts, and the temp file is always removed. Needs a terminal; refused with `--format json`.
