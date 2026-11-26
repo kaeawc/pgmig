@@ -19,6 +19,7 @@ doctest = false
 pgmig-conn = { workspace = true }
 pgmig-diff = { workspace = true }
 pgmig-inspect = { workspace = true }
+pgmig-migrate = { workspace = true }
 pgmig-model = { workspace = true }
 pgmig-plan = { workspace = true }
 pgmig-shadow = { workspace = true }

@@ -9,7 +9,7 @@ use serde::Serialize;
 const AFTER_HELP: &str = "\
 Exit codes:
   0  success
-  1  error (also: `schema validate` found errors in the files)
+  1  error (also: `schema validate` or `migrate validate` found errors)
   2  usage error (unknown flag, missing argument)
   3  `--exit-code` was given and the plan is not empty
 
@@ -30,6 +30,39 @@ enum Command {
     /// Work with schema states (SQL files or live databases).
     #[command(subcommand)]
     Schema(SchemaCommand),
+    /// Work with a migration directory (`<version>_<description>.sql` files and pgmig.sum).
+    #[command(subcommand)]
+    Migrate(MigrateCommand),
+}
+
+#[derive(Subcommand)]
+enum MigrateCommand {
+    /// Write or update the directory's sum file (pgmig.sum).
+    Hash {
+        #[command(flatten)]
+        dir: DirArg,
+        #[command(flatten)]
+        format: FormatArg,
+    },
+    /// Check the files against the sum file, and with --shadow replay them in order; prints
+    /// nothing on success.
+    Validate {
+        #[command(flatten)]
+        dir: DirArg,
+        /// Also replay every migration in order into this shadow database: `pgmem` (embedded) or
+        /// the URL of an empty Postgres database.
+        #[arg(long)]
+        shadow: Option<String>,
+        #[command(flatten)]
+        format: FormatArg,
+    },
+}
+
+#[derive(clap::Args)]
+struct DirArg {
+    /// The migration directory.
+    #[arg(long)]
+    dir: std::path::PathBuf,
 }
 
 #[derive(Subcommand)]
@@ -168,12 +201,14 @@ fn main() -> ExitCode {
 
 impl Cli {
     fn format(&self) -> Format {
-        let Command::Schema(command) = &self.command;
-        match command {
-            SchemaCommand::Diff { format, .. }
-            | SchemaCommand::Inspect { format, .. }
-            | SchemaCommand::Apply { format, .. }
-            | SchemaCommand::Validate { format, .. } => format.format,
+        match &self.command {
+            Command::Schema(
+                SchemaCommand::Diff { format, .. }
+                | SchemaCommand::Inspect { format, .. }
+                | SchemaCommand::Apply { format, .. }
+                | SchemaCommand::Validate { format, .. },
+            )
+            | Command::Migrate(MigrateCommand::Hash { format, .. } | MigrateCommand::Validate { format, .. }) => format.format,
         }
     }
 }
@@ -188,7 +223,10 @@ const CHANGES: u8 = 3;
 
 /// Builds each command's request from the flags, calls the library and prints the response.
 fn run(cli: Cli) -> anyhow::Result<ExitCode> {
-    let Command::Schema(command) = cli.command;
+    let command = match cli.command {
+        Command::Schema(command) => command,
+        Command::Migrate(command) => return migrate(command),
+    };
     match command {
         SchemaCommand::Apply { url, to, shadow, scope, dry_run, auto_approve, format, exit_code } => {
             let req = api::PlanApplyRequest {
@@ -240,6 +278,38 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             match format.format {
                 Format::Text => print!("{}", res.plan.to_sql()),
                 Format::Json => print_json(&res)?,
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn migrate(command: MigrateCommand) -> anyhow::Result<ExitCode> {
+    match command {
+        MigrateCommand::Hash { dir, format } => {
+            let res = api::migrate_hash(&api::MigrateHashRequest { dir: dir.dir })?;
+            match format.format {
+                Format::Text if res.written => {
+                    let n = res.files.len();
+                    eprintln!("wrote {} ({n} file{})", res.sum_file.display(), if n == 1 { "" } else { "s" });
+                }
+                Format::Text => eprintln!("{} is up to date", res.sum_file.display()),
+                Format::Json => print_json(&res)?,
+            }
+        }
+        MigrateCommand::Validate { dir, shadow, format } => {
+            let req = api::MigrateValidateRequest { dir: dir.dir, shadow: shadow.as_deref().map(ShadowSpec::parse) };
+            let res = api::migrate_validate(&req)?;
+            match format.format {
+                Format::Text => {
+                    for d in &res.diagnostics {
+                        eprintln!("error: {d}");
+                    }
+                }
+                Format::Json => print_json(&res)?,
+            }
+            if !res.is_valid() {
+                return Ok(ExitCode::FAILURE);
             }
         }
     }

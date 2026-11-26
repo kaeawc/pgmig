@@ -218,8 +218,11 @@ h1:<base64 sha256 of the whole directory>
 20261126101500_add_orders.sql h1:<base64>
 ```
 
-Each file's hash covers its own bytes and the previous line's hash, so changing or inserting a file
-changes every line after it. Two branches that each add a file both rewrite the last line, which
+Each file's hash is SHA-256 over the previous file's hash, its name, a zero byte and its bytes exactly
+as on disk (no newline normalization), so changing, renaming or inserting a file changes every line
+after it. The directory hash covers the file lines as written, so a hand-edited sum file is caught.
+Versions are digits, ordered as numbers; a duplicate version or a `.sql` file not named
+`<version>_<description>.sql` is an error. Two branches that each add a file both rewrite the last line, which
 guarantees a version-control conflict instead of a silent merge; `migrate rebase` resolves it.
 
 ### Revisions table
