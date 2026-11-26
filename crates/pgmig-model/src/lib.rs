@@ -2,17 +2,31 @@
 //!
 //! Object bodies hold exactly what the server prints (`format_type`, `pg_get_expr`, ...), so two
 //! objects are equal when Postgres would print them identically.
+//!
+//! # Serialization
+//!
+//! Every type is serde-serializable, with a representation that is part of pgmig's interface (the
+//! JSON output and the language packages read it): fields keep their Rust names, enums without data
+//! are snake_case strings (`"primary_key"`), a [`QualName`] is `{"schema": ..., "name": ...}`, and
+//! the maps of a [`Model`] are lists of their objects in key order (each object carries its own
+//! name, and a `QualName` cannot be a JSON object key). Text the server printed stays a string.
 
 use std::collections::BTreeMap;
 use std::fmt;
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Model {
+    #[serde(with = "as_list")]
     pub schemas: BTreeMap<String, Schema>,
+    #[serde(with = "as_list")]
     pub tables: BTreeMap<QualName, Table>,
+    #[serde(with = "as_list")]
     pub enums: BTreeMap<QualName, Enum>,
     /// Standalone sequences, including those `OWNED BY` a column (a `serial` column's sequence).
     /// Identity columns' sequences are not here: they belong to the column ([`Column::identity`]).
+    #[serde(with = "as_list")]
     pub sequences: BTreeMap<QualName, Sequence>,
 }
 
@@ -29,7 +43,7 @@ impl Model {
 /// The comment a new database's `public` schema carries (Postgres 15 and later).
 pub const PUBLIC_SCHEMA_COMMENT: &str = "standard public schema";
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct QualName {
     pub schema: String,
     pub name: String,
@@ -47,14 +61,14 @@ impl fmt::Display for QualName {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Schema {
     pub name: String,
     /// `obj_description` of the schema.
     pub comment: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Table {
     pub name: QualName,
     /// In `attnum` order. Postgres can't reorder columns, so diffs match columns by name.
@@ -77,7 +91,8 @@ impl Table {
 }
 
 /// `pg_constraint.contype`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ConstraintKind {
     PrimaryKey,
     Unique,
@@ -91,7 +106,7 @@ pub enum ConstraintKind {
 /// the definition doesn't.
 ///
 /// A constraint always lives in its table's schema.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Constraint {
     pub name: String,
     pub kind: ConstraintKind,
@@ -112,7 +127,7 @@ pub struct Constraint {
 }
 
 /// The referenced side of a foreign key.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct References {
     pub table: QualName,
     /// `confkey`.
@@ -143,7 +158,7 @@ impl Constraint {
 }
 
 /// An enum type (`pg_type.typtype = 'e'`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Enum {
     pub name: QualName,
     /// `pg_enum.enumlabel` in `enumsortorder` order.
@@ -152,7 +167,7 @@ pub struct Enum {
     pub comment: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Column {
     pub name: String,
     /// `format_type(atttypid, atttypmod)`.
@@ -174,7 +189,8 @@ pub struct Column {
 }
 
 /// How an identity column takes values (`pg_attribute.attidentity`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Generated {
     /// `GENERATED ALWAYS` (`a`).
     Always,
@@ -188,7 +204,7 @@ pub enum Generated {
 /// Equality ignores [`Identity::sequence`]: the name is whatever Postgres picked when the
 /// identity was added (truncated, or with a digit appended when the name was taken), not part of
 /// the desired state.
-#[derive(Debug, Clone, Eq)]
+#[derive(Debug, Clone, Eq, Serialize, Deserialize)]
 pub struct Identity {
     pub generated: Generated,
     pub options: SequenceOptions,
@@ -217,7 +233,7 @@ impl Identity {
 /// and whose sequence is `OWNED BY` it: the model keeps both halves as Postgres stores them (the
 /// column's [`Column::default`] and this sequence with [`Sequence::owned_by`]), so a `serial`
 /// column compares equal to the same column read back from any database.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Sequence {
     pub name: QualName,
     /// `format_type(seqtypid, NULL)`: `smallint`, `integer` or `bigint`.
@@ -230,7 +246,7 @@ pub struct Sequence {
     pub comment: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OwnedBy {
     pub table: QualName,
     pub column: String,
@@ -238,7 +254,7 @@ pub struct OwnedBy {
 
 /// A sequence's options as `pg_sequence` reports them (`seqstart`, `seqincrement`, `seqmin`,
 /// `seqmax`, `seqcache`, `seqcycle`). The current value is state, not schema, and is not here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SequenceOptions {
     pub start: i64,
     pub increment: i64,
@@ -456,6 +472,60 @@ const QUOTED_KEYWORDS: &[&str] = &[
     "xmltable",
 ];
 
+/// An object a [`Model`] map holds, keyed by its own name.
+trait Keyed {
+    type Key: Ord;
+    fn key(&self) -> Self::Key;
+}
+
+impl Keyed for Schema {
+    type Key = String;
+    fn key(&self) -> String {
+        self.name.clone()
+    }
+}
+
+macro_rules! keyed_by_qualname {
+    ($($t:ty),*) => {$(
+        impl Keyed for $t {
+            type Key = QualName;
+            fn key(&self) -> QualName {
+                self.name.clone()
+            }
+        }
+    )*};
+}
+keyed_by_qualname!(Table, Enum, Sequence);
+
+/// A `BTreeMap` of [`Keyed`] objects as a list of them in key order; a list naming one object twice
+/// is refused.
+mod as_list {
+    use std::collections::BTreeMap;
+
+    use serde::de::Error as _;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::Keyed;
+
+    pub fn serialize<V: Keyed + Serialize, S: Serializer>(map: &BTreeMap<V::Key, V>, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_seq(map.values())
+    }
+
+    pub fn deserialize<'de, V, D>(d: D) -> Result<BTreeMap<V::Key, V>, D::Error>
+    where
+        V: Keyed + Deserialize<'de>,
+        D: Deserializer<'de>,
+    {
+        let mut map = BTreeMap::new();
+        for v in Vec::<V>::deserialize(d)? {
+            if map.insert(v.key(), v).is_some() {
+                return Err(D::Error::custom("an object is listed twice"));
+            }
+        }
+        Ok(map)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -525,5 +595,192 @@ mod tests {
         assert_eq!(quote_ident("1a"), "\"1a\"");
         assert_eq!(quote_ident("a\"b"), "\"a\"\"b\"");
         assert_eq!(quote_ident("name"), "name");
+    }
+
+    /// A model with one of everything: schemas, tables with columns of every shape, constraints,
+    /// enums, sequences and comments.
+    fn sample() -> Model {
+        let t = QualName::new("app", "users");
+        let ints = SequenceOptions::defaults("integer", 1).expect("integer");
+        let mut m = Model::empty_database();
+        m.schemas.insert("app".into(), Schema { name: "app".into(), comment: None });
+        let pk = Constraint {
+            name: "users_pkey".into(),
+            kind: ConstraintKind::PrimaryKey,
+            definition: "PRIMARY KEY (id)".into(),
+            deferrable: false,
+            deferred: false,
+            validated: true,
+            columns: vec!["id".into()],
+            references: None,
+            comment: Some("the key".into()),
+        };
+        let fk = Constraint {
+            name: "users_team_fkey".into(),
+            kind: ConstraintKind::ForeignKey,
+            definition: "FOREIGN KEY (team) REFERENCES app.teams(id) DEFERRABLE".into(),
+            deferrable: true,
+            deferred: false,
+            validated: false,
+            columns: vec!["team".into()],
+            references: Some(References {
+                table: QualName::new("app", "teams"),
+                columns: vec!["id".into()],
+                constraint: Some("teams_pkey".into()),
+            }),
+            comment: None,
+        };
+        let column = |name: &str, type_name: &str| Column {
+            name: name.into(),
+            type_name: type_name.into(),
+            type_ref: None,
+            not_null: false,
+            default: None,
+            comment: None,
+            default_sequences: vec![],
+            identity: None,
+        };
+        let columns = vec![
+            Column {
+                identity: Some(Identity {
+                    generated: Generated::ByDefault,
+                    options: ints,
+                    sequence: Some(QualName::new("app", "users_id_seq")),
+                }),
+                not_null: true,
+                ..column("id", "integer")
+            },
+            Column {
+                default: Some("nextval('app.users_n_seq'::regclass)".into()),
+                default_sequences: vec![QualName::new("app", "users_n_seq")],
+                not_null: true,
+                ..column("n", "integer")
+            },
+            Column { type_ref: Some(QualName::new("app", "mood")), comment: Some("how they feel".into()), ..column("mood", "app.mood[]") },
+            column("team", "integer"),
+        ];
+        m.tables.insert(t.clone(), Table { name: t.clone(), columns, comment: Some("people".into()), constraints: vec![pk, fk] });
+        let mood = QualName::new("app", "mood");
+        m.enums.insert(mood.clone(), Enum { name: mood, labels: vec!["sad".into(), "ok".into()], comment: None });
+        let seq = QualName::new("app", "users_n_seq");
+        m.sequences.insert(
+            seq.clone(),
+            Sequence {
+                name: seq,
+                data_type: "integer".into(),
+                options: SequenceOptions { cycle: true, ..ints },
+                owned_by: Some(OwnedBy { table: t, column: "n".into() }),
+                comment: Some("counter".into()),
+            },
+        );
+        m
+    }
+
+    #[test]
+    fn model_round_trips_through_json() {
+        let m = sample();
+        let json = serde_json::to_string(&m).expect("serialize");
+        let back: Model = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, m);
+        // `Identity` equality ignores the sequence name; the JSON does not.
+        assert_eq!(serde_json::to_string(&back).expect("serialize"), json);
+    }
+
+    #[test]
+    fn model_lists_refuse_duplicates() {
+        let s = r#"{"schemas":[{"name":"a","comment":null},{"name":"a","comment":null}],"tables":[],"enums":[],"sequences":[]}"#;
+        let err = serde_json::from_str::<Model>(s).expect_err("duplicate schema");
+        assert!(err.to_string().contains("listed twice"), "{err}");
+    }
+
+    /// The JSON of a model is part of pgmig's interface: a change here must be deliberate.
+    #[test]
+    fn model_json_is_pinned() {
+        let t = QualName::new("public", "t");
+        let mut m = Model::empty_database();
+        let id = Column {
+            name: "id".into(),
+            type_name: "bigint".into(),
+            type_ref: None,
+            not_null: true,
+            default: None,
+            comment: None,
+            default_sequences: vec![],
+            identity: Some(Identity {
+                generated: Generated::Always,
+                options: SequenceOptions::defaults("bigint", 1).expect("bigint"),
+                sequence: None,
+            }),
+        };
+        let check = Constraint {
+            name: "t_id_check".into(),
+            kind: ConstraintKind::Check,
+            definition: "CHECK ((id > 0))".into(),
+            deferrable: false,
+            deferred: false,
+            validated: true,
+            columns: vec!["id".into()],
+            references: None,
+            comment: None,
+        };
+        m.tables.insert(t.clone(), Table { name: t, columns: vec![id], comment: None, constraints: vec![check] });
+        let want = r#"{
+  "schemas": [
+    {
+      "name": "public",
+      "comment": "standard public schema"
+    }
+  ],
+  "tables": [
+    {
+      "name": {
+        "schema": "public",
+        "name": "t"
+      },
+      "columns": [
+        {
+          "name": "id",
+          "type_name": "bigint",
+          "type_ref": null,
+          "not_null": true,
+          "default": null,
+          "comment": null,
+          "default_sequences": [],
+          "identity": {
+            "generated": "always",
+            "options": {
+              "start": 1,
+              "increment": 1,
+              "min": 1,
+              "max": 9223372036854775807,
+              "cache": 1,
+              "cycle": false
+            },
+            "sequence": null
+          }
+        }
+      ],
+      "comment": null,
+      "constraints": [
+        {
+          "name": "t_id_check",
+          "kind": "check",
+          "definition": "CHECK ((id > 0))",
+          "deferrable": false,
+          "deferred": false,
+          "validated": true,
+          "columns": [
+            "id"
+          ],
+          "references": null,
+          "comment": null
+        }
+      ]
+    }
+  ],
+  "enums": [],
+  "sequences": []
+}"#;
+        assert_eq!(serde_json::to_string_pretty(&m).expect("serialize"), want);
     }
 }

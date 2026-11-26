@@ -23,6 +23,7 @@ pgmig-model = { workspace = true }
 pgmig-plan = { workspace = true }
 pgmig-shadow = { workspace = true }
 pgmig-sql = { workspace = true }
+serde = { workspace = true }
 thiserror = { workspace = true }
 
 [lints]
@@ -30,3 +31,4 @@ workspace = true
 
 [dev-dependencies]
 pgmem = { workspace = true }
+serde_json = { workspace = true }

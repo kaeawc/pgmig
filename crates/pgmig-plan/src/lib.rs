@@ -48,8 +48,11 @@ pub mod graph;
 use graph::{Deps, Node, Object};
 use pgmig_diff::{Change, CommentTarget, EnumPosition};
 use pgmig_model::{Column, Constraint, Generated, Identity, OwnedBy, QualName, SequenceOptions, quote_ident, quote_literal};
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Serialized as `{"statements": [...], "commit_after": <index or null>}`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Plan {
     pub statements: Vec<String>,
     /// The index of the last statement that must be committed before the statements after it run
@@ -94,7 +97,7 @@ pub enum Error {
 }
 
 /// How a plan prints object names.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanOptions {
     /// Objects in this schema are printed unqualified (`CREATE TABLE t`, not `public.t`): the plan
     /// is meant to run with the schema first on the `search_path`. Names in other schemas, and
@@ -313,10 +316,10 @@ fn deps(change: &Change) -> Deps {
             let requires = match target {
                 CommentTarget::Schema(s) => vec![Object::Schema(s.clone())],
                 CommentTarget::Table(t) => vec![in_table(t)],
-                CommentTarget::Column(t, c) => vec![in_table(t), column(t, c)],
+                CommentTarget::Column { table: t, column: c } => vec![in_table(t), column(t, c)],
                 CommentTarget::Type(t) => vec![Object::Type(t.clone())],
                 CommentTarget::Sequence(s) => vec![Object::Sequence(s.clone())],
-                CommentTarget::Constraint(t, c) => vec![in_table(t), constraint(t, c)],
+                CommentTarget::Constraint { table: t, name: c } => vec![in_table(t), constraint(t, c)],
             };
             Deps { requires, ..Deps::default() }
         }
@@ -565,10 +568,10 @@ fn statement(change: &Change, opts: &PlanOptions) -> String {
             let object = match target {
                 CommentTarget::Schema(s) => format!("SCHEMA {}", quote_ident(s)),
                 CommentTarget::Table(t) => format!("TABLE {}", n(t)),
-                CommentTarget::Column(t, c) => format!("COLUMN {}.{}", n(t), quote_ident(c)),
+                CommentTarget::Column { table: t, column: c } => format!("COLUMN {}.{}", n(t), quote_ident(c)),
                 CommentTarget::Type(t) => format!("TYPE {}", n(t)),
                 CommentTarget::Sequence(s) => format!("SEQUENCE {}", n(s)),
-                CommentTarget::Constraint(t, c) => format!("CONSTRAINT {} ON {}", quote_ident(c), n(t)),
+                CommentTarget::Constraint { table: t, name: c } => format!("CONSTRAINT {} ON {}", quote_ident(c), n(t)),
             };
             format!("COMMENT ON {object} IS {}", comment.as_deref().map_or("NULL".to_owned(), quote_literal))
         }
@@ -600,6 +603,18 @@ fn column_def(c: &Column) -> String {
 mod tests {
     use super::*;
     use pgmig_model::{Enum, Sequence, Table};
+
+    /// The JSON of a plan is part of pgmig's interface: a change here must be deliberate.
+    #[test]
+    fn plan_json_is_pinned_and_round_trips() {
+        let plan = Plan { statements: vec!["ALTER TYPE e ADD VALUE 'b'".into(), "CREATE TABLE t (c e)".into()], commit_after: Some(0) };
+        let json = serde_json::to_string(&plan).expect("serialize");
+        assert_eq!(json, r#"{"statements":["ALTER TYPE e ADD VALUE 'b'","CREATE TABLE t (c e)"],"commit_after":0}"#);
+        assert_eq!(serde_json::from_str::<Plan>(&json).expect("deserialize"), plan);
+        let empty = Plan::default();
+        assert_eq!(serde_json::to_string(&empty).expect("serialize"), r#"{"statements":[],"commit_after":null}"#);
+        assert_eq!(serde_json::from_str::<Plan>(r#"{"statements":[],"commit_after":null}"#).expect("deserialize"), empty);
+    }
 
     fn col(name: &str, type_ref: Option<QualName>) -> Column {
         let type_name = type_ref.as_ref().map_or("integer".to_owned(), |t| t.name.clone());
@@ -755,7 +770,7 @@ mod tests {
         let mut created = table("app", "t", vec![col("id", None)]);
         created.comment = Some("it's".into());
         let changes = [
-            Change::SetComment { target: CommentTarget::Column(t.clone(), "id".into()), comment: Some("a\\b\nc".into()) },
+            Change::SetComment { target: CommentTarget::Column { table: t.clone(), column: "id".into() }, comment: Some("a\\b\nc".into()) },
             Change::SetComment { target: CommentTarget::Table(t.clone()), comment: Some("it's".into()) },
             Change::SetComment { target: CommentTarget::Schema("app".into()), comment: None },
             Change::CreateTable(created),
@@ -1259,7 +1274,7 @@ mod tests {
             Change::CreateTable(t.clone()),
             Change::CreateSequence(sequence("Seq", "bigint", opts("bigint", 1))),
             Change::SetSequenceOwner { name: QualName::new("public", "Seq"), owned_by: owned, old: None },
-            Change::SetComment { target: CommentTarget::Column(t.name.clone(), "id".into()), comment: None },
+            Change::SetComment { target: CommentTarget::Column { table: t.name.clone(), column: "id".into() }, comment: None },
             Change::AddConstraint { table: t.name.clone(), constraint: fkey("t", "pid", "p") },
             Change::SetComment { target: CommentTarget::Type(QualName::new("app", "mood")), comment: None },
         ];
@@ -1299,7 +1314,7 @@ mod tests {
         assert_eq!(alter(true, false), ["ALTER TABLE \"App\".t ALTER CONSTRAINT \"Odd\" DEFERRABLE INITIALLY IMMEDIATE"]);
         assert_eq!(alter(false, false), ["ALTER TABLE \"App\".t ALTER CONSTRAINT \"Odd\" NOT DEFERRABLE"]);
         let renamed = sql(&[
-            Change::SetComment { target: CommentTarget::Constraint(t.clone(), "Odd".into()), comment: Some("it's".into()) },
+            Change::SetComment { target: CommentTarget::Constraint { table: t.clone(), name: "Odd".into() }, comment: Some("it's".into()) },
             Change::RenameConstraint { table: t.clone(), from: "old".into(), to: deferred.clone() },
         ]);
         assert_eq!(

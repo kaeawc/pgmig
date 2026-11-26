@@ -1,7 +1,15 @@
-//! pgmig's library surface. Every CLI command is one function here.
+//! pgmig's library surface. Every CLI command is one function here, and one in [`api`] taking and
+//! returning serde types (what the CLI, JSON output and language packages call).
+//!
+//! [`Source`] and [`ShadowSpec`] serialize adjacently tagged, like the changes of a plan:
+//! `{"kind": "sql", "data": "schema/"}`, `{"kind": "database", "data": "postgres://..."}`,
+//! `{"kind": "pgmem"}`, `{"kind": "postgres", "data": "host=..."}`.
 
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
+pub mod api;
 mod files;
 pub mod filter;
 
@@ -82,7 +90,8 @@ fn apply_message(index: &Option<usize>, statement: &str, source: &pgmig_conn::Er
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// A schema state: SQL files describing it, or a live database.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Source {
     /// A `.sql` file, or a directory of them loaded in lexical order, after the files they
     /// `-- pgmig:import`.
@@ -103,7 +112,8 @@ impl Source {
 }
 
 /// Where desired-state SQL is executed.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ShadowSpec {
     #[default]
     Pgmem,
@@ -124,8 +134,10 @@ impl ShadowSpec {
     }
 }
 
-/// What pgmig manages, and how it prints names.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// What pgmig manages, and how it prints names. Serialized as `{"filter": {...}, "schema": ...}`;
+/// both may be left out.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Options {
     /// Which objects are managed (see [`filter`]).
     pub filter: Filter,
@@ -215,16 +227,19 @@ pub fn schema_validate(source: &Source, shadow: &ShadowSpec) -> Result<()> {
 
 /// `schema diff`: the plan that turns `from` into `to`, for the objects `opts` manages.
 pub fn schema_diff(from: &Source, to: &Source, shadow: &ShadowSpec, opts: &Options) -> Result<Plan> {
-    diff_sources(from, to, shadow, opts, &opts.plan_options())
+    diff_sources(from, to, shadow, opts, &opts.plan_options()).map(|(_, plan)| plan)
 }
 
-/// The plan that turns `from` into `to` for the objects `opts` manages, naming them as `names` says.
-fn diff_sources(from: &Source, to: &Source, shadow: &ShadowSpec, opts: &Options, names: &PlanOptions) -> Result<Plan> {
+/// The changes that turn `from` into `to` for the objects `opts` manages, and their plan, naming
+/// them as `names` says.
+fn diff_sources(from: &Source, to: &Source, shadow: &ShadowSpec, opts: &Options, names: &PlanOptions) -> Result<(Vec<Change>, Plan)> {
     // `from`'s shadow is wiped before `to`'s opens: a real Postgres shadow must start empty.
     let a = opts.managed(&load_model(from, shadow)?);
     let (b, mut loaded) = open_model(to, shadow)?;
     let b = opts.managed(&b);
-    Ok(plan_with(&diff_with_casts(&a, &b, loaded.conn()), names)?)
+    let changes = diff_with_casts(&a, &b, loaded.conn());
+    let plan = plan_with(&changes, names)?;
+    Ok((changes, plan))
 }
 
 /// `diff(a, b)`, with each type change that has no assignment cast converting `USING` an explicit
@@ -255,8 +270,14 @@ pub fn assignment_castable(conn: &mut Conn, from: &str, to: &str) -> bool {
 
 /// `schema inspect`: SQL that recreates the objects `opts` manages in a new database.
 pub fn schema_inspect(source: &Source, shadow: &ShadowSpec, opts: &Options) -> Result<Plan> {
+    inspect_source(source, shadow, opts).map(|(_, plan)| plan)
+}
+
+/// The model of the objects `opts` manages in `source`, and the plan that recreates them.
+fn inspect_source(source: &Source, shadow: &ShadowSpec, opts: &Options) -> Result<(Model, Plan)> {
     let m = opts.managed(&load_model(source, shadow)?);
-    Ok(plan_with(&diff(&opts.empty_database(), &m), &opts.plan_options())?)
+    let plan = plan_with(&diff(&opts.empty_database(), &m), &opts.plan_options())?;
+    Ok((m, plan))
 }
 
 /// `schema apply`, first half: the plan that turns the database at `target` into `desired`.
@@ -265,11 +286,16 @@ pub fn schema_inspect(source: &Source, shadow: &ShadowSpec, opts: &Options) -> R
 /// `DROP TABLE x` would drop whichever `x` the target's `search_path` finds first, which need not
 /// be the managed schema's. Schema mode still limits which objects are managed.
 pub fn schema_plan_apply(target: &str, desired: &Source, shadow: &ShadowSpec, opts: &Options) -> Result<Plan> {
+    plan_apply_changes(target, desired, shadow, opts).map(|(_, plan)| plan)
+}
+
+/// [`schema_plan_apply`], with the changes the plan makes.
+fn plan_apply_changes(target: &str, desired: &Source, shadow: &ShadowSpec, opts: &Options) -> Result<(Vec<Change>, Plan)> {
     diff_sources(&Source::Database(target.to_owned()), desired, shadow, opts, &PlanOptions::default())
 }
 
 /// What [`apply`] did.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApplyReport {
     /// Transactions committed (one per [`Plan::batches`] entry).
     pub batches: usize,

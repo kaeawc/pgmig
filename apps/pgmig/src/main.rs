@@ -2,6 +2,7 @@ use std::io::{BufRead, IsTerminal, Write};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use pgmig::api::{self, ApiError};
 use pgmig::{Filter, Options, ShadowSpec, Source};
 
 #[derive(Parser)]
@@ -94,13 +95,13 @@ struct ScopeArgs {
 
 impl ScopeArgs {
     fn options(&self) -> anyhow::Result<Options> {
-        Ok(Options { filter: Filter::parse(&self.include, &self.exclude)?, schema: self.schema.clone() })
+        Ok(Options { filter: Filter::parse(&self.include, &self.exclude).map_err(ApiError::from)?, schema: self.schema.clone() })
     }
 }
 
 fn main() -> ExitCode {
     match run(Cli::parse()) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(e) => {
             // Library errors already include their cause in their message; `{e:#}` would repeat it.
             eprintln!("error: {e}");
@@ -109,27 +110,53 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(cli: Cli) -> anyhow::Result<()> {
-    let plan = match cli.command {
-        Command::Schema(SchemaCommand::Apply { url, to, shadow, scope, dry_run, auto_approve }) => {
-            return schema_apply(&url, &to, &shadow.shadow, &scope.options()?, dry_run, auto_approve);
+/// Builds each command's request from the flags, calls the library and prints the response.
+fn run(cli: Cli) -> anyhow::Result<ExitCode> {
+    let Command::Schema(command) = cli.command;
+    match command {
+        SchemaCommand::Apply { url, to, shadow, scope, dry_run, auto_approve } => {
+            let req = api::PlanApplyRequest {
+                target: url,
+                desired: Source::parse(&to),
+                shadow: ShadowSpec::parse(&shadow.shadow),
+                options: scope.options()?,
+            };
+            schema_apply(req, dry_run, auto_approve)?;
         }
-        Command::Schema(SchemaCommand::Diff { from, to, shadow, scope }) => {
-            pgmig::schema_diff(&Source::parse(&from), &Source::parse(&to), &ShadowSpec::parse(&shadow.shadow), &scope.options()?)?
+        SchemaCommand::Diff { from, to, shadow, scope } => {
+            let req = api::DiffRequest {
+                from: Source::parse(&from),
+                to: Source::parse(&to),
+                shadow: ShadowSpec::parse(&shadow.shadow),
+                options: scope.options()?,
+            };
+            print!("{}", api::schema_diff(&req)?.plan.to_sql());
         }
-        Command::Schema(SchemaCommand::Validate { source, shadow }) => {
-            return Ok(pgmig::schema_validate(&Source::parse(&source), &ShadowSpec::parse(&shadow.shadow))?);
+        SchemaCommand::Validate { source, shadow } => {
+            let req = api::ValidateRequest { source: Source::parse(&source), shadow: ShadowSpec::parse(&shadow.shadow) };
+            let res = api::schema_validate(&req)?;
+            for d in &res.diagnostics {
+                eprintln!("error: {d}");
+            }
+            if !res.is_valid() {
+                return Ok(ExitCode::FAILURE);
+            }
         }
-        Command::Schema(SchemaCommand::Inspect { source, shadow, scope }) => {
-            pgmig::schema_inspect(&Source::parse(&source), &ShadowSpec::parse(&shadow.shadow), &scope.options()?)?
+        SchemaCommand::Inspect { source, shadow, scope } => {
+            let req = api::InspectRequest {
+                source: Source::parse(&source),
+                shadow: ShadowSpec::parse(&shadow.shadow),
+                options: scope.options()?,
+            };
+            print!("{}", api::schema_inspect(&req)?.plan.to_sql());
         }
-    };
-    print!("{}", plan.to_sql());
-    Ok(())
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
-fn schema_apply(url: &str, to: &str, shadow: &str, opts: &Options, dry_run: bool, auto_approve: bool) -> anyhow::Result<()> {
-    let plan = pgmig::schema_plan_apply(url, &Source::parse(to), &ShadowSpec::parse(shadow), opts)?;
+/// Shows the plan, asks (unless told not to), then applies it.
+fn schema_apply(req: api::PlanApplyRequest, dry_run: bool, auto_approve: bool) -> anyhow::Result<()> {
+    let plan = api::schema_plan_apply(&req)?.plan;
     if plan.is_empty() {
         eprintln!("no changes");
         return Ok(());
@@ -152,7 +179,7 @@ fn schema_apply(url: &str, to: &str, shadow: &str, opts: &Options, dry_run: bool
             anyhow::bail!("not applied");
         }
     }
-    let report = pgmig::apply(url, &plan)?;
+    let report = api::apply(&api::ApplyRequest { target: req.target, plan })?;
     eprintln!("applied {} statements in {} transaction(s)", report.statements, report.batches);
     Ok(())
 }
