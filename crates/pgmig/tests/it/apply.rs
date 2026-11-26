@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use pgmig::{Error, ShadowSpec, Source, apply, schema_plan_apply};
+use pgmig::{Error, Options, ShadowSpec, Source, apply, schema_plan_apply};
 
 use crate::support::{TestDb, postgres_dsn};
 
@@ -56,13 +56,13 @@ fn apply_then_plan_again_is_empty() {
     let desired = Desired::new("CREATE SCHEMA app; CREATE TABLE t (id int NOT NULL, name text DEFAULT 'x'); CREATE TABLE app.u (id int);");
     let (shadow, _shadow_db) = shadow_spec();
 
-    let plan = schema_plan_apply(&db.conninfo, &desired.source(), &shadow).expect("plan");
+    let plan = schema_plan_apply(&db.conninfo, &desired.source(), &shadow, &Options::default()).expect("plan");
     assert!(!plan.is_empty());
     let report = apply(&db.conninfo, &plan).expect("apply");
     assert_eq!(report.batches, 1);
     assert_eq!(report.statements, plan.statements.len());
 
-    let again = schema_plan_apply(&db.conninfo, &desired.source(), &shadow).expect("plan again");
+    let again = schema_plan_apply(&db.conninfo, &desired.source(), &shadow, &Options::default()).expect("plan again");
     assert!(again.is_empty(), "changes left after apply:\n{}", again.to_sql());
 }
 
@@ -73,7 +73,7 @@ fn failing_statement_rolls_back_its_batch() {
     let desired = Desired::new("CREATE TABLE t (a int, b int NOT NULL, c text);");
     let (shadow, _shadow_db) = shadow_spec();
 
-    let plan = schema_plan_apply(&db.conninfo, &desired.source(), &shadow).expect("plan");
+    let plan = schema_plan_apply(&db.conninfo, &desired.source(), &shadow, &Options::default()).expect("plan");
     let failing = plan.statements.iter().position(|s| s.contains("SET NOT NULL")).expect("SET NOT NULL planned");
     assert!(plan.statements[..failing].iter().any(|s| s.contains("ADD COLUMN")), "ADD COLUMN runs first:\n{}", plan.to_sql());
 
@@ -98,12 +98,12 @@ fn enum_value_and_its_use_apply_in_two_batches() {
     let desired = Desired::new("CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy'); CREATE TABLE p (id int, m mood DEFAULT 'ok');");
     let (shadow, _shadow_db) = shadow_spec();
 
-    let plan = schema_plan_apply(&db.conninfo, &desired.source(), &shadow).expect("plan");
+    let plan = schema_plan_apply(&db.conninfo, &desired.source(), &shadow, &Options::default()).expect("plan");
     assert_eq!(plan.batches().len(), 2, "{}", plan.to_sql());
     let report = apply(&db.conninfo, &plan).expect("apply");
     assert_eq!(report.batches, 2);
 
-    let again = schema_plan_apply(&db.conninfo, &desired.source(), &shadow).expect("plan again");
+    let again = schema_plan_apply(&db.conninfo, &desired.source(), &shadow, &Options::default()).expect("plan again");
     assert!(again.is_empty(), "changes left after apply:\n{}", again.to_sql());
 }
 
@@ -112,7 +112,7 @@ fn empty_plan_applies_nothing() {
     let db = target("CREATE TABLE t (id int);");
     let desired = Desired::new("CREATE TABLE t (id int);");
     let (shadow, _shadow_db) = shadow_spec();
-    let plan = schema_plan_apply(&db.conninfo, &desired.source(), &shadow).expect("plan");
+    let plan = schema_plan_apply(&db.conninfo, &desired.source(), &shadow, &Options::default()).expect("plan");
     assert!(plan.is_empty(), "{}", plan.to_sql());
     assert_eq!(apply(&db.conninfo, &plan).expect("apply"), pgmig::ApplyReport::default());
 }

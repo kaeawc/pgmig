@@ -30,6 +30,14 @@ cargo run -p pgmig-cli -- schema inspect postgres://localhost/app
 `--shadow <url>` runs SQL files in an empty real Postgres database instead of pgmem (for
 extensions pgmem doesn't have).
 
+`--include` / `--exclude` (repeatable) limit what `diff`, `inspect` and `apply` manage, by
+`[kind:]schema[.object[.column]]` globs (`*`, `?`; kind `schema`, `table`, `enum` or `sequence`):
+`--exclude 'public.tmp_*'` leaves those objects alone on both sides. A managed object may reference
+an unmanaged one (a foreign key to an excluded table); the plan assumes it exists. `--schema <name>`
+manages one schema's objects (not the schema itself); `inspect` and `diff` print their names
+unqualified, while `apply` prints and runs schema-qualified SQL so the target's `search_path` cannot
+redirect a statement to another schema. Without it, every schema is managed and names are qualified.
+
 ## Layout
 
 | Path | What |

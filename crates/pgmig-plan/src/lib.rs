@@ -34,6 +34,12 @@
 //! without a cycle. A foreign key is dropped before the table or constraint it references; a
 //! constraint is dropped before the columns it uses change or go, and added after they are set.
 //!
+//! # Objects outside the changes
+//!
+//! A change may reference an object no change creates or drops: one that already exists and is
+//! left alone, or one pgmig does not manage (filtered out, or outside the schema in scope). Such a
+//! reference orders nothing; the plan assumes the object exists.
+//!
 //! Changes Postgres cannot make in place (removing or reordering enum values) fail the plan with
 //! [`Error::Unsupported`].
 
@@ -87,23 +93,47 @@ pub enum Error {
     Unsupported(Vec<String>),
 }
 
+/// How a plan prints object names.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlanOptions {
+    /// Objects in this schema are printed unqualified (`CREATE TABLE t`, not `public.t`): the plan
+    /// is meant to run with the schema first on the `search_path`. Names in other schemas, and
+    /// SQL the server printed (types, defaults, constraint definitions), are left as they are.
+    pub unqualified_schema: Option<String>,
+}
+
+impl PlanOptions {
+    /// `name` as statements print it.
+    pub fn name(&self, name: &QualName) -> String {
+        match &self.unqualified_schema {
+            Some(s) if *s == name.schema => quote_ident(&name.name),
+            _ => name.to_string(),
+        }
+    }
+}
+
+/// [`plan_with`] with qualified names.
 pub fn plan(changes: &[Change]) -> Result<Plan, Error> {
+    plan_with(changes, &PlanOptions::default())
+}
+
+pub fn plan_with(changes: &[Change], opts: &PlanOptions) -> Result<Plan, Error> {
     let unsupported: Vec<String> = changes.iter().filter_map(unsupported).collect();
     if !unsupported.is_empty() {
         return Err(Error::Unsupported(unsupported));
     }
     let (adds, rest): (Vec<&Change>, Vec<&Change>) = changes.iter().partition(|c| matches!(c, Change::AddEnumValue { .. }));
-    let mut statements = sorted(&adds)?;
+    let mut statements = sorted(&adds, opts)?;
     let commit_after = (!statements.is_empty() && !rest.is_empty()).then(|| statements.len() - 1);
-    statements.extend(sorted(&rest)?);
+    statements.extend(sorted(&rest, opts)?);
     Ok(Plan { statements, commit_after })
 }
 
-fn sorted(changes: &[&Change]) -> Result<Vec<String>, Error> {
+fn sorted(changes: &[&Change], opts: &PlanOptions) -> Result<Vec<String>, Error> {
     let nodes: Vec<Node> = changes.iter().map(|c| Node { phase: phase(c), deps: deps(c) }).collect();
     match graph::sort(&nodes) {
-        Ok(order) => Ok(order.into_iter().map(|i| statement(changes[i])).collect()),
-        Err(graph::Cycle(steps)) => Err(Error::Cycle(steps.into_iter().map(|i| statement(changes[i])).collect())),
+        Ok(order) => Ok(order.into_iter().map(|i| statement(changes[i], opts)).collect()),
+        Err(graph::Cycle(steps)) => Err(Error::Cycle(steps.into_iter().map(|i| statement(changes[i], opts)).collect())),
     }
 }
 
@@ -421,7 +451,8 @@ fn identity_clause(type_name: &str, identity: &Identity) -> String {
     s
 }
 
-fn statement(change: &Change) -> String {
+fn statement(change: &Change, opts: &PlanOptions) -> String {
+    let n = |q: &QualName| opts.name(q);
     match change {
         Change::CreateSchema(name) => format!("CREATE SCHEMA {}", quote_ident(name)),
         Change::DropSchema(name) => format!("DROP SCHEMA {}", quote_ident(name)),
@@ -429,19 +460,19 @@ fn statement(change: &Change) -> String {
             let mut cols: Vec<String> = t.columns.iter().map(|c| format!("    {}", column_def(c))).collect();
             cols.extend(t.constraints.iter().map(|c| format!("    {}", constraint_def(c))));
             if cols.is_empty() {
-                format!("CREATE TABLE {} ()", t.name)
+                format!("CREATE TABLE {} ()", n(&t.name))
             } else {
-                format!("CREATE TABLE {} (\n{}\n)", t.name, cols.join(",\n"))
+                format!("CREATE TABLE {} (\n{}\n)", n(&t.name), cols.join(",\n"))
             }
         }
-        Change::DropTable { table: t, .. } => format!("DROP TABLE {}", t.name),
+        Change::DropTable { table: t, .. } => format!("DROP TABLE {}", n(&t.name)),
         Change::CreateEnum(e) => {
             let labels: Vec<String> = e.labels.iter().map(|l| quote_literal(l)).collect();
-            format!("CREATE TYPE {} AS ENUM ({})", e.name, labels.join(", "))
+            format!("CREATE TYPE {} AS ENUM ({})", n(&e.name), labels.join(", "))
         }
-        Change::DropEnum(e) => format!("DROP TYPE {}", e.name),
+        Change::DropEnum(e) => format!("DROP TYPE {}", n(&e.name)),
         Change::CreateSequence(seq) => {
-            let mut s = format!("CREATE SEQUENCE {}", seq.name);
+            let mut s = format!("CREATE SEQUENCE {}", n(&seq.name));
             if seq.data_type != "bigint" {
                 s.push_str(&format!(" AS {}", seq.data_type));
             }
@@ -451,10 +482,10 @@ fn statement(change: &Change) -> String {
             }
             s
         }
-        Change::DropSequence(seq) => format!("DROP SEQUENCE {}", seq.name),
+        Change::DropSequence(seq) => format!("DROP SEQUENCE {}", n(&seq.name)),
         Change::AlterSequence { from, to } => {
             let retyped = from.data_type != to.data_type;
-            let mut s = format!("ALTER SEQUENCE {}", to.name);
+            let mut s = format!("ALTER SEQUENCE {}", n(&to.name));
             if retyped {
                 s.push_str(&format!(" AS {}", to.data_type));
             }
@@ -465,20 +496,22 @@ fn statement(change: &Change) -> String {
             s
         }
         Change::SetSequenceOwner { name, owned_by, .. } => match owned_by {
-            Some(o) => format!("ALTER SEQUENCE {name} OWNED BY {}.{}", o.table, quote_ident(&o.column)),
-            None => format!("ALTER SEQUENCE {name} OWNED BY NONE"),
+            Some(o) => format!("ALTER SEQUENCE {} OWNED BY {}.{}", n(name), n(&o.table), quote_ident(&o.column)),
+            None => format!("ALTER SEQUENCE {} OWNED BY NONE", n(name)),
         },
         Change::AddIdentity { table, column, type_name, identity } => {
-            format!("ALTER TABLE {table} ALTER COLUMN {} ADD {}", quote_ident(column), identity_clause(type_name, identity))
+            format!("ALTER TABLE {} ALTER COLUMN {} ADD {}", n(table), quote_ident(column), identity_clause(type_name, identity))
         }
-        Change::DropIdentity { table, column, .. } => format!("ALTER TABLE {table} ALTER COLUMN {} DROP IDENTITY", quote_ident(column)),
+        Change::DropIdentity { table, column, .. } => {
+            format!("ALTER TABLE {} ALTER COLUMN {} DROP IDENTITY", n(table), quote_ident(column))
+        }
         Change::AlterIdentity { table, column, from, to, type_changed, .. } => {
             let mut parts = Vec::new();
             if from.generated != to.generated {
                 parts.push(format!("SET GENERATED {}", generated(to.generated)));
             }
             parts.extend(option_clauses(Some(&from.options), &to.options, *type_changed).into_iter().map(|o| format!("SET {o}")));
-            format!("ALTER TABLE {table} ALTER COLUMN {} {}", quote_ident(column), parts.join(" "))
+            format!("ALTER TABLE {} ALTER COLUMN {} {}", n(table), quote_ident(column), parts.join(" "))
         }
         Change::AddEnumValue { name, value, position } => {
             let at = match position {
@@ -486,38 +519,39 @@ fn statement(change: &Change) -> String {
                 EnumPosition::After(l) => format!(" AFTER {}", quote_literal(l)),
                 EnumPosition::End => String::new(),
             };
-            format!("ALTER TYPE {name} ADD VALUE {}{at}", quote_literal(value))
+            format!("ALTER TYPE {} ADD VALUE {}{at}", n(name), quote_literal(value))
         }
         Change::RenameEnumValue { name, from, to } => {
             // The catalog cannot tell a rename from removing one value and adding another, so say
             // what this does to stored data.
             format!(
-                "-- renames a value: rows holding {} will hold {}\nALTER TYPE {name} RENAME VALUE {} TO {}",
+                "-- renames a value: rows holding {} will hold {}\nALTER TYPE {} RENAME VALUE {} TO {}",
                 quote_literal(from),
                 quote_literal(to),
+                n(name),
                 quote_literal(from),
                 quote_literal(to)
             )
         }
-        Change::UnsupportedEnumChange { name, .. } => format!("-- unsupported change to enum {name}"),
-        Change::AddColumn { table, column } => format!("ALTER TABLE {table} ADD COLUMN {}", column_def(column)),
-        Change::DropColumn { table, column, .. } => format!("ALTER TABLE {table} DROP COLUMN {}", quote_ident(column)),
+        Change::UnsupportedEnumChange { name, .. } => format!("-- unsupported change to enum {}", n(name)),
+        Change::AddColumn { table, column } => format!("ALTER TABLE {} ADD COLUMN {}", n(table), column_def(column)),
+        Change::DropColumn { table, column, .. } => format!("ALTER TABLE {} DROP COLUMN {}", n(table), quote_ident(column)),
         Change::AlterColumnType { table, column, type_name, using, .. } => {
             let using = using.as_ref().map(|u| format!(" USING {u}")).unwrap_or_default();
-            format!("ALTER TABLE {table} ALTER COLUMN {} TYPE {type_name}{using}", quote_ident(column))
+            format!("ALTER TABLE {} ALTER COLUMN {} TYPE {type_name}{using}", n(table), quote_ident(column))
         }
-        Change::SetNotNull { table, column } => format!("ALTER TABLE {table} ALTER COLUMN {} SET NOT NULL", quote_ident(column)),
-        Change::DropNotNull { table, column } => format!("ALTER TABLE {table} ALTER COLUMN {} DROP NOT NULL", quote_ident(column)),
+        Change::SetNotNull { table, column } => format!("ALTER TABLE {} ALTER COLUMN {} SET NOT NULL", n(table), quote_ident(column)),
+        Change::DropNotNull { table, column } => format!("ALTER TABLE {} ALTER COLUMN {} DROP NOT NULL", n(table), quote_ident(column)),
         Change::SetDefault { table, column, default, .. } => {
-            format!("ALTER TABLE {table} ALTER COLUMN {} SET DEFAULT {default}", quote_ident(column))
+            format!("ALTER TABLE {} ALTER COLUMN {} SET DEFAULT {default}", n(table), quote_ident(column))
         }
-        Change::DropDefault { table, column, .. } => format!("ALTER TABLE {table} ALTER COLUMN {} DROP DEFAULT", quote_ident(column)),
-        Change::AddConstraint { table, constraint } => format!("ALTER TABLE {table} ADD {}", constraint_def(constraint)),
+        Change::DropDefault { table, column, .. } => format!("ALTER TABLE {} ALTER COLUMN {} DROP DEFAULT", n(table), quote_ident(column)),
+        Change::AddConstraint { table, constraint } => format!("ALTER TABLE {} ADD {}", n(table), constraint_def(constraint)),
         Change::DropConstraint { table, constraint } => {
-            format!("ALTER TABLE {table} DROP CONSTRAINT {}", quote_ident(&constraint.name))
+            format!("ALTER TABLE {} DROP CONSTRAINT {}", n(table), quote_ident(&constraint.name))
         }
         Change::RenameConstraint { table, from, to } => {
-            format!("ALTER TABLE {table} RENAME CONSTRAINT {} TO {}", quote_ident(from), quote_ident(&to.name))
+            format!("ALTER TABLE {} RENAME CONSTRAINT {} TO {}", n(table), quote_ident(from), quote_ident(&to.name))
         }
         Change::AlterConstraint { table, to } => {
             let timing = match (to.deferrable, to.deferred) {
@@ -525,16 +559,16 @@ fn statement(change: &Change) -> String {
                 (true, false) => "DEFERRABLE INITIALLY IMMEDIATE",
                 (true, true) => "DEFERRABLE INITIALLY DEFERRED",
             };
-            format!("ALTER TABLE {table} ALTER CONSTRAINT {} {timing}", quote_ident(&to.name))
+            format!("ALTER TABLE {} ALTER CONSTRAINT {} {timing}", n(table), quote_ident(&to.name))
         }
         Change::SetComment { target, comment } => {
             let object = match target {
                 CommentTarget::Schema(s) => format!("SCHEMA {}", quote_ident(s)),
-                CommentTarget::Table(t) => format!("TABLE {t}"),
-                CommentTarget::Column(t, c) => format!("COLUMN {t}.{}", quote_ident(c)),
-                CommentTarget::Type(t) => format!("TYPE {t}"),
-                CommentTarget::Sequence(s) => format!("SEQUENCE {s}"),
-                CommentTarget::Constraint(t, c) => format!("CONSTRAINT {} ON {t}", quote_ident(c)),
+                CommentTarget::Table(t) => format!("TABLE {}", n(t)),
+                CommentTarget::Column(t, c) => format!("COLUMN {}.{}", n(t), quote_ident(c)),
+                CommentTarget::Type(t) => format!("TYPE {}", n(t)),
+                CommentTarget::Sequence(s) => format!("SEQUENCE {}", n(s)),
+                CommentTarget::Constraint(t, c) => format!("CONSTRAINT {} ON {}", quote_ident(c), n(t)),
             };
             format!("COMMENT ON {object} IS {}", comment.as_deref().map_or("NULL".to_owned(), quote_literal))
         }
@@ -1213,6 +1247,43 @@ mod tests {
                 "ALTER TABLE public.t ADD CONSTRAINT t_pid_fkey FOREIGN KEY (pid) REFERENCES p(id)",
             ]
         );
+    }
+
+    #[test]
+    fn names_in_the_unqualified_schema_print_without_it() {
+        let scoped = PlanOptions { unqualified_schema: Some("public".into()) };
+        let mut t = keyed("t", "pid", vec![pkey("t")]);
+        t.columns.push(col("m", row_type("app", "mood")));
+        let owned = Some(OwnedBy { table: t.name.clone(), column: "id".into() });
+        let changes = [
+            Change::CreateTable(t.clone()),
+            Change::CreateSequence(sequence("Seq", "bigint", opts("bigint", 1))),
+            Change::SetSequenceOwner { name: QualName::new("public", "Seq"), owned_by: owned, old: None },
+            Change::SetComment { target: CommentTarget::Column(t.name.clone(), "id".into()), comment: None },
+            Change::AddConstraint { table: t.name.clone(), constraint: fkey("t", "pid", "p") },
+            Change::SetComment { target: CommentTarget::Type(QualName::new("app", "mood")), comment: None },
+        ];
+        assert_eq!(
+            plan_with(&changes, &scoped).expect("plan").statements,
+            [
+                "CREATE SEQUENCE \"Seq\"",
+                "CREATE TABLE t (\n    id integer NOT NULL,\n    pid integer,\n    m mood,\n    CONSTRAINT t_pkey PRIMARY KEY (id)\n)",
+                "ALTER SEQUENCE \"Seq\" OWNED BY t.id",
+                "ALTER TABLE t ADD CONSTRAINT t_pid_fkey FOREIGN KEY (pid) REFERENCES p(id)",
+                "COMMENT ON COLUMN t.id IS NULL",
+                "COMMENT ON TYPE app.mood IS NULL",
+            ]
+        );
+    }
+
+    #[test]
+    fn objects_referenced_but_not_planned_are_assumed_to_exist() {
+        // `p`, its key and the `app.mood` type are not managed: nothing creates them.
+        let mut t = keyed("t", "pid", vec![]);
+        t.columns.push(col("m", row_type("app", "mood")));
+        let changes = [Change::AddConstraint { table: t.name.clone(), constraint: fkey("t", "pid", "p") }, Change::CreateTable(t.clone())];
+        assert_eq!(sql(&changes)[1], "ALTER TABLE public.t ADD CONSTRAINT t_pid_fkey FOREIGN KEY (pid) REFERENCES p(id)");
+        assert_eq!(sql(&[drop_table(keyed("t", "pid", vec![fkey("t", "pid", "p")]))]), ["DROP TABLE public.t"]);
     }
 
     #[test]

@@ -21,6 +21,9 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
   runs in a transaction; a failure rolls it back and names the statement and how many earlier
   batches stayed applied. `--dry-run` prints the plan; without a terminal it needs
   `--auto-approve`.
+- `--include` / `--exclude` globs over `[kind:]schema.object[.column]` on `schema diff`, `inspect`
+  and `apply`, applied to both sides. `--schema <name>` manages one schema and prints unqualified
+  names; `apply` always executes qualified names.
 - A column type change with no assignment cast (`text` to `integer`) is planned `USING` an explicit
   cast, with a blocking default dropped before and set again after. Castability is asked of the
   server.
@@ -46,7 +49,7 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
   created after that table and dropped before it.
 - Breaking library changes: `pgmig_plan::plan` returns `Result<Plan, Error>` (an error names a
   dependency cycle); `Change::DropTable` carries the dropped `Table`; `DropColumn` and
-  `AlterColumnType` carry the referenced types; `Column` has a new `type_ref` field; `DropTable` and `DropColumn` carry the sequences they drop; `Table` has a new `constraints` field; `AlterColumnType` has a new `using` field; `Plan` has a new `commit_after` field and `plan` can fail
+  `AlterColumnType` carry the referenced types; `Column` has a new `type_ref` field; `DropTable` and `DropColumn` carry the sequences they drop; `Table` has a new `constraints` field; `AlterColumnType` has a new `using` field; `schema_diff`, `schema_inspect` and `schema_plan_apply` take `&Options`; `Plan` has a new `commit_after` field and `plan` can fail
   with `Error::Unsupported`.
 
 ## [0.1.0] - 2026-11-26
