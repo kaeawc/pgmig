@@ -575,6 +575,9 @@ pub struct MigrationFailure {
     /// Files of this run committed before the failure.
     pub applied_files: usize,
     pub outcome: MigrationOutcome,
+    /// The run as far as it got: `pending` before it, and each file with its status and the
+    /// timings of the statements that ran.
+    pub report: MigrateApplyReport,
 }
 
 /// Where an `apply` stopped and what became of the batch it was in.
@@ -718,17 +721,18 @@ impl From<&Error> for ApiError {
             Error::LockTimeout { .. } => err(ErrorCode::LockTimeout),
             Error::TxModeConflict { path, .. } => err(ErrorCode::TxModeConflict).at(path, None),
             Error::Resume { path, .. } => err(ErrorCode::Resume).at(path, None),
-            Error::MigrationFailed { path, pos, statement_index, statement, source, outcome, applied_files } => {
+            Error::MigrationFailed { path, pos, statement_index, statement, source, outcome, applied_files, report } => {
                 let mut e = err(ErrorCode::Migration).at(path, Some(*pos)).sqlstate(source);
                 e.migration = Some(Box::new(MigrationFailure {
                     statement_index: Some(*statement_index),
                     statement: statement.clone(),
                     applied_files: *applied_files,
                     outcome: *outcome,
+                    report: (**report).clone(),
                 }));
                 e
             }
-            Error::MigrationRecord { path, statement_index, source, outcome, applied_files } => {
+            Error::MigrationRecord { path, statement_index, source, outcome, applied_files, report } => {
                 let mut e = match source.as_ref() {
                     pgmig_migrate::revisions::Error::Conn(c) => err(ErrorCode::Revisions).sqlstate(c),
                     _ => err(ErrorCode::Revisions),
@@ -739,10 +743,11 @@ impl From<&Error> for ApiError {
                     statement: String::new(),
                     applied_files: *applied_files,
                     outcome: *outcome,
+                    report: (**report).clone(),
                 }));
                 e
             }
-            Error::MigrationStep { path, step, source, outcome, applied_files } => {
+            Error::MigrationStep { path, step, source, outcome, applied_files, report } => {
                 let mut e = err(ErrorCode::Migration).sqlstate(source);
                 if let Some(p) = path {
                     e = e.at(p, None);
@@ -752,6 +757,7 @@ impl From<&Error> for ApiError {
                     statement: step.clone(),
                     applied_files: *applied_files,
                     outcome: *outcome,
+                    report: (**report).clone(),
                 }));
                 e
             }
@@ -1226,6 +1232,7 @@ mod tests {
             source: Box::new(source),
             outcome: MigrationOutcome::FileRolledBack,
             applied_files: 1,
+            report: Box::default(),
         };
         let json = serde_json::to_value(ApiError::from(&e)).expect("serialize");
         assert_eq!((json["code"].as_str(), json["sqlstate"].as_str(), json["line"].as_u64()), (Some("migration"), Some("42P01"), Some(3)));

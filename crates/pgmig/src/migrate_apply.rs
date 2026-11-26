@@ -230,6 +230,16 @@ pub enum FileStatus {
     Skipped,
     /// Recorded as applied by this run without running it (`--baseline`); with `dry_run`, would be.
     Baselined,
+    /// A statement of it (or its own bookkeeping) failed in this run. Only in the report of a
+    /// failure.
+    Failed,
+    /// This run ran it in the one transaction of `--tx-mode all`, which was rolled back (because a
+    /// later file failed, or `after_sql` or `COMMIT` failed). Only in the report of a failure.
+    RolledBack,
+    /// This run ran it in the one transaction of `--tx-mode all` and `COMMIT`'s outcome is not
+    /// known (the connection was lost): it may or may not be applied. Only in the report of a
+    /// failure.
+    Unknown,
 }
 
 /// One migration file in a [`MigrateApplyReport`].
@@ -246,18 +256,39 @@ pub struct FileReport {
     /// Statements an earlier, interrupted run applied, which this run resumes after.
     pub resumed_after: usize,
     pub execution_ms: u64,
+    /// The statements this run ran, in order, each with its time. Without the SQL text (it may hold
+    /// secrets): the hash is the one the revisions table keeps. After a failure, the statements
+    /// before the failing one; empty for a file that did not run.
+    pub statement_timings: Vec<StatementTiming>,
+}
+
+/// One statement a run ran, in a [`FileReport`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatementTiming {
+    /// 0-based index in its file.
+    pub index: usize,
+    /// 1-based line in its file where the statement starts.
+    pub line: u32,
+    /// The statement's hash, as the revisions table records it.
+    pub hash: String,
+    pub execution_ms: u64,
 }
 
 /// What [`migrate_apply`] did, or with `dry_run` would do.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MigrateApplyReport {
     pub dry_run: bool,
+    /// The files that were pending when the run started (to run, or beyond the limit), in the
+    /// order they run.
+    pub pending: Vec<String>,
     /// Every file of the directory, in version order.
     pub files: Vec<FileReport>,
     /// Files applied by this run.
     pub applied: usize,
     /// Statements run by this run.
     pub statements: usize,
+    /// Time from the first statement of the run to its end, hooks and bookkeeping included.
+    pub execution_ms: u64,
     /// `baseline` was given and ignored because the database has no history and holds no objects:
     /// every file runs (or with `dry_run`, would run) instead.
     pub baseline_skipped: bool,
@@ -544,6 +575,7 @@ fn locked(conn: &mut Conn, dir: &MigrationDir, prepared: &[Prepared], opts: &App
         statements,
         resumed_after,
         execution_ms: 0,
+        statement_timings: Vec::new(),
     };
     for f in &status.applied {
         let now = baselined.iter().any(|r| r.version == f.version);
@@ -562,19 +594,25 @@ fn locked(conn: &mut Conn, dir: &MigrationDir, prepared: &[Prepared], opts: &App
         reports.push(report_of(j.p, job_status, Some(j.mode), j.p.sql.statements.len().saturating_sub(start), start));
     }
 
-    let mut out = MigrateApplyReport { dry_run: opts.dry_run, files: reports, applied: 0, statements: 0, baseline_skipped };
+    let pending = jobs.iter().map(|j| j.p.file.name.clone()).chain(waiting.iter().map(|p| p.file.name.clone())).collect();
+    let mut out =
+        MigrateApplyReport { dry_run: opts.dry_run, pending, files: reports, applied: 0, statements: 0, execution_ms: 0, baseline_skipped };
+    let mut failure = None;
     if !opts.dry_run && !jobs.is_empty() {
         let table = table.expect("ensured");
-        let ms = run(conn, &table, &jobs, opts)?;
-        for (r, ms) in out.files[first_job..].iter_mut().zip(ms) {
-            r.execution_ms = ms;
-        }
-        out.applied = jobs.len();
-        out.statements = out.files[first_job..].iter().map(|r| r.statements).sum();
+        let started = Instant::now();
+        let res = run(conn, &table, &jobs, opts, &mut out.files[first_job..]);
+        out.execution_ms = elapsed(started);
+        let ran = &out.files[first_job..];
+        out.applied = ran.iter().filter(|r| r.status == FileStatus::Applied).count();
+        out.statements = ran.iter().map(|r| r.statement_timings.len()).sum();
+        failure = res.err();
     }
-    let order = |r: &FileReport| r.version.clone();
-    out.files.sort_by(|a, b| pgmig_migrate::compare_versions(&order(a), &order(b)));
-    Ok(out)
+    out.files.sort_by(|a, b| pgmig_migrate::compare_versions(&a.version, &b.version));
+    match failure {
+        Some(e) => Err(e.with_report(out)),
+        None => Ok(out),
+    }
 }
 
 /// The files `--baseline` would record: on a database without history, every file up to and
@@ -702,35 +740,50 @@ fn check_resume(p: &Prepared, r: &Revision) -> Result<()> {
     Ok(())
 }
 
-/// Run the jobs; the execution time of each.
-fn run(conn: &mut Conn, table: &Table, jobs: &[Job], opts: &ApplyOptions) -> Result<Vec<u64>> {
-    let mut times = Vec::with_capacity(jobs.len());
+/// Run the jobs, recording in `reports` (one per job) each file's time and statement timings; after
+/// a failure, what became of each file.
+fn run(conn: &mut Conn, table: &Table, jobs: &[Job], opts: &ApplyOptions, reports: &mut [FileReport]) -> Result<()> {
     if opts.tx_mode == TxMode::All {
         let started = Instant::now();
         let mut current: Option<usize> = None;
-        let res = (|| -> std::result::Result<Vec<u64>, Failure> {
+        let mut file_started = started;
+        let mut in_file = false;
+        let res = (|| -> std::result::Result<(), Failure> {
             step(conn, "BEGIN")?;
             hook(conn, "before_sql", opts.before_sql.as_deref())?;
-            let mut times = Vec::new();
             for (i, j) in jobs.iter().enumerate() {
                 let t = Instant::now();
+                file_started = t;
                 current = Some(i);
+                in_file = true;
                 let mut rev = j.revision();
                 let mut committed = rev.clone();
                 table.replace(conn, &rev, true)?;
                 // Files with commit points are refused in this mode, so this never commits.
-                in_transaction(conn, table, j, &mut rev, &mut committed, opts, t)?;
-                times.push(elapsed(t));
+                let done = in_transaction(conn, table, j, &mut rev, &mut committed, opts, t, &mut reports[i]);
+                reports[i].execution_ms = elapsed(t);
+                done?;
+                in_file = false;
             }
             hook(conn, "after_sql", opts.after_sql.as_deref())?;
-            step(conn, "COMMIT")?;
-            Ok(times)
+            step(conn, "COMMIT")
         })();
         return res.map_err(|f| {
             let _ = conn.batch("ROLLBACK");
             let outcome = commit_outcome(&f).unwrap_or(MigrationOutcome::AllRolledBack);
+            // The files ran in one transaction: none of them is applied. When COMMIT's outcome is
+            // unknown, each may be. A failure in `after_sql` or `COMMIT` is not any file's own.
+            let status = if outcome == MigrationOutcome::Unknown { FileStatus::Unknown } else { FileStatus::RolledBack };
+            let reached = current.map_or(0, |i| i + 1);
+            for (i, r) in reports.iter_mut().enumerate() {
+                r.status = if i >= reached { FileStatus::Pending } else { status };
+            }
+            if let (Some(i), MigrationOutcome::AllRolledBack, true) = (current, outcome, in_file) {
+                reports[i].status = FileStatus::Failed;
+                reports[i].execution_ms = elapsed(file_started);
+            }
             match current {
-                Some(i) => fail(conn, table, &jobs[i], jobs[i].revision(), f, outcome, 0, started),
+                Some(i) => fail(conn, table, &jobs[i], jobs[i].revision(), f, outcome, 0, file_started),
                 None => failure_error(None, f, outcome, 0),
             }
         });
@@ -740,11 +793,12 @@ fn run(conn: &mut Conn, table: &Table, jobs: &[Job], opts: &ApplyOptions) -> Res
         let mut rev = j.revision();
         // The row as last committed, for a failure after a commit point.
         let mut committed = rev.clone();
+        let rep = &mut reports[done];
         let res = if j.mode == TxMode::None {
             (|| -> std::result::Result<(), Failure> {
                 hook(conn, "before_sql", opts.before_sql.as_deref())?;
                 table.replace(conn, &rev, false)?;
-                no_transaction(conn, table, j, &mut rev, t)?;
+                no_transaction(conn, table, j, &mut rev, t, rep)?;
                 hook(conn, "after_sql", opts.after_sql.as_deref())
             })()
         } else {
@@ -752,12 +806,17 @@ fn run(conn: &mut Conn, table: &Table, jobs: &[Job], opts: &ApplyOptions) -> Res
                 step(conn, "BEGIN")?;
                 hook(conn, "before_sql", opts.before_sql.as_deref())?;
                 table.replace(conn, &rev, true)?;
-                in_transaction(conn, table, j, &mut rev, &mut committed, opts, t)?;
+                in_transaction(conn, table, j, &mut rev, &mut committed, opts, t, rep)?;
                 hook(conn, "after_sql", opts.after_sql.as_deref())?;
                 step(conn, "COMMIT")
             })()
         };
+        reports[done].execution_ms = elapsed(t);
         if let Err(f) = res {
+            reports[done].status = FileStatus::Failed;
+            for r in &mut reports[done + 1..] {
+                r.status = FileStatus::Pending;
+            }
             return Err(if j.mode == TxMode::None {
                 // Progress is recorded as it is made; record the error on top of it. After a
                 // statement that ran and could not be recorded, the row keeps its in-flight mark.
@@ -787,9 +846,12 @@ fn run(conn: &mut Conn, table: &Table, jobs: &[Job], opts: &ApplyOptions) -> Res
                 fail(conn, table, j, committed, f, outcome, done, t)
             });
         }
-        times.push(elapsed(t));
     }
-    Ok(times)
+    Ok(())
+}
+
+fn timing(index: usize, s: &pgmig_sql::Statement, began: Instant) -> StatementTiming {
+    StatementTiming { index, line: s.pos.line, hash: history::statement_hash(&s.sql), execution_ms: elapsed(began) }
 }
 
 fn elapsed(t: Instant) -> u64 {
@@ -817,7 +879,9 @@ fn hook(conn: &mut Conn, name: &str, sql: Option<&str>) -> std::result::Result<(
 
 /// Run the file's statements after those already applied, in the transaction in progress. At each
 /// commit point the row records the progress, the transaction commits (with the hooks) and a new
-/// one begins; `committed` follows the row as last committed. The row is written at the end.
+/// one begins; `committed` follows the row as last committed. The row is written at the end. Each
+/// statement that ran is added to `rep`.
+#[allow(clippy::too_many_arguments)]
 fn in_transaction(
     conn: &mut Conn,
     table: &Table,
@@ -826,6 +890,7 @@ fn in_transaction(
     committed: &mut Revision,
     opts: &ApplyOptions,
     t: Instant,
+    rep: &mut FileReport,
 ) -> std::result::Result<(), Failure> {
     let start = j.start();
     for (index, s) in j.p.sql.statements.iter().enumerate().skip(start) {
@@ -838,7 +903,9 @@ fn in_transaction(
             step(conn, "BEGIN")?;
             hook(conn, "before_sql", opts.before_sql.as_deref())?;
         }
+        let began = Instant::now();
         conn.batch(&s.sql).map_err(|source| Failure::Statement { index, source })?;
+        rep.statement_timings.push(timing(index, s, began));
         rev.progress(&history::statement_hash(&s.sql));
     }
     rev.execution_ms = elapsed(t);
@@ -848,13 +915,22 @@ fn in_transaction(
 
 /// Run the file's statements after those already applied, each committing on its own: the row
 /// marks each statement in flight before it runs and records it as applied after.
-fn no_transaction(conn: &mut Conn, table: &Table, j: &Job, rev: &mut Revision, t: Instant) -> std::result::Result<(), Failure> {
+fn no_transaction(
+    conn: &mut Conn,
+    table: &Table,
+    j: &Job,
+    rev: &mut Revision,
+    t: Instant,
+    rep: &mut FileReport,
+) -> std::result::Result<(), Failure> {
     for (index, s) in j.p.sql.statements.iter().enumerate().skip(j.start()) {
         let mut marked = rev.clone();
         marked.start_statement(index, &s.sql);
         marked.execution_ms = elapsed(t);
         table.update(conn, &marked)?;
+        let began = Instant::now();
         conn.batch(&s.sql).map_err(|source| Failure::Statement { index, source })?;
+        rep.statement_timings.push(timing(index, s, began));
         rev.progress(&history::statement_hash(&s.sql));
         rev.execution_ms = elapsed(t);
         table.update(conn, rev).map_err(|source| Failure::Record { index, source })?;
@@ -889,9 +965,28 @@ fn fail(
     failure_error(Some(j), f, outcome, done)
 }
 
+impl Error {
+    /// A migration failure with what became of the run's files.
+    fn with_report(mut self, run: MigrateApplyReport) -> Error {
+        if let Error::MigrationFailed { report, .. } | Error::MigrationStep { report, .. } | Error::MigrationRecord { report, .. } =
+            &mut self
+        {
+            **report = run;
+        }
+        self
+    }
+}
+
 fn failure_error(j: Option<&Job>, f: Failure, outcome: MigrationOutcome, applied_files: usize) -> Error {
     let record = |statement_index, source| match j {
-        Some(j) => Error::MigrationRecord { path: j.p.path.clone(), statement_index, source: Box::new(source), outcome, applied_files },
+        Some(j) => Error::MigrationRecord {
+            path: j.p.path.clone(),
+            statement_index,
+            source: Box::new(source),
+            outcome,
+            applied_files,
+            report: Box::default(),
+        },
         None => Error::Revisions(source),
     };
     match f {
@@ -906,9 +1001,17 @@ fn failure_error(j: Option<&Job>, f: Failure, outcome: MigrationOutcome, applied
                 source: Box::new(source),
                 outcome,
                 applied_files,
+                report: Box::default(),
             }
         }
-        Failure::Step { step, source } => Error::MigrationStep { path: j.map(|j| j.p.path.clone()), step, source, outcome, applied_files },
+        Failure::Step { step, source } => Error::MigrationStep {
+            path: j.map(|j| j.p.path.clone()),
+            step,
+            source: Box::new(source),
+            outcome,
+            applied_files,
+            report: Box::default(),
+        },
         Failure::Revisions(e) => record(None, e),
         Failure::Record { index, source } => record(Some(index), source),
     }

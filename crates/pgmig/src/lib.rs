@@ -19,7 +19,9 @@ pub mod migrate_maintain;
 pub mod migrate_status;
 
 pub use filter::{Filter, Pattern, PatternError, filter_model, scope_model, without_schema};
-pub use migrate_apply::{ApplyOptions, ExecOrder, FileReport, FileStatus, MigrateApplyReport, MigrationOutcome, TxMode, migrate_apply};
+pub use migrate_apply::{
+    ApplyOptions, ExecOrder, FileReport, FileStatus, MigrateApplyReport, MigrationOutcome, StatementTiming, TxMode, migrate_apply,
+};
 pub use migrate_maintain::{
     Guard, ListedMigration, MigrateEdit, MigrateLs, MigrateRebase, MigrateRm, MigrateShow, MissingRevision, RebasedFile, RevisionStatus,
     migrate_edit, migrate_ls, migrate_rebase, migrate_rm, migrate_show,
@@ -131,10 +133,19 @@ pub enum Error {
         outcome: MigrationOutcome,
         /// Files of this run committed before the failing one.
         applied_files: usize,
+        /// What became of each file of the run.
+        report: Box<MigrateApplyReport>,
     },
     /// Something around a migration's statements failed: `BEGIN`, `COMMIT`, a hook.
     #[error("{}{step} failed: {source}\n{}", .path.as_ref().map(|p| format!("{}: ", p.display())).unwrap_or_default(), migrate_apply::outcome_message(*.outcome, *.applied_files))]
-    MigrationStep { path: Option<PathBuf>, step: String, source: pgmig_conn::Error, outcome: MigrationOutcome, applied_files: usize },
+    MigrationStep {
+        path: Option<PathBuf>,
+        step: String,
+        source: Box<pgmig_conn::Error>,
+        outcome: MigrationOutcome,
+        applied_files: usize,
+        report: Box<MigrateApplyReport>,
+    },
     /// Writing a migration's revisions row failed; `statement_index` is the statement that ran
     /// without a transaction and could not be recorded.
     #[error("{path}: recording progress in the revisions table failed{}: {source}\n{}", .statement_index.map(|i| format!(" after statement {}", i + 1)).unwrap_or_default(), migrate_apply::outcome_message(*.outcome, *.applied_files))]
@@ -144,6 +155,7 @@ pub enum Error {
         source: Box<pgmig_migrate::revisions::Error>,
         outcome: MigrationOutcome,
         applied_files: usize,
+        report: Box<MigrateApplyReport>,
     },
     /// `migrate rm` or `migrate rebase` of a file the target's revisions table records.
     #[error(

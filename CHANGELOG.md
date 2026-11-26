@@ -8,6 +8,8 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
 
 ### Added
 
+- `migrate apply --format json` reports pending files, per-file status and per-statement timings
+  (index, line, hash, milliseconds; no SQL text), and a failure carries the partial report.
 - Adopting existing databases: `pgmig migrate baseline <name>` writes the live schema as the first
   migration; `migrate apply --baseline <version>` records files up to it as applied on a populated
   database with no history (and runs everything on an empty one), and refuses other populated

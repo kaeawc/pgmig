@@ -972,7 +972,7 @@ fn migrate_apply(req: &api::MigrateApplyRequest, target: &Target, format: Format
             FileStatus::Baselined if report.dry_run => println!("{} (baseline: would be recorded as applied, not run)", f.file),
             FileStatus::Baselined => println!("{} (baseline: recorded as applied, not run)", f.file),
             FileStatus::Pending if report.dry_run => println!("{}", f.file),
-            FileStatus::Pending | FileStatus::AlreadyApplied => {}
+            FileStatus::Pending | FileStatus::AlreadyApplied | FileStatus::Failed | FileStatus::RolledBack | FileStatus::Unknown => {}
         }
     }
     let pending = report.files.iter().filter(|f| f.status == FileStatus::Pending).count();

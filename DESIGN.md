@@ -243,7 +243,7 @@ row per migration file:
 | `applied` | `integer not null` | statements applied |
 | `total` | `integer not null` | statements in the file |
 | `executed_at` | `timestamptz not null` | when the file started (the server's `now()`) |
-| `execution_ms` | `bigint not null` | |
+| `execution_ms` | `bigint not null` | time spent on this file alone (also for a file that failed, in any `--tx-mode`), not the run's |
 | `error` | `text` | last error, if any |
 | `error_stmt` | `text` | statement that failed |
 | `hash` | `text not null` | the file's own hash (SHA-256 of its name, a zero byte and its bytes; not chained, so a non-linear insert leaves applied rows valid) |
