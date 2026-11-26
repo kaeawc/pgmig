@@ -28,6 +28,8 @@ impl TestDb {
         match postgres_dsn() {
             None => {
                 let server = pgmem::Server::start().expect("start pgmem");
+                // As a new Postgres database has it (kaeawc/pgmem#178).
+                Conn::connect(&server.conninfo()).and_then(|mut c| c.batch(pgmig::PUBLIC_SCHEMA_COMMENT_SQL)).expect("comment public");
                 TestDb { conninfo: server.conninfo(), keep: Keep::Pgmem { _server: server } }
             }
             Some(admin) => {

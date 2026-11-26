@@ -29,7 +29,9 @@ impl Shadow {
     /// A fresh embedded pgmem instance.
     pub fn pgmem() -> Result<Shadow> {
         let server = pgmem::Server::start().map_err(|e| Error::Pgmem(e.to_string()))?;
-        let conn = Conn::connect(&server.conninfo())?;
+        let mut conn = Conn::connect(&server.conninfo())?;
+        // pgmem's `public` has no comment (kaeawc/pgmem#178); give it the one Postgres does.
+        conn.batch(PUBLIC_COMMENT)?;
         Ok(Shadow { conn, backend: Backend::Pgmem { _server: server } })
     }
 
@@ -72,8 +74,12 @@ fn wipe(conn: &mut Conn) -> pgmig_conn::Result<()> {
     }
     // Recreate `public` as a new database has it (PostgreSQL 15+).
     sql.push_str("CREATE SCHEMA IF NOT EXISTS public AUTHORIZATION pg_database_owner;\nGRANT USAGE ON SCHEMA public TO PUBLIC;\n");
+    sql.push_str(PUBLIC_COMMENT);
     conn.batch(&sql)
 }
+
+/// The comment a new database's `public` schema has (`pgmig_model::PUBLIC_SCHEMA_COMMENT`).
+pub const PUBLIC_COMMENT: &str = "COMMENT ON SCHEMA public IS 'standard public schema';\n";
 
 const USER_SCHEMA: &str = "n.nspname NOT IN ('pg_catalog', 'information_schema') AND left(n.nspname, 3) <> 'pg_'";
 

@@ -21,23 +21,25 @@ const USER_SCHEMA: &str = "n.nspname NOT IN ('pg_catalog', 'information_schema')
 pub fn inspect(conn: &mut Conn) -> Result<Model> {
     let mut model = Model::default();
 
-    for row in run(conn, "schemas", &format!("SELECT n.nspname FROM pg_namespace n WHERE {USER_SCHEMA} ORDER BY 1"))? {
+    let schemas = format!("SELECT n.nspname, obj_description(n.oid, 'pg_namespace') FROM pg_namespace n WHERE {USER_SCHEMA} ORDER BY 1");
+    for row in run(conn, "schemas", &schemas)? {
         let name = text(&row, 0, "schemas")?;
-        model.schemas.insert(name.clone(), Schema { name });
+        model.schemas.insert(name.clone(), Schema { name, comment: row.get(1).cloned().flatten() });
     }
 
     let tables = format!(
-        "SELECT n.nspname, c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+        "SELECT n.nspname, c.relname, obj_description(c.oid, 'pg_class') FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
          WHERE c.relkind IN ('r', 'p') AND {USER_SCHEMA} ORDER BY 1, 2"
     );
     for row in run(conn, "tables", &tables)? {
         let name = QualName::new(text(&row, 0, "tables")?, text(&row, 1, "tables")?);
-        model.tables.insert(name.clone(), Table { name, columns: Vec::new() });
+        model.tables.insert(name.clone(), Table { name, columns: Vec::new(), comment: row.get(2).cloned().flatten() });
     }
 
     let columns = format!(
         "SELECT n.nspname, c.relname, a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull, \
-                pg_get_expr(d.adbin, d.adrelid), tn.nspname, COALESCE(e.typname, t.typname) \
+                pg_get_expr(d.adbin, d.adrelid), tn.nspname, COALESCE(e.typname, t.typname), \
+                col_description(a.attrelid, a.attnum) \
          FROM pg_attribute a \
          JOIN pg_class c ON c.oid = a.attrelid \
          JOIN pg_namespace n ON n.oid = c.relnamespace \
@@ -56,6 +58,7 @@ pub fn inspect(conn: &mut Conn) -> Result<Model> {
             not_null: text(&row, 4, "columns")? == "t",
             default: row.get(5).cloned().flatten(),
             type_ref: type_ref(&row),
+            comment: row.get(8).cloned().flatten(),
         };
         if let Some(t) = model.tables.get_mut(&table) {
             t.columns.push(column);

@@ -9,7 +9,7 @@ pub use pgmig_diff::{Change, diff};
 pub use pgmig_inspect::inspect;
 pub use pgmig_model::Model;
 pub use pgmig_plan::{Plan, plan};
-pub use pgmig_shadow::Shadow;
+pub use pgmig_shadow::{PUBLIC_COMMENT as PUBLIC_SCHEMA_COMMENT_SQL, Shadow};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

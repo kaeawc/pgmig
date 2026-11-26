@@ -10,8 +10,8 @@
 pub mod graph;
 
 use graph::{Deps, Node, Object};
-use pgmig_diff::Change;
-use pgmig_model::{Column, QualName, quote_ident};
+use pgmig_diff::{Change, CommentTarget};
+use pgmig_model::{Column, QualName, quote_ident, quote_literal};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Plan {
@@ -57,6 +57,8 @@ fn phase(change: &Change) -> u8 {
         Change::DropColumn { .. } => 7,
         Change::DropTable(_) => 8,
         Change::DropSchema(_) => 9,
+        // After the object it describes exists and has settled.
+        Change::SetComment { .. } => 10,
     }
 }
 
@@ -89,6 +91,15 @@ fn deps(change: &Change) -> Deps {
             requires.extend(types([type_ref]));
             let releases = if type_ref == old_type_ref { Vec::new() } else { types([old_type_ref]) };
             Deps { alters: vec![column(table, c)], requires, releases, ..Deps::default() }
+        }
+        Change::SetComment { target, .. } => {
+            // A comment only waits for the object (and a column's table) to exist.
+            let requires = match target {
+                CommentTarget::Schema(s) => vec![Object::Schema(s.clone())],
+                CommentTarget::Table(t) => vec![in_table(t)],
+                CommentTarget::Column(t, c) => vec![in_table(t), column(t, c)],
+            };
+            Deps { requires, ..Deps::default() }
         }
         Change::SetNotNull { table, column: c }
         | Change::DropNotNull { table, column: c }
@@ -128,6 +139,14 @@ fn statement(change: &Change) -> String {
             format!("ALTER TABLE {table} ALTER COLUMN {} SET DEFAULT {default}", quote_ident(column))
         }
         Change::DropDefault { table, column } => format!("ALTER TABLE {table} ALTER COLUMN {} DROP DEFAULT", quote_ident(column)),
+        Change::SetComment { target, comment } => {
+            let object = match target {
+                CommentTarget::Schema(s) => format!("SCHEMA {}", quote_ident(s)),
+                CommentTarget::Table(t) => format!("TABLE {t}"),
+                CommentTarget::Column(t, c) => format!("COLUMN {t}.{}", quote_ident(c)),
+            };
+            format!("COMMENT ON {object} IS {}", comment.as_deref().map_or("NULL".to_owned(), quote_literal))
+        }
     }
 }
 
@@ -150,11 +169,11 @@ mod tests {
 
     fn col(name: &str, type_ref: Option<QualName>) -> Column {
         let type_name = type_ref.as_ref().map_or("integer".to_owned(), |t| t.name.clone());
-        Column { name: name.into(), type_name, type_ref, not_null: false, default: None }
+        Column { name: name.into(), type_name, type_ref, not_null: false, default: None, comment: None }
     }
 
     fn table(schema: &str, name: &str, columns: Vec<Column>) -> Table {
-        Table { name: QualName::new(schema, name), columns }
+        Table { name: QualName::new(schema, name), columns, comment: None }
     }
 
     fn row_type(schema: &str, name: &str) -> Option<QualName> {
@@ -249,5 +268,29 @@ mod tests {
         let Error::Cycle(statements) = &err;
         assert_eq!(statements.len(), 2);
         assert!(err.to_string().starts_with("the changes depend on each other in a cycle: CREATE TABLE"), "{err}");
+    }
+
+    #[test]
+    fn comments_follow_the_objects_they_describe_and_are_quoted() {
+        let t = QualName::new("app", "t");
+        let mut created = table("app", "t", vec![col("id", None)]);
+        created.comment = Some("it's".into());
+        let changes = [
+            Change::SetComment { target: CommentTarget::Column(t.clone(), "id".into()), comment: Some("a\\b\nc".into()) },
+            Change::SetComment { target: CommentTarget::Table(t.clone()), comment: Some("it's".into()) },
+            Change::SetComment { target: CommentTarget::Schema("app".into()), comment: None },
+            Change::CreateTable(created),
+            Change::CreateSchema("app".into()),
+        ];
+        assert_eq!(
+            sql(&changes),
+            [
+                "CREATE SCHEMA app",
+                "CREATE TABLE app.t (\n    id integer\n)",
+                "COMMENT ON COLUMN app.t.id IS 'a\\b\nc'",
+                "COMMENT ON TABLE app.t IS 'it''s'",
+                "COMMENT ON SCHEMA app IS NULL",
+            ]
+        );
     }
 }

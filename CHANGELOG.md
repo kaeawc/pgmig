@@ -17,6 +17,8 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
   that directory, first. Paths are relative to the importing file, each file loads once, and an
   import cycle is an error naming the files. Files without imports keep lexical order.
 - `-- pgmig:<name> args` directive comments are parsed (new crate `pgmig-sql`).
+- Comments on schemas, tables and columns are inspected and planned (`COMMENT ON`), after the
+  object they describe.
 
 ### Changed
 
