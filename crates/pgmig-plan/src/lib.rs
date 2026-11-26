@@ -43,8 +43,16 @@
 //!
 //! Changes Postgres cannot make in place (removing or reordering enum values) fail the plan with
 //! [`Error::Unsupported`].
+//!
+//! # Policy
+//!
+//! [`skip`] leaves chosen kinds of change out before planning, with the changes that depend on
+//! them (see [`policy`]).
 
 pub mod graph;
+pub mod policy;
+
+pub use policy::{Cause, Skipped, skip};
 
 use graph::{Deps, Node, Object};
 use pgmig_diff::{Change, CommentTarget, EnumPosition};

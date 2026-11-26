@@ -5,4 +5,5 @@ mod config;
 mod filters;
 mod json;
 mod migrate;
+mod policy;
 mod support;

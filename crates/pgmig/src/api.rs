@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ApplyOptions, ApplyReport, Change, ChecksumError, Error, Guard, MigrateApplyReport, MigrateEdit, MigrateLs, MigrateRebase, MigrateRm,
-    MigrateSet, MigrateShow, MigrateStatus, MigrationOutcome, Model, Options, Plan, SetOptions, ShadowSpec, Source, SumFile,
+    MigrateSet, MigrateShow, MigrateStatus, MigrationOutcome, Model, Options, Plan, SetOptions, ShadowSpec, Skipped, Source, SumFile,
     filter::PatternError,
 };
 
@@ -34,6 +34,9 @@ pub struct DiffResponse {
     pub plan: Plan,
     /// The changes the plan makes, for the objects the options manage.
     pub changes: Vec<Change>,
+    /// The changes the options' policy (`skip`) left out of the plan.
+    #[serde(default)]
+    pub skipped: Vec<Skipped>,
     /// `plan` rendered as a SQL script ([`Plan::to_sql`]).
     pub sql: String,
 }
@@ -116,6 +119,9 @@ pub struct PlanApplyResponse {
     /// The plan to pass to [`apply`]: schema-qualified, whatever the options' schema mode.
     pub plan: Plan,
     pub changes: Vec<Change>,
+    /// The changes the options' policy (`skip`) left out of the plan.
+    #[serde(default)]
+    pub skipped: Vec<Skipped>,
     /// `plan` rendered as a SQL script ([`Plan::to_sql`]).
     pub sql: String,
 }
@@ -222,6 +228,9 @@ pub struct MigrateDiffResponse {
     /// The plan from the replayed directory to the desired state (schema-qualified).
     pub plan: Plan,
     pub changes: Vec<Change>,
+    /// The changes the options' policy (`skip`) left out of the file.
+    #[serde(default)]
+    pub skipped: Vec<Skipped>,
     /// `plan` rendered as a SQL script ([`Plan::to_sql`]): the new file's contents.
     pub sql: String,
 }
@@ -877,8 +886,8 @@ fn is_diagnostic(e: &Error) -> bool {
 
 /// [`crate::schema_diff`].
 pub fn schema_diff(req: &DiffRequest) -> Result<DiffResponse, ApiError> {
-    let (changes, plan) = crate::diff_sources(&req.from, &req.to, &req.shadow, &req.options, &req.options.plan_options())?;
-    Ok(DiffResponse { sql: plan.to_sql(), plan, changes })
+    let d = crate::diff_sources(&req.from, &req.to, &req.shadow, &req.options, &req.options.plan_options())?;
+    Ok(DiffResponse { sql: d.plan.to_sql(), plan: d.plan, changes: d.changes, skipped: d.skipped })
 }
 
 /// [`crate::schema_inspect`].
@@ -922,7 +931,7 @@ pub fn migrate_validate(req: &MigrateValidateRequest) -> Result<MigrateValidateR
 pub fn migrate_diff(req: &MigrateDiffRequest) -> Result<MigrateDiffResponse, ApiError> {
     let res = crate::migrate_diff(&req.dir, &req.name, &req.to, &req.shadow, &req.options)?;
     let (file, version) = res.written.map(|w| (w.path, w.version)).unzip();
-    Ok(MigrateDiffResponse { file, version, sql: res.plan.to_sql(), plan: res.plan, changes: res.changes })
+    Ok(MigrateDiffResponse { file, version, sql: res.plan.to_sql(), plan: res.plan, changes: res.changes, skipped: res.skipped })
 }
 
 /// [`crate::migrate_new`].
@@ -987,8 +996,8 @@ pub fn config_validate(req: &ConfigValidateRequest) -> Result<ConfigValidateResp
 
 /// [`crate::schema_plan_apply`].
 pub fn schema_plan_apply(req: &PlanApplyRequest) -> Result<PlanApplyResponse, ApiError> {
-    let (changes, plan) = crate::plan_apply_changes(&req.target, &req.desired, &req.shadow, &req.options)?;
-    Ok(PlanApplyResponse { sql: plan.to_sql(), plan, changes })
+    let d = crate::plan_apply_changes(&req.target, &req.desired, &req.shadow, &req.options)?;
+    Ok(PlanApplyResponse { sql: d.plan.to_sql(), plan: d.plan, changes: d.changes, skipped: d.skipped })
 }
 
 /// [`crate::apply`].
@@ -1081,11 +1090,21 @@ mod tests {
     fn responses_round_trip() {
         let changes =
             vec![Change::CreateSchema("app".into()), Change::SetNotNull { table: QualName::new("app", "t"), column: "id".into() }];
-        round_trip(&DiffResponse { plan: plan(), sql: plan().to_sql(), changes: changes.clone() });
+        let skipped = vec![Skipped {
+            kind: crate::ChangeKind::DropSchema,
+            object: "old".into(),
+            statement: Some("DROP SCHEMA old".into()),
+            because: Some(crate::SkipCause { kind: crate::ChangeKind::DropTable, object: "old.t".into() }),
+        }];
+        let json = round_trip(&DiffResponse { plan: plan(), sql: plan().to_sql(), changes: changes.clone(), skipped: skipped.clone() });
+        assert!(
+            json.contains(r#""skipped":[{"kind":"drop_schema","object":"old","statement":"DROP SCHEMA old","because":{"kind":"drop_table","object":"old.t"}}]"#),
+            "{json}"
+        );
         round_trip(&InspectResponse { plan: plan(), sql: plan().to_sql(), model: Model::empty_database() });
         let fp = FingerprintResponse { fingerprint: crate::fingerprint(&Model::empty_database()) };
         assert_eq!(round_trip(&fp), format!(r#"{{"fingerprint":"{}"}}"#, fp.fingerprint));
-        round_trip(&PlanApplyResponse { plan: plan(), sql: plan().to_sql(), changes });
+        round_trip(&PlanApplyResponse { plan: plan(), sql: plan().to_sql(), changes, skipped });
         round_trip(&ApplyReport { batches: 2, statements: 5 });
         round_trip(&MigrateDiffResponse {
             file: Some("m/1_a.sql".into()),
@@ -1093,6 +1112,7 @@ mod tests {
             plan: plan(),
             sql: plan().to_sql(),
             changes: vec![],
+            skipped: vec![],
         });
         round_trip(&MigrateNewResponse { file: "m/1_a.sql".into(), version: "1".into() });
         let load = ApiError {
@@ -1310,8 +1330,21 @@ mod tests {
 
     #[test]
     fn responses_carry_the_rendered_script() {
-        let json = serde_json::to_value(DiffResponse { plan: plan(), sql: plan().to_sql(), changes: vec![] }).expect("serialize");
+        let json =
+            serde_json::to_value(DiffResponse { plan: plan(), sql: plan().to_sql(), changes: vec![], skipped: vec![] }).expect("serialize");
         assert_eq!(json["sql"], "CREATE SCHEMA app;\n");
+    }
+
+    #[test]
+    fn options_name_the_kinds_they_skip() {
+        let src = r#"{"kind":"sql","data":"s.sql"}"#;
+        let json = format!(r#"{{"from":{src},"to":{src},"options":{{"skip":["drop_table","drop_column"]}}}}"#);
+        let req: DiffRequest = serde_json::from_str(&json).expect("request");
+        assert_eq!(req.options.skip, [crate::ChangeKind::DropTable, crate::ChangeKind::DropColumn]);
+        assert!(round_trip(&req).contains(r#""skip":["drop_table","drop_column"]"#));
+        let json = format!(r#"{{"from":{src},"to":{src},"options":{{"skip":["drop_tables"]}}}}"#);
+        let err = serde_json::from_str::<DiffRequest>(&json).expect_err("unknown kind");
+        assert!(err.to_string().contains("unknown variant `drop_tables`"), "{err}");
     }
 
     /// A typo in a request must fail, not fall back to a default that manages everything.

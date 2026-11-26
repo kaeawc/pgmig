@@ -5,7 +5,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand, ValueEnum};
 use pgmig::api::{self, ApiError};
 use pgmig::config::{Config, Settings, Vars};
-use pgmig::{Filter, Options, ShadowSpec, Source};
+use pgmig::{ChangeKind, Filter, Options, ShadowSpec, Skipped, Source};
 use serde::Serialize;
 
 const AFTER_HELP: &str = "\
@@ -32,7 +32,8 @@ pgmig.toml (or the file given to --config), under the flag's name: `url`, `shado
 diff`), `include`, `exclude`, `schema`,
 `format`, and the `migrate apply` flags under `[migrations]`: `dir`, `tx_mode`, `exec_order`,
 `lock_name`, `lock_timeout`, `before_sql`, `after_sql`. `[migrations] revisions_schema` (default
-`pgmig`) names the schema of the revisions table; pgmig never manages that schema. `[env.NAME]` sections, selected with --env NAME,
+`pgmig`) names the schema of the revisions table; pgmig never manages that schema. `[diff] skip`
+is --skip. `[env.NAME]` sections, selected with --env NAME,
 override the top level. A flag wins over both. `${KEY}` in a value is replaced by --var KEY=VALUE,
 or else by the environment variable KEY; `$${` is a literal `${`.";
 
@@ -101,6 +102,8 @@ enum MigrateCommand {
         shadow: ShadowArg,
         #[command(flatten)]
         scope: ScopeArgs,
+        #[command(flatten)]
+        skip: SkipArg,
         #[command(flatten)]
         format: FormatArg,
     },
@@ -381,8 +384,10 @@ enum SchemaCommand {
         #[command(flatten)]
         scope: ScopeArgs,
         #[command(flatten)]
+        skip: SkipArg,
+        #[command(flatten)]
         format: FormatArg,
-        /// Exit with status 3 when there are changes.
+        /// Exit with status 3 when there are changes (skipped ones do not count).
         #[arg(long)]
         exit_code: bool,
     },
@@ -421,6 +426,8 @@ enum SchemaCommand {
         shadow: ShadowArg,
         #[command(flatten)]
         scope: ScopeArgs,
+        #[command(flatten)]
+        skip: SkipArg,
         /// Print the plan and change nothing.
         #[arg(long)]
         dry_run: bool,
@@ -498,7 +505,43 @@ impl ScopeArgs {
             filter: Filter::parse(&include, &exclude).map_err(ApiError::from)?,
             schema: self.schema.or_else(|| settings.schema.clone()),
             revisions_schema: revisions_schema(settings),
+            skip: Vec::new(),
         })
+    }
+}
+
+#[derive(clap::Args)]
+struct SkipArg {
+    /// Never plan this kind of change (repeatable): one of the `kind` names of the JSON changes,
+    /// such as drop_table, drop_column, drop_schema, drop_constraint, drop_default. A change that
+    /// needs a skipped one is skipped too. Skipped changes are reported on stderr (in JSON:
+    /// `skipped`) and found again by every later diff (config: `[diff] skip`).
+    #[arg(long, value_name = "KIND", value_parser = parse_kind)]
+    skip: Vec<ChangeKind>,
+}
+
+fn parse_kind(s: &str) -> Result<ChangeKind, String> {
+    s.parse().map_err(|e: pgmig::UnknownKind| e.to_string())
+}
+
+impl SkipArg {
+    /// `options` with the policy: the flags, or where none are given, `[diff] skip` (checked when
+    /// the file was read).
+    fn add_to(self, mut options: Options, settings: &Settings) -> anyhow::Result<Options> {
+        options.skip = if self.skip.is_empty() {
+            let names = settings.diff_skip.iter().flatten();
+            names.map(|n| n.parse().map_err(|e: pgmig::UnknownKind| ApiError::usage(e.to_string()))).collect::<Result<_, _>>()?
+        } else {
+            self.skip
+        };
+        Ok(options)
+    }
+}
+
+/// One notice per skipped change, on stderr.
+fn print_skipped(skipped: &[Skipped]) {
+    for s in skipped {
+        eprintln!("skipped {s}");
     }
 }
 
@@ -732,7 +775,7 @@ fn run(cli: Cli, loaded: &Loaded, format: Format) -> anyhow::Result<ExitCode> {
     };
     let s = settings;
     match command {
-        SchemaCommand::Apply { url, to, shadow, scope, dry_run, auto_approve, format: _, exit_code } => {
+        SchemaCommand::Apply { url, to, shadow, scope, skip, dry_run, auto_approve, format: _, exit_code } => {
             let source = match &url {
                 Some(_) => "--url".to_owned(),
                 None => loaded.url_source.clone().unwrap_or_else(|| "`url` in the config file".to_owned()),
@@ -743,20 +786,24 @@ fn run(cli: Cli, loaded: &Loaded, format: Format) -> anyhow::Result<ExitCode> {
                 target,
                 desired: Source::parse(&need(to, s.to.clone(), "--to", "to")?),
                 shadow: shadow.spec(s),
-                options: scope.options(s)?,
+                options: skip.add_to(scope.options(s)?, s)?,
             };
             return schema_apply(req, &shown, dry_run, auto_approve, format, exit_code);
         }
-        SchemaCommand::Diff { from, to, shadow, scope, format: _, exit_code } => {
+        SchemaCommand::Diff { from, to, shadow, scope, skip, format: _, exit_code } => {
             let req = api::DiffRequest {
                 from: Source::parse(&need(from, s.from.clone(), "--from", "from")?),
                 to: Source::parse(&need(to, s.to.clone(), "--to", "to")?),
                 shadow: shadow.spec(s),
-                options: scope.options(s)?,
+                options: skip.add_to(scope.options(s)?, s)?,
             };
             let res = api::schema_diff(&req)?;
             match format {
-                Format::Text => print!("{}", res.plan.to_sql()),
+                Format::Text => {
+                    print!("{}", res.plan.to_sql());
+                    std::io::stdout().flush()?;
+                    print_skipped(&res.skipped);
+                }
                 Format::Json => print_json(&res)?,
             }
             if exit_code && !res.plan.is_empty() {
@@ -820,15 +867,18 @@ fn migrate(command: MigrateCommand, s: &Settings, format: Format) -> anyhow::Res
                 Format::Json => print_json(&res)?,
             }
         }
-        MigrateCommand::Diff { name, dir: d, to, shadow, scope, format: _ } => {
+        MigrateCommand::Diff { name, dir: d, to, shadow, scope, skip, format: _ } => {
             let req = api::MigrateDiffRequest {
                 dir: dir(d)?,
                 name,
                 to: Source::parse(&need(to, s.to.clone(), "--to", "to")?),
                 shadow: shadow.spec(s),
-                options: scope.options(s)?,
+                options: skip.add_to(scope.options(s)?, s)?,
             };
             let res = api::migrate_diff(&req)?;
+            if format == Format::Text {
+                print_skipped(&res.skipped);
+            }
             match format {
                 Format::Text => match &res.file {
                     Some(file) => {
@@ -1133,6 +1183,9 @@ fn schema_apply(
 ) -> anyhow::Result<ExitCode> {
     let json = format == Format::Json;
     let res = api::schema_plan_apply(&req)?;
+    if !json {
+        print_skipped(&res.skipped);
+    }
     let changes = !res.plan.is_empty();
     let dry_code = if dry_run && exit_code && changes { ExitCode::from(CHANGES) } else { ExitCode::SUCCESS };
     if !changes {

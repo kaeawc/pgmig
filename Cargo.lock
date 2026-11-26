@@ -650,6 +650,7 @@ dependencies = [
 name = "pgmig-config"
 version = "0.1.0"
 dependencies = [
+ "pgmig-diff",
  "serde",
  "thiserror",
  "toml",

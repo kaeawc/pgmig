@@ -21,12 +21,13 @@
 //! | `migrations.lock_timeout` | `--lock-timeout` | duration: `"500ms"`, `"10s"`, `"2m"`, `"0"` ([`parse_duration_ms`]) |
 //! | `migrations.before_sql` | `--before-sql` | string |
 //! | `migrations.after_sql` | `--after-sql` | string |
+//! | `diff.skip` | `--skip` | array of kinds of change (`"drop_table"`, ...; [`pgmig_diff::ChangeKind`]) |
 //!
 //! Top-level keys apply everywhere; an `[env.<name>]` section overrides them key by key (an array
 //! replaces the one below it, it does not extend it). [`Config::resolve`] applies the precedence
 //! below the command line (`[env.<name>]` over top level); the caller puts its flags on top and
 //! its built-in defaults underneath. Any other key is an error naming its path
-//! (`env.prod.urll`); diff policy and lint rules will get their own sections.
+//! (`env.prod.urll`); lint rules will get their own section.
 //!
 //! `${NAME}` in a string value is replaced by a `--var NAME=value`, or else by the environment
 //! variable `NAME` ([`Vars`]); an undefined name is an error naming the key. `$${` is a literal
@@ -69,6 +70,8 @@ pub struct Settings {
     pub migrations_lock_timeout: Option<String>,
     pub migrations_before_sql: Option<String>,
     pub migrations_after_sql: Option<String>,
+    /// `[diff] skip`: kinds of change never planned (each checked to be a kind when parsed).
+    pub diff_skip: Option<Vec<String>>,
 }
 
 impl fmt::Debug for Settings {
@@ -91,6 +94,7 @@ impl fmt::Debug for Settings {
             .field("migrations_lock_timeout", &self.migrations_lock_timeout)
             .field("migrations_before_sql", &self.migrations_before_sql)
             .field("migrations_after_sql", &self.migrations_after_sql)
+            .field("diff_skip", &self.diff_skip)
             .finish()
     }
 }
@@ -275,7 +279,7 @@ fn join(prefix: &str, key: &str) -> String {
     if prefix.is_empty() { key_segment(key) } else { format!("{prefix}.{}", key_segment(key)) }
 }
 
-const SETTING_KEYS: &[&str] = &["url", "shadow", "from", "to", "include", "exclude", "schema", "format", "migrations"];
+const SETTING_KEYS: &[&str] = &["url", "shadow", "from", "to", "include", "exclude", "schema", "format", "migrations", "diff"];
 
 /// Reads one level's settings from `table`, recording what is wrong. `top` allows `env`.
 fn settings(table: &toml::Table, prefix: &str, problems: &mut Vec<Problem>) -> Settings {
@@ -357,6 +361,39 @@ fn settings(table: &toml::Table, prefix: &str, problems: &mut Vec<Problem>) -> S
                 }
                 _ => problems.push(Problem::key(&path, "expected a table")),
             },
+            "diff" => match value {
+                toml::Value::Table(d) => {
+                    for (k, v) in d {
+                        let path = join(&path, k);
+                        if k != "skip" {
+                            problems.push(Problem::key(&path, "unknown key (expected `skip`)"));
+                            continue;
+                        }
+                        let toml::Value::Array(items) = v else {
+                            problems.push(Problem::key(&path, "expected an array of kinds of change"));
+                            continue;
+                        };
+                        let mut kinds = Vec::with_capacity(items.len());
+                        for (i, item) in items.iter().enumerate() {
+                            let path = format!("{path}[{i}]");
+                            let toml::Value::String(item) = item else {
+                                problems.push(Problem::key(&path, "expected a string"));
+                                continue;
+                            };
+                            if let Err(p) = interpolate(item, &path, &|_| Some(String::new())) {
+                                problems.push(p);
+                            }
+                            // A value with a placeholder is checked once interpolated.
+                            match check_kind(item).filter(|_| !item.contains('$')) {
+                                Some(message) => problems.push(Problem::key(&path, message)),
+                                None => kinds.push(item.clone()),
+                            }
+                        }
+                        s.diff_skip = Some(kinds);
+                    }
+                }
+                _ => problems.push(Problem::key(&path, "expected a table")),
+            },
             "env" if prefix.is_empty() => {} // handled by the caller
             _ => problems.push(Problem::key(&path, unknown_key_message(prefix.is_empty()))),
         }
@@ -394,6 +431,11 @@ fn check_migrations_value(key: &str, v: &str) -> Option<&'static str> {
         "lock_timeout" if parse_duration_ms(v).is_none() => Some("expected a duration such as \"500ms\", \"10s\" or \"2m\""),
         _ => None,
     }
+}
+
+/// What is wrong with a `[diff] skip` entry, if anything: it must name a kind of change.
+fn check_kind(v: &str) -> Option<String> {
+    v.parse::<pgmig_diff::ChangeKind>().err().map(|e| e.to_string())
 }
 
 /// A duration in milliseconds: digits followed by `ms`, `s` or `m`, or `0`.
@@ -553,6 +595,7 @@ impl Config {
         };
         let include = many(&section.include, &self.top.include, "include");
         let exclude = many(&section.exclude, &self.top.exclude, "exclude");
+        let diff_skip = many(&section.diff_skip, &self.top.diff_skip, "diff.skip");
         if !problems.is_empty() {
             return Err(ConfigError::Invalid { path: self.path.clone(), problems });
         }
@@ -578,6 +621,12 @@ impl Config {
                 problems.push(Problem::key(&path, message));
             }
         }
+        for (i, kind) in diff_skip.iter().flatten().enumerate() {
+            if let Some(message) = check_kind(kind) {
+                let path = if section.diff_skip.is_some() { join(&join(&prefix, "diff"), "skip") } else { "diff.skip".to_owned() };
+                problems.push(Problem::key(&format!("{path}[{i}]"), message));
+            }
+        }
         if !problems.is_empty() {
             return Err(ConfigError::Invalid { path: self.path.clone(), problems });
         }
@@ -598,6 +647,7 @@ impl Config {
             migrations_lock_timeout,
             migrations_before_sql,
             migrations_after_sql,
+            diff_skip,
         })
     }
 }
@@ -770,6 +820,7 @@ exclude = ["e"]
 schema = "app"
 format = "text"
 migrations = { dir = "m", revisions_schema = "ops", tx_mode = "none", exec_order = "linear-skip", lock_name = "l", lock_timeout = "5s", before_sql = "SET LOCAL lock_timeout = '1s'", after_sql = "SELECT 1" }
+diff = { skip = ["drop_table", "drop_column"] }
 "#,
         );
         let s = c.resolve(None, &Vars::only(BTreeMap::new())).expect("resolve");
@@ -790,6 +841,7 @@ migrations = { dir = "m", revisions_schema = "ops", tx_mode = "none", exec_order
             migrations_lock_timeout: Some("5s".into()),
             migrations_before_sql: Some("SET LOCAL lock_timeout = '1s'".into()),
             migrations_after_sql: Some("SELECT 1".into()),
+            diff_skip: Some(vec!["drop_table".into(), "drop_column".into()]),
         };
         assert_eq!(s, want);
         assert!(c.envs.is_empty());
@@ -834,12 +886,12 @@ dri = "m"
 [env.prod]
 url = "u"
 env = "nested"
-[env."my env".diff]
+[env."my env".lint]
 skip = true
 "#,
         );
         assert_eq!(got.len(), 4, "{got:?}");
-        assert!(got[0].starts_with("env.\"my env\".diff: unknown key (expected one of `url`"), "{got:?}");
+        assert!(got[0].starts_with("env.\"my env\".lint: unknown key (expected one of `url`"), "{got:?}");
         assert!(got[1].starts_with("env.prod.env: unknown key"), "{got:?}");
         assert!(!got[1].contains("`env`)"), "env is a top-level key only: {got:?}");
         assert_eq!(
@@ -847,6 +899,25 @@ skip = true
             "migrations.dri: unknown key (expected one of `dir`, `revisions_schema`, `tx_mode`, `exec_order`, `lock_name`, `lock_timeout`, `before_sql`, `after_sql`)"
         );
         assert!(got[3].starts_with("urll: unknown key") && got[3].contains("`env`"), "{got:?}");
+    }
+
+    #[test]
+    fn diff_skip_names_kinds_of_change() {
+        let got = problems("[diff]\nskip = [\"drop_table\", \"drop_tables\", 1]\nskipp = []\n[env.prod.diff]\nskip = \"drop_table\"\n");
+        assert_eq!(got.len(), 4, "{got:?}");
+        assert!(got[0].starts_with("diff.skip[1]: unknown kind of change \"drop_tables\" (expected one of create_schema,"), "{got:?}");
+        assert_eq!(got[1], "diff.skip[2]: expected a string");
+        assert_eq!(got[2], "diff.skipp: unknown key (expected `skip`)");
+        assert_eq!(got[3], "env.prod.diff.skip: expected an array of kinds of change");
+        // An environment replaces the list; a placeholder is checked once interpolated.
+        let c = parse("[diff]\nskip = [\"drop_table\"]\n[env.prod.diff]\nskip = [\"${KIND}\"]\n");
+        let top = c.resolve(None, &vars(&[])).expect("top");
+        assert_eq!(top.diff_skip, Some(vec!["drop_table".to_owned()]));
+        let prod = c.resolve(Some("prod"), &vars(&[("KIND", "drop_column")])).expect("prod");
+        assert_eq!(prod.diff_skip, Some(vec!["drop_column".to_owned()]));
+        let got = resolve_err(&c, Some("prod"), &vars(&[("KIND", "drop_col")]));
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(got[0].starts_with("env.prod.diff.skip[0]: unknown kind of change \"drop_col\""), "{got:?}");
     }
 
     #[test]
