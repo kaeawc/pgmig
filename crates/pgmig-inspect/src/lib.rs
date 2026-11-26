@@ -7,8 +7,8 @@ use pgmig_conn::{Conn, Row};
 use std::collections::BTreeMap;
 
 use pgmig_model::{
-    Column, Constraint, ConstraintKind, Enum, Generated, Identity, Model, OwnedBy, QualName, References, Schema, Sequence, SequenceOptions,
-    Table, quote_literal,
+    Column, Constraint, ConstraintKind, Enum, Generated, Identity, Index, Model, OwnedBy, QualName, References, Schema, Sequence,
+    SequenceOptions, Table, quote_literal,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -91,9 +91,10 @@ fn inspect_catalog(conn: &mut Conn) -> Result<Model> {
     );
     for row in run(conn, "tables", &tables)? {
         let name = QualName::new(text(&row, 0, "tables")?, text(&row, 1, "tables")?);
-        model
-            .tables
-            .insert(name.clone(), Table { name, columns: Vec::new(), comment: row.get(2).cloned().flatten(), constraints: Vec::new() });
+        model.tables.insert(
+            name.clone(),
+            Table { name, columns: Vec::new(), comment: row.get(2).cloned().flatten(), constraints: Vec::new(), indexes: Vec::new() },
+        );
     }
 
     let enums = format!(
@@ -271,7 +272,77 @@ fn inspect_catalog(conn: &mut Conn) -> Result<Model> {
         t.constraints.sort_by(|x, y| x.name.cmp(&y.name));
     }
 
+    inspect_indexes(conn, &mut model, &attnames)?;
+
     Ok(model)
+}
+
+/// The indexes of the model's tables that no constraint owns: not a primary key, unique or
+/// exclusion constraint's (`conindid`; a foreign key's `conindid` is the index it references, which
+/// stays), and not a partition's index attached to its parent's (`pg_inherits`), which Postgres
+/// creates and drops with the parent's.
+///
+/// `attnames` maps `(table, attnum)` to column names.
+fn inspect_indexes(conn: &mut Conn, model: &mut Model, attnames: &BTreeMap<(QualName, String), String>) -> Result<()> {
+    let what = "indexes";
+    let indexes = format!(
+        "SELECT n.nspname, t.relname, i.relname, pg_get_indexdef(x.indexrelid), x.indisunique, x.indkey, \
+                obj_description(i.oid, 'pg_class'), x.indexrelid \
+         FROM pg_index x \
+         JOIN pg_class i ON i.oid = x.indexrelid \
+         JOIN pg_class t ON t.oid = x.indrelid \
+         JOIN pg_namespace n ON n.oid = t.relnamespace \
+         WHERE t.relkind IN ('r', 'p') AND {USER_SCHEMA} \
+           AND NOT EXISTS (SELECT 1 FROM pg_constraint co WHERE co.conindid = x.indexrelid AND co.contype IN ('p', 'u', 'x')) \
+           AND NOT EXISTS (SELECT 1 FROM pg_inherits h WHERE h.inhrelid = x.indexrelid) \
+         ORDER BY 1, 2, 3"
+    );
+    let mut by_oid: BTreeMap<String, (QualName, usize)> = BTreeMap::new();
+    for row in run(conn, what, &indexes)? {
+        let table = QualName::new(text(&row, 0, what)?, text(&row, 1, what)?);
+        let mut columns: Vec<String> = Vec::new();
+        for n in int_vector(&row.get(5).cloned().flatten().unwrap_or_default()) {
+            if let Some(name) = attnames.get(&(table.clone(), n))
+                && !columns.contains(name)
+            {
+                columns.push(name.clone());
+            }
+        }
+        let index = Index {
+            name: text(&row, 2, what)?,
+            definition: text(&row, 3, what)?,
+            unique: text(&row, 4, what)? == "t",
+            columns,
+            comment: row.get(6).cloned().flatten(),
+        };
+        if let Some(t) = model.tables.get_mut(&table) {
+            by_oid.insert(text(&row, 7, what)?, (table, t.indexes.len()));
+            t.indexes.push(index);
+        }
+    }
+    // The columns expressions and predicates use, which `indkey` records as 0.
+    let used = "SELECT d.objid, d.refobjsubid FROM pg_depend d JOIN pg_index x ON x.indexrelid = d.objid \
+                WHERE d.classid = 'pg_class'::regclass AND d.refclassid = 'pg_class'::regclass AND d.refobjid = x.indrelid \
+                  AND d.refobjsubid > 0 ORDER BY 1, 2";
+    for row in run(conn, what, used)? {
+        let Some((table, at)) = by_oid.get(&text(&row, 0, what)?) else { continue };
+        let Some(name) = attnames.get(&(table.clone(), text(&row, 1, what)?)) else { continue };
+        if let Some(index) = model.tables.get_mut(table).and_then(|t| t.indexes.get_mut(*at))
+            && !index.columns.contains(name)
+        {
+            index.columns.push(name.clone());
+        }
+    }
+    for t in model.tables.values_mut() {
+        t.indexes.sort_by(|x, y| x.name.cmp(&y.name));
+    }
+    Ok(())
+}
+
+/// The elements of an `int2vector` as the server prints it (`1 2`; pgmem prints `{1,2}`,
+/// kaeawc/pgmem#170), as text.
+fn int_vector(printed: &str) -> impl Iterator<Item = String> + '_ {
+    printed.trim_start_matches('{').trim_end_matches('}').split([',', ' ']).filter(|n| !n.is_empty()).map(str::to_owned)
 }
 
 /// The elements of an `int2[]` as the server prints it (`{1,2}`), as text.
@@ -451,7 +522,7 @@ fn text(row: &Row, column: usize, what: &'static str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{int_array, is_unqualified, nextval_arguments, qualify_regclass_literals, regclass_literals};
+    use super::{int_array, int_vector, is_unqualified, nextval_arguments, qualify_regclass_literals, regclass_literals};
     use pgmig_model::QualName;
 
     #[test]
@@ -505,6 +576,14 @@ mod tests {
         assert_eq!(int_array("{3}").collect::<Vec<_>>(), ["3"]);
         assert!(int_array("{}").next().is_none());
         assert!(int_array("").next().is_none());
+    }
+
+    #[test]
+    fn int_vectors_are_read_as_printed() {
+        assert_eq!(int_vector("2 3").collect::<Vec<_>>(), ["2", "3"]);
+        assert_eq!(int_vector("0").collect::<Vec<_>>(), ["0"]);
+        assert_eq!(int_vector("{1,2}").collect::<Vec<_>>(), ["1", "2"]);
+        assert!(int_vector("").next().is_none());
     }
 
     #[test]

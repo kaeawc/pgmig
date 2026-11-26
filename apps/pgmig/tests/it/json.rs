@@ -62,7 +62,8 @@ fn inspect_prints_the_model() {
           }
         ],
         "comment": null,
-        "constraints": []
+        "constraints": [],
+        "indexes": []
       }
     ],
     "enums": [],

@@ -17,18 +17,22 @@
 //! - tables: name, comment; columns by name (column order is not compared: Postgres cannot reorder
 //!   columns, so a diff never tries to), each with its type, `NOT NULL`, default, comment and
 //!   identity (how it is generated and its sequence options); constraints by name, each with its
-//!   kind, definition and comment.
+//!   kind, definition and comment; indexes by name, each with its definition and comment.
 //!
 //! Left out, because they are derived from what enters or are named by the server rather than by
 //! the schema: [`Column::type_ref`] and [`Column::default_sequences`] (read from the type and the
 //! default), [`Identity::sequence`] (whatever name Postgres picked), and a constraint's flags,
 //! columns and references (which say nothing its definition doesn't; the referenced index name
-//! is the catalog's).
+//! is the catalog's), and an index's uniqueness and columns (its definition says them).
+//!
+//! Indexes entered the fingerprint without a new [`FORMAT`]: a model without indexes writes no
+//! index record, so its fingerprint is what it was. A schema with indexes fingerprints differently
+//! from before, as it should: earlier versions did not read its indexes at all.
 //!
 //! # Encoding
 //!
-//! One record per line, in model order (maps are sorted by identity; columns and constraints are
-//! sorted by name). A record is a tag and fields in a fixed order, separated by spaces. A string
+//! One record per line, in model order (maps are sorted by identity; columns, constraints and
+//! indexes are sorted by name). A record is a tag and fields in a fixed order, separated by spaces. A string
 //! is `<byte length>:<bytes>`, so any text, including spaces and newlines, is unambiguous; an
 //! absent value is `-`, and a present optional value is `+` and then its fields. Integers are decimal and
 //! booleans are `t` or `f`. A list is its length, then its items.
@@ -40,7 +44,8 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    Column, Constraint, ConstraintKind, Enum, Generated, Identity, Model, OwnedBy, QualName, Schema, Sequence, SequenceOptions, Table,
+    Column, Constraint, ConstraintKind, Enum, Generated, Identity, Index, Model, OwnedBy, QualName, Schema, Sequence, SequenceOptions,
+    Table,
 };
 
 /// The first line of the canonical text. Changing what enters the fingerprint, or how it is
@@ -77,7 +82,7 @@ pub fn canonical(model: &Model) -> String {
         w.opt(comment).end();
     }
     for t in tables.values() {
-        let Table { name, columns, comment, constraints } = t;
+        let Table { name, columns, comment, constraints, indexes } = t;
         w.tag("table").name(name).opt(comment).end();
         let mut columns: Vec<_> = columns.iter().collect();
         columns.sort_by(|a, b| a.name.cmp(&b.name));
@@ -122,6 +127,19 @@ pub fn canonical(model: &Model) -> String {
                 comment,
             } = c;
             w.tag("constraint").str(name).raw(kind(*k)).str(definition).opt(comment).end();
+        }
+        let mut indexes: Vec<_> = indexes.iter().collect();
+        indexes.sort_by(|a, b| a.name.cmp(&b.name));
+        for i in indexes {
+            let Index {
+                name,
+                definition,
+                // The definition already says these.
+                unique: _,
+                columns: _,
+                comment,
+            } = i;
+            w.tag("index").str(name).str(definition).opt(comment).end();
         }
     }
     w.0
@@ -206,7 +224,7 @@ impl Writer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::References;
+    use crate::{Index, References};
 
     fn column(name: &str, type_name: &str) -> Column {
         Column {
@@ -270,7 +288,23 @@ mod tests {
             references: Some(References { table: t(), columns: vec!["id".into()], constraint: Some("users_pkey".into()) }),
             comment: None,
         };
-        m.tables.insert(t(), Table { name: t(), columns, comment: Some("people".into()), constraints: vec![pk, fk] });
+        let indexes = vec![
+            Index {
+                name: "users_team_idx".into(),
+                definition: "CREATE INDEX users_team_idx ON app.users USING btree (team) WHERE (team > 0)".into(),
+                unique: false,
+                columns: vec!["team".into()],
+                comment: Some("by team".into()),
+            },
+            Index {
+                name: "users_n_key".into(),
+                definition: "CREATE UNIQUE INDEX users_n_key ON app.users USING btree (n)".into(),
+                unique: true,
+                columns: vec!["n".into()],
+                comment: None,
+            },
+        ];
+        m.tables.insert(t(), Table { name: t(), columns, comment: Some("people".into()), constraints: vec![pk, fk], indexes });
         let mood = QualName::new("app", "mood");
         m.enums.insert(mood.clone(), Enum { name: mood, labels: vec!["sad".into(), "ok".into()], comment: None });
         let seq = QualName::new("app", "users_n_seq");
@@ -312,8 +346,19 @@ column 1:n 7:integer f + 36:nextval('app.users_n_seq'::regclass) - -
 column 4:team 7:integer f - - -
 constraint 10:users_pkey primary_key 16:PRIMARY KEY (id) + 7:the key
 constraint 15:users_team_fkey foreign_key 43:FOREIGN KEY (team) REFERENCES app.users(id) -
+index 11:users_n_key 60:CREATE UNIQUE INDEX users_n_key ON app.users USING btree (n) -
+index 14:users_team_idx 76:CREATE INDEX users_team_idx ON app.users USING btree (team) WHERE (team > 0) + 7:by team
 ";
         assert_eq!(canonical(&sample()), want);
+    }
+
+    /// Indexes came without a new format: a model without them keeps the fingerprint it had.
+    #[test]
+    fn a_model_without_indexes_keeps_its_fingerprint() {
+        let mut m = sample();
+        table(&mut m).indexes.clear();
+        assert!(!canonical(&m).contains("\nindex "));
+        assert_eq!(fingerprint(&m), "h1:5sXCRUfyLpra3Bf30ZJnHjIRFWDat5XAQWp/AOGtM0M=");
     }
 
     #[test]
@@ -331,6 +376,7 @@ constraint 15:users_team_fkey foreign_key 43:FOREIGN KEY (team) REFERENCES app.u
         let mut m = sample();
         table(&mut m).columns.reverse();
         table(&mut m).constraints.reverse();
+        table(&mut m).indexes.reverse();
         assert_eq!(fingerprint(&m), base);
     }
 
@@ -345,6 +391,8 @@ constraint 15:users_team_fkey foreign_key 43:FOREIGN KEY (team) REFERENCES app.u
             ("type_ref", |m| col(m, "mood").type_ref = None),
             ("default_sequences", |m| col(m, "n").default_sequences.clear()),
             ("constraint columns", |m| table(m).constraints[1].columns.clear()),
+            ("index columns", |m| table(m).indexes[0].columns.clear()),
+            ("index unique flag", |m| table(m).indexes[1].unique = false),
             ("constraint referenced index", |m| table(m).constraints[1].references.as_mut().expect("references").constraint = None),
         ];
         for (what, change) in unchanged {
@@ -397,6 +445,10 @@ constraint 15:users_team_fkey foreign_key 43:FOREIGN KEY (team) REFERENCES app.u
             ("constraint definition", |m| table(m).constraints[1].definition.push_str(" DEFERRABLE")),
             ("constraint comment", |m| table(m).constraints[1].comment = Some("x".into())),
             ("constraint dropped", |m| table(m).constraints.truncate(1)),
+            ("index renamed", |m| table(m).indexes[0].name = "users_by_team".into()),
+            ("index definition", |m| table(m).indexes[0].definition = "CREATE INDEX users_team_idx ON app.users USING hash (team)".into()),
+            ("index comment", |m| table(m).indexes[1].comment = Some("x".into())),
+            ("index dropped", |m| table(m).indexes.truncate(1)),
             ("table renamed", |m| {
                 let mut tb = m.tables.remove(&t()).expect("table");
                 tb.name = QualName::new("app", "people");
