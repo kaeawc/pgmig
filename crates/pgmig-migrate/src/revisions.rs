@@ -41,10 +41,8 @@
 //! # SQL
 //!
 //! Every statement is plain SQL over the simple protocol: identifiers go through
-//! [`quote_ident`], values through a local escape-string literal (`E'...'`, backslashes and quotes
-//! doubled), which reads the same whatever `standard_conforming_strings` is set to on the target:
-//! error texts carry backslashes and a plain literal would break out of its quotes with the
-//! setting off. Statements run in the caller's transaction, if any: the
+//! [`quote_ident`], values through `pgmig_model::quote_literal` (an escape string `E'...'` when there is a backslash, quotes
+//! doubled), which reads the same whatever `standard_conforming_strings` is set to on the target. Statements run in the caller's transaction, if any: the
 //! apply engine decides what is atomic.
 
 use std::cmp::Ordering;
@@ -53,7 +51,7 @@ use std::fmt;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use pgmig_conn::Conn;
-use pgmig_model::quote_ident;
+use pgmig_model::{quote_ident, quote_literal as lit};
 use sha2::{Digest, Sha256};
 
 use crate::compare_versions;
@@ -493,20 +491,6 @@ impl Table {
     }
 }
 
-/// `s` as an escape-string literal: correct with `standard_conforming_strings` on or off.
-fn lit(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 3);
-    out.push_str("E'");
-    for c in s.chars() {
-        if matches!(c, '\\' | '\'') {
-            out.push(c);
-        }
-        out.push(c);
-    }
-    out.push('\'');
-    out
-}
-
 fn qualified(schema: &str) -> String {
     format!("{}.{TABLE}", quote_ident(schema))
 }
@@ -678,7 +662,7 @@ mod tests {
         let t = Table { schema: DEFAULT_SCHEMA.into() };
         let r = rev();
         let alone = t.replace_sql(&r, false).expect("sql");
-        assert!(alone.starts_with("BEGIN;\nDELETE FROM pgmig.pgmig_revisions WHERE version = E'20261126103000';\nINSERT INTO"), "{alone}");
+        assert!(alone.starts_with("BEGIN;\nDELETE FROM pgmig.pgmig_revisions WHERE version = '20261126103000';\nINSERT INTO"), "{alone}");
         assert!(alone.ends_with(";\nCOMMIT"), "{alone}");
         assert_eq!((alone.matches("DELETE").count(), alone.matches("INSERT").count()), (1, 1));
         let inside = t.replace_sql(&r, true).expect("sql");
@@ -690,23 +674,13 @@ mod tests {
     }
 
     #[test]
-    fn literals_are_escape_strings() {
-        assert_eq!(lit("abc"), "E'abc'");
-        assert_eq!(lit("a\\b"), r"E'a\\b'");
-        assert_eq!(lit("it's"), "E'it''s'");
-        assert_eq!(lit("\\'"), r"E'\\'''");
-        assert_eq!(lit("a\nb"), "E'a\nb'");
-        assert_eq!(lit("h\u{e9}llo \u{1f600}"), "E'h\u{e9}llo \u{1f600}'");
-    }
-
-    #[test]
     fn values_are_quoted() {
         let mut r = rev();
         r.description = "it's".into();
         r.fail("x", "SELECT 'a'");
         let sql = r.assignments();
-        assert!(sql.contains("description = E'it''s'"), "{sql}");
-        assert!(sql.contains("error_stmt = E'SELECT ''a'''"), "{sql}");
+        assert!(sql.contains("description = 'it''s'"), "{sql}");
+        assert!(sql.contains("error_stmt = 'SELECT ''a'''"), "{sql}");
         assert!(sql.contains("partial_hashes = '{}'::text[]"), "{sql}");
         assert!(!sql.contains("executed_at"), "{sql}");
         assert_eq!(qualified("Ops"), "\"Ops\".pgmig_revisions");

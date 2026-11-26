@@ -288,10 +288,24 @@ pub fn integer_bounds(data_type: &str) -> Option<(i64, i64)> {
     }
 }
 
-/// Quote a string as a SQL literal: single quotes doubled. Backslashes and newlines are kept as
-/// they are, which is right under `standard_conforming_strings` (on by default since 9.1).
+/// Quote a string as a SQL literal that reads back the same whatever the target's
+/// `standard_conforming_strings` is: a plain `'...'` (quotes doubled) when the text has no
+/// backslash, otherwise an escape string `E'...'` with backslashes and quotes doubled.
 pub fn quote_literal(text: &str) -> String {
-    format!("'{}'", text.replace('\'', "''"))
+    let escape = text.contains('\\');
+    let mut out = String::with_capacity(text.len() + 3);
+    if escape {
+        out.push('E');
+    }
+    out.push('\'');
+    for c in text.chars() {
+        if c == '\'' || (escape && c == '\\') {
+            out.push(c);
+        }
+        out.push(c);
+    }
+    out.push('\'');
+    out
 }
 
 /// Quote an identifier the way Postgres' `quote_ident` does.
@@ -544,7 +558,12 @@ mod tests {
         assert_eq!(quote_literal(""), "''");
         assert_eq!(quote_literal("it's"), "'it''s'");
         assert_eq!(quote_literal("''"), "''''''");
-        assert_eq!(quote_literal("a\\b"), "'a\\b'");
+        assert_eq!(quote_literal("a\\b"), "E'a\\\\b'");
+        assert_eq!(quote_literal("a\\'b"), "E'a\\\\''b'");
+        assert_eq!(quote_literal("\\"), "E'\\\\'");
+        assert_eq!(quote_literal("tab\\\nnew"), "E'tab\\\\\nnew'");
+        assert_eq!(quote_literal("caf\u{e9} \u{1F600}"), "'caf\u{e9} \u{1F600}'");
+        assert_eq!(quote_literal("caf\u{e9}\\"), "E'caf\u{e9}\\\\'");
         assert_eq!(quote_literal("line1\nline2"), "'line1\nline2'");
     }
 

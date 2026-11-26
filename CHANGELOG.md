@@ -97,6 +97,9 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
 
 ### Changed
 
+- Literals in plans (comments, enum labels) containing a backslash render as escape strings
+  (`E'...'`), so they read back the same whatever `standard_conforming_strings` the target has (#116).
+
 - Plans mark commit points with a `-- pgmig:commit` directive line after the explanatory comment.
 - The revisions schema (`pgmig` by default) is never managed by `schema` commands: it is left out
   of inspect, diff and apply on both sides. A project with its own schema named `pgmig` must set
