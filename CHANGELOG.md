@@ -21,6 +21,9 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
   runs in a transaction; a failure rolls it back and names the statement and how many earlier
   batches stayed applied. `--dry-run` prints the plan; without a terminal it needs
   `--auto-approve`.
+- Sequences, identity columns and serial columns: sequence options and `OWNED BY` (the current
+  value is never compared), identity `ALWAYS`/`BY DEFAULT` and options, and serial columns as a
+  default plus an owned sequence, so switching between serial and identity plans cleanly.
 - Enum types: create, drop, add values at a position, and rename a value (planned only when one
   label changes in place; the statement carries a comment saying stored values change). Removing
   or reordering values is reported as unsupported. `ADD VALUE` is planned first, and the plan marks
@@ -35,7 +38,7 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
   created after that table and dropped before it.
 - Breaking library changes: `pgmig_plan::plan` returns `Result<Plan, Error>` (an error names a
   dependency cycle); `Change::DropTable` carries the dropped `Table`; `DropColumn` and
-  `AlterColumnType` carry the referenced types; `Column` has a new `type_ref` field; `Plan` has a new `commit_after` field and `plan` can fail
+  `AlterColumnType` carry the referenced types; `Column` has a new `type_ref` field; `DropTable` and `DropColumn` carry the sequences they drop; `Plan` has a new `commit_after` field and `plan` can fail
   with `Error::Unsupported`.
 
 ## [0.1.0] - 2026-11-26

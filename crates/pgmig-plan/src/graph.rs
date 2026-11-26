@@ -30,6 +30,8 @@ pub enum Object {
     /// A type by its `pg_type` name. Creating a table creates its row type of the same name.
     Type(QualName),
     Column(QualName, String),
+    /// A sequence, standalone or (by its implicit name) an identity column's.
+    Sequence(QualName),
 }
 
 /// What one step does to which objects.
