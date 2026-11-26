@@ -101,7 +101,8 @@ pub enum Error {
 pub struct PlanOptions {
     /// Objects in this schema are printed unqualified (`CREATE TABLE t`, not `public.t`): the plan
     /// is meant to run with the schema first on the `search_path`. Names in other schemas, and
-    /// SQL the server printed (types, defaults, constraint definitions), are left as they are.
+    /// SQL the server printed (types, defaults, constraint definitions), are left as they are:
+    /// inspection prints those schema-qualified (`'a'::public.mood`, `REFERENCES public.b(id)`).
     pub unqualified_schema: Option<String>,
 }
 

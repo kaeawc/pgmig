@@ -35,8 +35,11 @@ extensions pgmem doesn't have).
 `--exclude 'public.tmp_*'` leaves those objects alone on both sides. A managed object may reference
 an unmanaged one (a foreign key to an excluded table); the plan assumes it exists. `--schema <name>`
 manages one schema's objects (not the schema itself); `inspect` and `diff` print their names
-unqualified, while `apply` prints and runs schema-qualified SQL so the target's `search_path` cannot
-redirect a statement to another schema. Without it, every schema is managed and names are qualified.
+unqualified (types, defaults and constraint definitions keep their schema), while `apply` prints
+and runs schema-qualified SQL so the target's `search_path` cannot redirect a statement to another
+schema. Without it, every schema is managed and names are qualified.
+Databases are inspected with `search_path` set to `pg_catalog` alone, so a role's or session's
+`search_path` does not change how a schema prints.
 
 `--format json` (on `inspect`, `diff`, `validate` and `apply`) prints the command's response as one
 pretty-printed JSON document on stdout and nothing on stderr; a failure prints the error object

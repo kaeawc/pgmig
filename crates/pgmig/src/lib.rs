@@ -142,7 +142,8 @@ pub struct Options {
     /// Which objects are managed (see [`filter`]).
     pub filter: Filter,
     /// Schema mode: manage only this schema's objects, not the schema itself, and print their names
-    /// unqualified in `schema inspect` and `schema diff`. `None` is database mode: every schema is
+    /// unqualified in `schema inspect` and `schema diff`; SQL the server prints (types, defaults,
+    /// constraint definitions) stays schema-qualified (see [`inspect`]). `None` is database mode: every schema is
     /// managed and names are qualified. Plans that are executed ([`schema_plan_apply`]) are always
     /// qualified: an unqualified name means whatever the target's `search_path` makes it mean.
     pub schema: Option<String>,

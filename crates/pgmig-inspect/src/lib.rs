@@ -25,7 +25,58 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 const USER_SCHEMA: &str = "n.nspname NOT IN ('pg_catalog', 'information_schema') AND left(n.nspname, 3) <> 'pg_'";
 
+/// The model of the database `conn` is connected to.
+///
+/// Server functions (`format_type`, `pg_get_expr`, `pg_get_constraintdef`, `regclass` output) leave
+/// out the schema of an object on the session's `search_path`, so the same schema would print
+/// differently under different settings, and printed text such as `REFERENCES b(id)` could bind to
+/// another `b` when executed elsewhere. Inspection therefore sets the session's `search_path` to
+/// `pg_catalog` alone, so every name in a user schema prints qualified, and restores it afterwards,
+/// also when a query fails. It opens no transaction, so a transaction the session is in (one a
+/// desired-state file left open, say) keeps its work.
 pub fn inspect(conn: &mut Conn) -> Result<Model> {
+    let mut guard = SearchPath::set(conn, "pg_catalog")?;
+    let model = inspect_catalog(guard.conn);
+    let restored = guard.restore();
+    let model = model?;
+    restored?;
+    Ok(model)
+}
+
+/// The session's `search_path`, replaced for inspection; dropping it puts the saved value back.
+struct SearchPath<'a> {
+    conn: &'a mut Conn,
+    saved: Option<String>,
+}
+
+impl<'a> SearchPath<'a> {
+    fn set(conn: &'a mut Conn, value: &str) -> Result<SearchPath<'a>> {
+        let rows = run(conn, "search path", "SELECT current_setting('search_path')")?;
+        let saved = rows.first().map(|row| text(row, 0, "search path")).transpose()?.unwrap_or_default();
+        set_search_path(conn, value)?;
+        Ok(SearchPath { conn, saved: Some(saved) })
+    }
+
+    fn restore(&mut self) -> Result<()> {
+        match self.saved.take() {
+            Some(saved) => set_search_path(self.conn, &saved),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for SearchPath<'_> {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
+fn set_search_path(conn: &mut Conn, value: &str) -> Result<()> {
+    let sql = format!("SELECT set_config('search_path', {}, false)", quote_literal(value));
+    run(conn, "search path", &sql).map(drop)
+}
+
+fn inspect_catalog(conn: &mut Conn) -> Result<Model> {
     let mut model = Model::default();
 
     let schemas = format!("SELECT n.nspname, obj_description(n.oid, 'pg_namespace') FROM pg_namespace n WHERE {USER_SCHEMA} ORDER BY 1");
@@ -128,17 +179,16 @@ pub fn inspect(conn: &mut Conn) -> Result<Model> {
         let table = QualName::new(text(&row, 0, "columns")?, text(&row, 1, "columns")?);
         let name = text(&row, 2, "columns")?;
         attnames.insert((table.clone(), text(&row, 10, "columns")?), name.clone());
-        let default = row.get(5).cloned().flatten();
+        let default = match row.get(5).cloned().flatten() {
+            Some(expr) => Some(qualify_regclass_literals(&expr, |literal| resolve_cached(conn, &mut resolved, literal))?),
+            None => None,
+        };
         let mut default_sequences = Vec::new();
         for literal in default.as_deref().map(nextval_arguments).unwrap_or_default() {
-            if !resolved.contains_key(&literal) {
-                let found = resolve_relation(conn, &literal)?;
-                resolved.insert(literal.clone(), found);
-            }
-            if let Some(Some(seq)) = resolved.get(&literal)
-                && !default_sequences.contains(seq)
+            if let Some(seq) = resolve_cached(conn, &mut resolved, &literal)?
+                && !default_sequences.contains(&seq)
             {
-                default_sequences.push(seq.clone());
+                default_sequences.push(seq);
             }
         }
         let generated = match row.get(9).cloned().flatten().as_deref() {
@@ -271,8 +321,97 @@ pub fn nextval_arguments(expr: &str) -> Vec<String> {
     out
 }
 
-/// The relation a `regclass` literal names, resolved by the server with its search path.
+/// The `'<name>'::regclass` literals in an expression as the server prints it: each literal's byte
+/// range (quotes included) and its unquoted text. String literals and quoted identifiers are skipped
+/// whole, so a quote inside them starts nothing.
+fn regclass_literals(expr: &str) -> Vec<(std::ops::Range<usize>, String)> {
+    const CAST: &str = "::regclass";
+    let bytes = expr.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let quote = bytes[i];
+        if quote != b'\'' && quote != b'"' {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut text = Vec::new();
+        i += 1;
+        let mut closed = false;
+        while i < bytes.len() {
+            if bytes[i] == quote {
+                if bytes.get(i + 1) == Some(&quote) {
+                    text.push(quote);
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+                closed = true;
+                break;
+            }
+            text.push(bytes[i]);
+            i += 1;
+        }
+        if !closed {
+            break;
+        }
+        if quote == b'\'' && expr[i..].starts_with(CAST) {
+            out.push((start..i, String::from_utf8_lossy(&text).into_owned()));
+        }
+    }
+    out
+}
+
+/// `expr` with every unqualified `regclass` literal naming a user relation rewritten to the
+/// qualified, quoted form the server prints under inspection's search path
+/// (`nextval('public.t_id_seq'::regclass)`). `resolve` looks a literal up. On Postgres there is
+/// nothing to rewrite; pgmem prints `public` relations unqualified (kaeawc/pgmem#226), which would
+/// otherwise compare unequal to a Postgres target's defaults on every run.
+fn qualify_regclass_literals(expr: &str, mut resolve: impl FnMut(&str) -> Result<Option<QualName>>) -> Result<String> {
+    let mut out = String::new();
+    let mut last = 0;
+    for (range, literal) in regclass_literals(expr) {
+        if !is_unqualified(&literal) {
+            continue;
+        }
+        let Some(name) = resolve(&literal)? else { continue };
+        if name.schema == "pg_catalog" {
+            continue;
+        }
+        out.push_str(&expr[last..range.start]);
+        out.push_str(&quote_literal(&name.to_string()));
+        last = range.end;
+    }
+    out.push_str(&expr[last..]);
+    Ok(out)
+}
+
+/// [`resolve_relation`], remembering answers in `resolved` by literal.
+fn resolve_cached(conn: &mut Conn, resolved: &mut BTreeMap<String, Option<QualName>>, literal: &str) -> Result<Option<QualName>> {
+    if let Some(found) = resolved.get(literal) {
+        return Ok(found.clone());
+    }
+    let found = resolve_relation(conn, literal)?;
+    resolved.insert(literal.to_owned(), found.clone());
+    Ok(found)
+}
+
+/// The relation a `regclass` literal names, resolved by the server with inspection's search path,
+/// where `regclass` output names every user relation with its schema.
+///
+/// pgmem prints a `public` relation unqualified whatever the search path (kaeawc/pgmem#226), so a
+/// literal that resolves to nothing is also tried in `public`. On Postgres that never matches: an
+/// unqualified literal there is a `pg_catalog` relation, which the first lookup finds.
 fn resolve_relation(conn: &mut Conn, literal: &str) -> Result<Option<QualName>> {
+    let found = lookup_relation(conn, literal)?;
+    if found.is_some() || !is_unqualified(literal) {
+        return Ok(found);
+    }
+    lookup_relation(conn, &format!("public.{literal}"))
+}
+
+fn lookup_relation(conn: &mut Conn, literal: &str) -> Result<Option<QualName>> {
     let sql = format!(
         "SELECT n.nspname, c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.oid = to_regclass({})",
         quote_literal(literal)
@@ -282,6 +421,19 @@ fn resolve_relation(conn: &mut Conn, literal: &str) -> Result<Option<QualName>> 
         Some(row) => Some(QualName::new(text(row, 0, "column default sequences")?, text(row, 1, "column default sequences")?)),
         None => None,
     })
+}
+
+/// Whether a relation name as `regclass` prints it has no schema: no `.` outside double quotes.
+fn is_unqualified(name: &str) -> bool {
+    let mut quoted = false;
+    for ch in name.chars() {
+        match ch {
+            '"' => quoted = !quoted,
+            '.' if !quoted => return false,
+            _ => {}
+        }
+    }
+    true
 }
 
 fn number(row: &Row, column: usize, what: &'static str) -> Result<i64> {
@@ -299,7 +451,53 @@ fn text(row: &Row, column: usize, what: &'static str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{int_array, nextval_arguments};
+    use super::{int_array, is_unqualified, nextval_arguments, qualify_regclass_literals, regclass_literals};
+    use pgmig_model::QualName;
+
+    #[test]
+    fn unqualified_regclass_literals_are_rewritten_qualified() {
+        let resolve = |literal: &str| {
+            Ok(match literal {
+                "t_id_seq" => Some(QualName::new("public", "t_id_seq")),
+                "\"Seq\"" => Some(QualName::new("Odd", "Seq")),
+                "pg_class" => Some(QualName::new("pg_catalog", "pg_class")),
+                _ => None,
+            })
+        };
+        let q = |expr: &str| qualify_regclass_literals(expr, resolve).expect("rewrite");
+        assert_eq!(q("nextval('t_id_seq'::regclass)"), "nextval('public.t_id_seq'::regclass)");
+        assert_eq!(q("nextval('\"Seq\"'::regclass)"), "nextval('\"Odd\".\"Seq\"'::regclass)");
+        assert_eq!(
+            q("(nextval('t_id_seq'::regclass) + nextval('app.s'::regclass))"),
+            "(nextval('public.t_id_seq'::regclass) + nextval('app.s'::regclass))"
+        );
+        assert_eq!(q("'pg_class'::regclass"), "'pg_class'::regclass");
+        assert_eq!(q("nextval('missing'::regclass)"), "nextval('missing'::regclass)");
+        assert_eq!(q("'t_id_seq'::text"), "'t_id_seq'::text");
+    }
+
+    #[test]
+    fn regclass_literals_are_found_with_their_ranges() {
+        let expr = "nextval('t_id_seq'::regclass)";
+        let found = regclass_literals(expr);
+        assert_eq!(found, [(8..18, "t_id_seq".to_owned())]);
+        assert_eq!(&expr[found[0].0.clone()], "'t_id_seq'");
+        assert_eq!(
+            regclass_literals("(nextval('\"Odd\".\"It''s\"'::regclass) + 'x'::text::regclass::oid)"),
+            [(9..24, "\"Odd\".\"It's\"".to_owned())]
+        );
+        assert!(regclass_literals("'nextval(''x''::regclass)'::text").is_empty());
+        assert!(regclass_literals("(\"it's\" + 1)").is_empty());
+        assert!(regclass_literals("'unterminated").is_empty());
+    }
+
+    #[test]
+    fn qualified_names_are_told_apart() {
+        assert!(is_unqualified("t_id_seq"));
+        assert!(is_unqualified("\"a.b\""));
+        assert!(!is_unqualified("app.counter"));
+        assert!(!is_unqualified("\"App\".\"It's\""));
+    }
 
     #[test]
     fn int_arrays_are_read_as_printed() {

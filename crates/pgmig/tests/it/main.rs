@@ -8,5 +8,6 @@ mod import;
 mod inspect;
 mod load;
 mod quoting;
+mod search_path;
 mod support;
 mod validate;
