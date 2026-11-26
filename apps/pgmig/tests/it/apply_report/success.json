@@ -1,0 +1,58 @@
+{
+  "target": "<target>",
+  "dry_run": false,
+  "pending": [
+    "1_users.sql",
+    "2_orders.sql",
+    "3_later.sql"
+  ],
+  "files": [
+    {
+      "file": "1_users.sql",
+      "version": "1",
+      "status": "applied",
+      "tx_mode": "file",
+      "statements": 2,
+      "resumed_after": 0,
+      "execution_ms": 0,
+      "statement_timings": [
+        {
+          "index": 0,
+          "line": 1,
+          "hash": "ksWyz5NVy1ftXWkoQWmWKN2meRoAt+45nUN3MDu6l80=",
+          "execution_ms": 0
+        },
+        {
+          "index": 1,
+          "line": 2,
+          "hash": "2cuI1a0FxSophImVLIAp/uUp7fKDrDOudqrAbBhITTQ=",
+          "execution_ms": 0
+        }
+      ]
+    },
+    {
+      "file": "2_orders.sql",
+      "version": "2",
+      "status": "pending",
+      "tx_mode": null,
+      "statements": 1,
+      "resumed_after": 0,
+      "execution_ms": 0,
+      "statement_timings": []
+    },
+    {
+      "file": "3_later.sql",
+      "version": "3",
+      "status": "pending",
+      "tx_mode": null,
+      "statements": 1,
+      "resumed_after": 0,
+      "execution_ms": 0,
+      "statement_timings": []
+    }
+  ],
+  "applied": 1,
+  "statements": 2,
+  "execution_ms": 0,
+  "baseline_skipped": false
+}

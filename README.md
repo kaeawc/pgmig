@@ -58,6 +58,24 @@ pretty-printed JSON document on stdout and nothing on stderr; a failure prints t
 still reported as text on stderr. `apply` never asks
 in JSON mode: pass `--auto-approve` or `--dry-run`.
 
+### `migrate apply` report
+
+`pgmig migrate apply --format json` prints the report below on success (`target`, then the fields).
+A failure prints the usual error object (`code` `migration`, `message`, `sqlstate`, `file`, `line`,
+`col`, `migration`) and exits `1`; its `migration` object (`statement_index`, `statement`,
+`applied_files`, `outcome`) also holds the same report as `report`, as far as the run got.
+
+| Field | Meaning |
+| --- | --- |
+| `dry_run` | Nothing was run. |
+| `pending` | File names pending when the run started (to run, or beyond `n`), in run order. |
+| `files[]` | Every file of the directory, in version order: `file`, `version`, `status`, `tx_mode` (`file`, `all` or `none`: how the file is to run or ran, set for every file this run was to run, i.e. the pending files up to the limit `n`, in a dry run and after a failure too; null for files beyond `n` and for `already_applied`, `skipped` and `baselined` files), `statements` (to run), `resumed_after`, `execution_ms`, `statement_timings[]`. |
+| `files[].status` | `already_applied`, `applied` (by this run), `pending`, `skipped`, `baselined`; after a failure also `failed` (a statement of this file, or its own bookkeeping, failed), `rolled_back` (ran in `--tx-mode all`, undone because a later file, `after_sql` or `COMMIT` failed) and `unknown` (ran in `--tx-mode all` and `COMMIT`'s outcome is not known: it may be applied). Files not reached stay `pending`. |
+| `files[].statement_timings[]` | The statements this run ran, in order: `index` (0-based), `line` (1-based), `hash` (as in the revisions table), `execution_ms`. After a failure: those before the failing statement. The SQL text is left out, as statements may hold secrets; `migration.statement` has the failing one. |
+| `applied`, `statements` | Files applied and statements run by this run. |
+| `execution_ms` | The run, hooks and bookkeeping included. Times are whole milliseconds. |
+| `baseline_skipped` | `--baseline` was ignored because the database is empty. |
+
 Exit codes: `0` success; `1` error (including `validate` finding errors); `2` usage (bad flags, or `apply` with no way to approve);
 `3` with `--exit-code` (`diff`, or `apply --dry-run`) when the plan is not empty.
 
