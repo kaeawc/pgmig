@@ -11,8 +11,8 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ApplyOptions, ApplyReport, Change, ChecksumError, Error, MigrateApplyReport, MigrationOutcome, Model, Options, Plan, ShadowSpec,
-    Source, SumFile, filter::PatternError,
+    ApplyOptions, ApplyReport, Change, ChecksumError, Error, Guard, MigrateApplyReport, MigrateEdit, MigrateLs, MigrateRebase, MigrateRm,
+    MigrateShow, MigrationOutcome, Model, Options, Plan, ShadowSpec, Source, SumFile, filter::PatternError,
 };
 
 /// `schema diff`.
@@ -240,6 +240,77 @@ pub struct MigrateApplyRequest {
 /// Every file of the directory with its status, and what this run applied.
 pub type MigrateApplyResponse = MigrateApplyReport;
 
+fn default_revisions_schema() -> String {
+    crate::revisions::DEFAULT_SCHEMA.to_owned()
+}
+
+/// `migrate ls`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MigrateLsRequest {
+    /// The migration directory.
+    pub dir: PathBuf,
+    /// Also read this database's revisions table (never written) for each file's status.
+    #[serde(default)]
+    pub target: Option<String>,
+    #[serde(default = "default_revisions_schema")]
+    pub revisions_schema: String,
+}
+
+/// The files in order, with their status in the target when one was given.
+pub type MigrateLsResponse = MigrateLs;
+
+/// `migrate show`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MigrateShowRequest {
+    pub dir: PathBuf,
+    /// A file name, a version, or the start of exactly one file's version.
+    pub migration: String,
+}
+
+pub type MigrateShowResponse = MigrateShow;
+
+/// `migrate edit`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MigrateEditRequest {
+    pub dir: PathBuf,
+    /// A file name, a version, or the start of exactly one file's version.
+    pub migration: String,
+    /// The editor and its arguments; the file's path is added last. Run without a shell.
+    pub editor: Vec<String>,
+}
+
+pub type MigrateEditResponse = MigrateEdit;
+
+/// `migrate rm`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MigrateRmRequest {
+    pub dir: PathBuf,
+    /// A file name, a version, or the start of exactly one file's version.
+    pub migration: String,
+    /// Refuse a file a target's revisions table records; left out, nothing is checked.
+    #[serde(default)]
+    pub guard: Guard,
+}
+
+pub type MigrateRmResponse = MigrateRm;
+
+/// `migrate rebase`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MigrateRebaseRequest {
+    pub dir: PathBuf,
+    /// The files to move to the end: file names, versions, or unique version prefixes.
+    pub migrations: Vec<String>,
+    #[serde(default)]
+    pub guard: Guard,
+}
+
+pub type MigrateRebaseResponse = MigrateRebase;
+
 /// `config validate`. `Debug` shows the `vars` names only: their values may be secrets.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -357,6 +428,14 @@ pub enum ErrorCode {
     Resume,
     /// A migration failed: a statement, a hook, `BEGIN` or `COMMIT`.
     Migration,
+    /// No migration has the version or file name given.
+    MigrationNotFound,
+    /// A version prefix matches more than one migration.
+    MigrationAmbiguous,
+    /// `migrate rm` or `rebase` of a file the target's revisions table records, without `force`.
+    MigrationApplied,
+    /// The editor of `migrate edit` could not be run or failed.
+    Editor,
 }
 
 impl ErrorCode {
@@ -400,6 +479,10 @@ impl ErrorCode {
             ErrorCode::TxModeConflict => "tx_mode_conflict",
             ErrorCode::Resume => "resume",
             ErrorCode::Migration => "migration",
+            ErrorCode::MigrationNotFound => "migration_not_found",
+            ErrorCode::MigrationAmbiguous => "migration_ambiguous",
+            ErrorCode::MigrationApplied => "migration_applied",
+            ErrorCode::Editor => "editor",
         }
     }
 }
@@ -518,7 +601,12 @@ impl From<&Error> for ApiError {
                 pgmig_migrate::Error::Io { path, .. } => err(ErrorCode::Io).at(path, None),
                 pgmig_migrate::Error::Name { path, .. } => err(ErrorCode::MigrationName).at(path, None),
                 pgmig_migrate::Error::DuplicateVersion { second, .. } => err(ErrorCode::MigrationName).at(second, None),
+                pgmig_migrate::Error::NotFound { .. } => err(ErrorCode::MigrationNotFound),
+                pgmig_migrate::Error::Ambiguous { .. } => err(ErrorCode::MigrationAmbiguous),
+                pgmig_migrate::Error::Exists { path } => err(ErrorCode::MigrationName).at(path, None),
             },
+            Error::MigrationApplied { path, .. } => err(ErrorCode::MigrationApplied).at(path, None),
+            Error::Editor { .. } => err(ErrorCode::Editor),
             Error::Checksum(c) => {
                 let code = match c {
                     ChecksumError::MissingSum { .. } => ErrorCode::SumMissing,
@@ -698,7 +786,9 @@ fn is_diagnostic(e: &Error) -> bool {
         | Error::Resume { .. }
         | Error::MigrationFailed { .. }
         | Error::MigrationStep { .. }
-        | Error::MigrationRecord { .. } => false,
+        | Error::MigrationRecord { .. }
+        | Error::MigrationApplied { .. }
+        | Error::Editor { .. } => false,
     }
 }
 
@@ -756,6 +846,31 @@ pub fn migrate_new(req: &MigrateNewRequest) -> Result<MigrateNewResponse, ApiErr
 /// [`crate::migrate_apply`].
 pub fn migrate_apply(req: &MigrateApplyRequest) -> Result<MigrateApplyResponse, ApiError> {
     Ok(crate::migrate_apply(&req.target, &req.dir, &req.options)?)
+}
+
+/// [`crate::migrate_ls`].
+pub fn migrate_ls(req: &MigrateLsRequest) -> Result<MigrateLsResponse, ApiError> {
+    Ok(crate::migrate_ls(&req.dir, req.target.as_deref(), &req.revisions_schema)?)
+}
+
+/// [`crate::migrate_show`].
+pub fn migrate_show(req: &MigrateShowRequest) -> Result<MigrateShowResponse, ApiError> {
+    Ok(crate::migrate_show(&req.dir, &req.migration)?)
+}
+
+/// [`crate::migrate_edit`].
+pub fn migrate_edit(req: &MigrateEditRequest) -> Result<MigrateEditResponse, ApiError> {
+    Ok(crate::migrate_edit(&req.dir, &req.migration, &req.editor)?)
+}
+
+/// [`crate::migrate_rm`].
+pub fn migrate_rm(req: &MigrateRmRequest) -> Result<MigrateRmResponse, ApiError> {
+    Ok(crate::migrate_rm(&req.dir, &req.migration, &req.guard)?)
+}
+
+/// [`crate::migrate_rebase`].
+pub fn migrate_rebase(req: &MigrateRebaseRequest) -> Result<MigrateRebaseResponse, ApiError> {
+    Ok(crate::migrate_rebase(&req.dir, &req.migrations, &req.guard)?)
 }
 
 /// [`crate::config::validate`]: problems with the file are diagnostics; an `Err` means it could
@@ -962,6 +1077,10 @@ mod tests {
             TxModeConflict,
             Resume,
             Migration,
+            MigrationNotFound,
+            MigrationAmbiguous,
+            MigrationApplied,
+            Editor,
         ] {
             assert_eq!(serde_json::to_string(&code).expect("serialize"), format!("\"{}\"", code.as_str()));
         }
@@ -1040,6 +1159,28 @@ mod tests {
         );
         // Other errors leave the field out.
         assert!(serde_json::to_value(ApiError::from(&Error::NotSql)).expect("serialize").get("migration").is_none());
+    }
+
+    #[test]
+    fn maintenance_requests_default_and_refuse_unknown_fields() {
+        let req: MigrateLsRequest = serde_json::from_str(r#"{"dir":"m"}"#).expect("request");
+        assert_eq!((req.target, req.revisions_schema.as_str()), (None, "pgmig"));
+        let req: MigrateRmRequest = serde_json::from_str(r#"{"dir":"m","migration":"1"}"#).expect("request");
+        assert_eq!(req.guard, Guard::default());
+        let req: MigrateRebaseRequest =
+            serde_json::from_str(r#"{"dir":"m","migrations":["1"],"guard":{"target":"host=a","force":true}}"#).expect("request");
+        assert_eq!((req.guard.target.as_deref(), req.guard.force, req.guard.revisions_schema.as_str()), (Some("host=a"), true, "pgmig"));
+        round_trip(&req);
+        round_trip(&MigrateEditRequest { dir: "m".into(), migration: "1".into(), editor: vec!["code".into(), "-w".into()] });
+        round_trip(&MigrateShowRequest { dir: "m".into(), migration: "1_a.sql".into() });
+        assert!(serde_json::from_str::<MigrateRmRequest>(r#"{"dir":"m","migration":"1","force":true}"#).is_err());
+        assert!(serde_json::from_str::<MigrateRmRequest>(r#"{"dir":"m","migration":"1","guard":{"forced":true}}"#).is_err());
+        assert!(serde_json::from_str::<MigrateLsRequest>(r#"{"dir":"m","url":"x"}"#).is_err());
+        let e = ApiError::from(&Error::Migrate(pgmig_migrate::Error::NotFound { dir: "m".into(), key: "9".into() }));
+        assert_eq!(e.code, ErrorCode::MigrationNotFound);
+        let e =
+            ApiError::from(&Error::MigrationApplied { path: "m/1_a.sql".into(), table: "pgmig.pgmig_revisions".into(), partial: false });
+        assert_eq!((e.code, e.file.as_deref()), (ErrorCode::MigrationApplied, Some(std::path::Path::new("m/1_a.sql"))));
     }
 
     #[test]

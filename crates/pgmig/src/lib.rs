@@ -15,9 +15,14 @@ pub mod api;
 mod files;
 pub mod filter;
 pub mod migrate_apply;
+pub mod migrate_maintain;
 
 pub use filter::{Filter, Pattern, PatternError, filter_model, scope_model, without_schema};
 pub use migrate_apply::{ApplyOptions, ExecOrder, FileReport, FileStatus, MigrateApplyReport, MigrationOutcome, TxMode, migrate_apply};
+pub use migrate_maintain::{
+    Guard, ListedMigration, MigrateEdit, MigrateLs, MigrateRebase, MigrateRm, MigrateShow, MissingRevision, RebasedFile, RevisionStatus,
+    migrate_edit, migrate_ls, migrate_rebase, migrate_rm, migrate_show,
+};
 /// `pgmig.toml`: project configuration.
 pub use pgmig_config as config;
 pub use pgmig_conn::Conn;
@@ -136,6 +141,15 @@ pub enum Error {
         outcome: MigrationOutcome,
         applied_files: usize,
     },
+    /// `migrate rm` or `migrate rebase` of a file the target's revisions table records.
+    #[error(
+        "{path}: {} in {table}; removing or renaming it leaves that history without its file (pass --force to do it anyway)",
+        if *.partial { "started (not finished)" } else { "applied" }
+    )]
+    MigrationApplied { path: PathBuf, table: String, partial: bool },
+    /// `migrate edit`: the editor could not be run or failed.
+    #[error("editor `{command}`: {reason}")]
+    Editor { command: String, reason: String },
 }
 
 fn apply_message(index: &Option<usize>, statement: &str, source: &pgmig_conn::Error, committed: &usize) -> String {

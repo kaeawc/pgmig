@@ -41,8 +41,14 @@
 //!
 //! [`revisions`]: the table in the target database recording what has been applied;
 //! [`history`]: what it leaves to apply.
+//!
+//! # Maintenance
+//!
+//! [`maintain`]: removing, rehashing after an edit, and moving files to the end ([`maintain::rebase`])
+//! with the sum file rewritten to match.
 
 pub mod history;
+pub mod maintain;
 pub mod revisions;
 
 use std::cmp::Ordering;
@@ -66,6 +72,12 @@ pub enum Error {
     Name { path: PathBuf, reason: NameError },
     #[error("{second} has the same version as {first}")]
     DuplicateVersion { first: PathBuf, second: PathBuf },
+    #[error("{dir}: no migration has the version or file name {key:?}")]
+    NotFound { dir: PathBuf, key: String },
+    #[error("{dir}: {key:?} could be any of {}; give the whole version or the file name", .candidates.join(", "))]
+    Ambiguous { dir: PathBuf, key: String, candidates: Vec<String> },
+    #[error("{path} already exists")]
+    Exists { path: PathBuf },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -175,6 +187,39 @@ impl Dir {
         &self.files
     }
 
+    /// The file `key` names: its file name (a path is reduced to its last component), its version
+    /// (as a number: `007` is `7`), or failing both the start of exactly one file's version.
+    pub fn find(&self, key: &str) -> Result<&File> {
+        let name = Path::new(key).file_name().and_then(|n| n.to_str()).unwrap_or(key);
+        if let Some(f) = self.files.iter().find(|f| f.name == name) {
+            return Ok(f);
+        }
+        let digits = !key.is_empty() && key.bytes().all(|b| b.is_ascii_digit());
+        if digits {
+            if let Some(f) = self.files.iter().find(|f| compare_versions(&f.version, key).is_eq()) {
+                return Ok(f);
+            }
+            let starts: Vec<&File> = self.files.iter().filter(|f| f.version.starts_with(key)).collect();
+            match starts.as_slice() {
+                [f] => return Ok(f),
+                [] => {}
+                many => {
+                    return Err(Error::Ambiguous {
+                        dir: self.path.clone(),
+                        key: key.to_owned(),
+                        candidates: many.iter().map(|f| f.name.clone()).collect(),
+                    });
+                }
+            }
+        }
+        Err(Error::NotFound { dir: self.path.clone(), key: key.to_owned() })
+    }
+
+    /// This directory without the files named `names`, without touching the file system.
+    pub fn without(&self, names: &[&str]) -> Dir {
+        Dir { path: self.path.clone(), files: self.files.iter().filter(|f| !names.contains(&f.name.as_str())).cloned().collect() }
+    }
+
     /// Where this directory's sum file is.
     pub fn sum_path(&self) -> PathBuf {
         self.path.join(SUM_FILE)
@@ -218,9 +263,22 @@ impl Dir {
         if std::fs::read(&path).is_ok_and(|old| old == text.as_bytes()) {
             return Ok((sum, false));
         }
-        std::fs::write(&path, text).map_err(|source| Error::Io { path, source })?;
+        write_atomic(&path, text.as_bytes())?;
         Ok((sum, true))
     }
+}
+
+/// Write `bytes` to `path` through a temporary file in the same directory renamed over it, so a
+/// reader sees the old contents or the new, never part of them. The temporary name starts with `.`
+/// and does not end in `.sql`, so [`Dir::open`] never reads it.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let tmp = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
+    let res = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res.map_err(|source| Error::Io { path: path.to_owned(), source })
 }
 
 /// The hash of a file following the file whose hash is `prev`.
