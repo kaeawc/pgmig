@@ -30,8 +30,15 @@ pub enum Object {
     /// A type by its `pg_type` name. Creating a table creates its row type of the same name.
     Type(QualName),
     Column(QualName, String),
+    /// The type of a column, apart from the column itself: a type change and the foreign keys
+    /// over the column (on either side) alter it, so those keys go before the change and come
+    /// back after, without being ordered against the column's other constraints.
+    ColumnType(QualName, String),
     /// A sequence, standalone or (by its implicit name) an identity column's.
     Sequence(QualName),
+    /// A table constraint by its table and name. A foreign key requires the constraint whose
+    /// index it uses; a table's drop drops its constraints.
+    Constraint(QualName, String),
 }
 
 /// What one step does to which objects.

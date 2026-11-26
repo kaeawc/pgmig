@@ -1,0 +1,10 @@
+ALTER TABLE public.child DROP CONSTRAINT child_pid_fkey;
+ALTER TABLE public.child DROP CONSTRAINT child_pid_fkey2;
+ALTER TABLE public.leaf DROP CONSTRAINT leaf_oid_fkey;
+ALTER TABLE public.child ALTER COLUMN id TYPE text;
+ALTER TABLE public.child ALTER COLUMN pid TYPE text;
+ALTER TABLE public.leaf ALTER COLUMN oid TYPE bigint;
+ALTER TABLE public.parent ALTER COLUMN id TYPE text;
+ALTER TABLE public.child ADD CONSTRAINT child_pid_fkey FOREIGN KEY (pid) REFERENCES parent(id);
+ALTER TABLE public.child ADD CONSTRAINT child_pid_fkey2 FOREIGN KEY (id) REFERENCES parent(id);
+ALTER TABLE public.leaf ADD CONSTRAINT leaf_oid_fkey FOREIGN KEY (oid) REFERENCES other(id);

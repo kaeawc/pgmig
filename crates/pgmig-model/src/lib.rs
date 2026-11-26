@@ -61,11 +61,84 @@ pub struct Table {
     pub columns: Vec<Column>,
     /// `obj_description` of the table.
     pub comment: Option<String>,
+    /// Primary key, unique, check, foreign key and exclusion constraints defined on the table
+    /// itself (not inherited), by name. `NOT NULL` is [`Column::not_null`], not a constraint here.
+    pub constraints: Vec<Constraint>,
 }
 
 impl Table {
     pub fn column(&self, name: &str) -> Option<&Column> {
         self.columns.iter().find(|c| c.name == name)
+    }
+
+    pub fn constraint(&self, name: &str) -> Option<&Constraint> {
+        self.constraints.iter().find(|c| c.name == name)
+    }
+}
+
+/// `pg_constraint.contype`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConstraintKind {
+    PrimaryKey,
+    Unique,
+    Check,
+    ForeignKey,
+    Exclusion,
+}
+
+/// A table constraint. Its body is [`Constraint::definition`], as the server prints it; the other
+/// fields are read from the catalog alongside it so the planner can order steps, and say nothing
+/// the definition doesn't.
+///
+/// A constraint always lives in its table's schema.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Constraint {
+    pub name: String,
+    pub kind: ConstraintKind,
+    /// `pg_get_constraintdef`, including `DEFERRABLE`, `INITIALLY DEFERRED` and `NOT VALID`.
+    pub definition: String,
+    /// `condeferrable`.
+    pub deferrable: bool,
+    /// `condeferred` (`INITIALLY DEFERRED`).
+    pub deferred: bool,
+    /// `convalidated`: false for `NOT VALID` (and `NOT ENFORCED`) constraints.
+    pub validated: bool,
+    /// The constrained columns (`conkey`); for a check, the columns its expression uses.
+    pub columns: Vec<String>,
+    /// What a foreign key references.
+    pub references: Option<References>,
+    /// `obj_description` of the constraint.
+    pub comment: Option<String>,
+}
+
+/// The referenced side of a foreign key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct References {
+    pub table: QualName,
+    /// `confkey`.
+    pub columns: Vec<String>,
+    /// The primary key, unique or exclusion constraint whose index the foreign key uses: the
+    /// index's name (`conindid`), which is the constraint's when a constraint owns it. `None` when
+    /// the catalog doesn't say.
+    pub constraint: Option<String>,
+}
+
+impl Constraint {
+    /// [`Constraint::definition`] without `DEFERRABLE` and `INITIALLY DEFERRED`, which the server
+    /// prints after the body and before `NOT ENFORCED` / `NOT VALID`. Two constraints whose
+    /// definitions differ only there differ only in deferrability.
+    pub fn definition_without_deferrability(&self) -> String {
+        let (mut body, tail) = [" NOT ENFORCED", " NOT VALID"]
+            .iter()
+            .find_map(|t| self.definition.strip_suffix(t).map(|b| (b, *t)))
+            .unwrap_or((self.definition.as_str(), ""));
+        if self.deferred {
+            body = body.strip_suffix(" INITIALLY DEFERRED").unwrap_or(body);
+        }
+        if self.deferrable {
+            body = body.strip_suffix(" DEFERRABLE").unwrap_or(body);
+        }
+        format!("{body}{tail}")
     }
 }
 
@@ -410,6 +483,31 @@ mod tests {
         assert_eq!(down, SequenceOptions { start: -1, increment: -2, min: -32768, max: -1, cache: 1, cycle: false });
         assert_eq!(SequenceOptions::defaults("bigint", 1).map(|o| o.max), Some(i64::MAX));
         assert_eq!(SequenceOptions::defaults("numeric", 1), None);
+    }
+
+    #[test]
+    fn deferrability_is_stripped_from_the_printed_definition() {
+        let fk = |definition: &str, deferrable, deferred| Constraint {
+            name: "fk".into(),
+            kind: ConstraintKind::ForeignKey,
+            definition: definition.into(),
+            deferrable,
+            deferred,
+            validated: true,
+            columns: vec![],
+            references: None,
+            comment: None,
+        };
+        let base = "FOREIGN KEY (a) REFERENCES p(id) ON DELETE CASCADE";
+        assert_eq!(fk(base, false, false).definition_without_deferrability(), base);
+        assert_eq!(fk(&format!("{base} DEFERRABLE"), true, false).definition_without_deferrability(), base);
+        assert_eq!(fk(&format!("{base} DEFERRABLE INITIALLY DEFERRED"), true, true).definition_without_deferrability(), base);
+        assert_eq!(
+            fk(&format!("{base} DEFERRABLE INITIALLY DEFERRED NOT VALID"), true, true).definition_without_deferrability(),
+            format!("{base} NOT VALID")
+        );
+        // Only what the flags say the server printed is removed.
+        assert_eq!(fk(&format!("{base} DEFERRABLE"), false, false).definition_without_deferrability(), format!("{base} DEFERRABLE"));
     }
 
     #[test]

@@ -21,6 +21,11 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
   runs in a transaction; a failure rolls it back and names the statement and how many earlier
   batches stayed applied. `--dry-run` prints the plan; without a terminal it needs
   `--auto-approve`.
+- Table constraints: primary key, unique (`NULLS NOT DISTINCT`, `INCLUDE`), check (`NO INHERIT`),
+  foreign key (match type, actions, deferrability) and exclusion, plus their comments. Changes are
+  drop and add, except renames and foreign-key deferrability. Foreign keys are added after the
+  tables they join, so tables can reference each other, and are dropped and re-added around type
+  changes of their columns.
 - Sequences, identity columns and serial columns: sequence options and `OWNED BY` (the current
   value is never compared), identity `ALWAYS`/`BY DEFAULT` and options, and serial columns as a
   default plus an owned sequence, so switching between serial and identity plans cleanly.
@@ -38,7 +43,7 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
   created after that table and dropped before it.
 - Breaking library changes: `pgmig_plan::plan` returns `Result<Plan, Error>` (an error names a
   dependency cycle); `Change::DropTable` carries the dropped `Table`; `DropColumn` and
-  `AlterColumnType` carry the referenced types; `Column` has a new `type_ref` field; `DropTable` and `DropColumn` carry the sequences they drop; `Plan` has a new `commit_after` field and `plan` can fail
+  `AlterColumnType` carry the referenced types; `Column` has a new `type_ref` field; `DropTable` and `DropColumn` carry the sequences they drop; `Table` has a new `constraints` field; `Plan` has a new `commit_after` field and `plan` can fail
   with `Error::Unsupported`.
 
 ## [0.1.0] - 2026-11-26

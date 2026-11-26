@@ -6,7 +6,10 @@
 use pgmig_conn::{Conn, Row};
 use std::collections::BTreeMap;
 
-use pgmig_model::{Column, Enum, Generated, Identity, Model, OwnedBy, QualName, Schema, Sequence, SequenceOptions, Table, quote_literal};
+use pgmig_model::{
+    Column, Constraint, ConstraintKind, Enum, Generated, Identity, Model, OwnedBy, QualName, References, Schema, Sequence, SequenceOptions,
+    Table, quote_literal,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -37,7 +40,9 @@ pub fn inspect(conn: &mut Conn) -> Result<Model> {
     );
     for row in run(conn, "tables", &tables)? {
         let name = QualName::new(text(&row, 0, "tables")?, text(&row, 1, "tables")?);
-        model.tables.insert(name.clone(), Table { name, columns: Vec::new(), comment: row.get(2).cloned().flatten() });
+        model
+            .tables
+            .insert(name.clone(), Table { name, columns: Vec::new(), comment: row.get(2).cloned().flatten(), constraints: Vec::new() });
     }
 
     let enums = format!(
@@ -106,7 +111,7 @@ pub fn inspect(conn: &mut Conn) -> Result<Model> {
     let columns = format!(
         "SELECT n.nspname, c.relname, a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull, \
                 pg_get_expr(d.adbin, d.adrelid), tn.nspname, COALESCE(e.typname, t.typname), \
-                col_description(a.attrelid, a.attnum), a.attidentity \
+                col_description(a.attrelid, a.attnum), a.attidentity, a.attnum \
          FROM pg_attribute a \
          JOIN pg_class c ON c.oid = a.attrelid \
          JOIN pg_namespace n ON n.oid = c.relnamespace \
@@ -118,9 +123,11 @@ pub fn inspect(conn: &mut Conn) -> Result<Model> {
          ORDER BY 1, 2, a.attnum"
     );
     let mut resolved: BTreeMap<String, Option<QualName>> = BTreeMap::new();
+    let mut attnames: BTreeMap<(QualName, String), String> = BTreeMap::new();
     for row in run(conn, "columns", &columns)? {
         let table = QualName::new(text(&row, 0, "columns")?, text(&row, 1, "columns")?);
         let name = text(&row, 2, "columns")?;
+        attnames.insert((table.clone(), text(&row, 10, "columns")?), name.clone());
         let default = row.get(5).cloned().flatten();
         let mut default_sequences = Vec::new();
         for literal in default.as_deref().map(nextval_arguments).unwrap_or_default() {
@@ -158,7 +165,68 @@ pub fn inspect(conn: &mut Conn) -> Result<Model> {
         }
     }
 
+    // A constraint's schema is its table's: pgmem reports `connamespace` as `public` for every
+    // constraint (kaeawc/pgmem#147), and Postgres always puts a table's constraints in its schema.
+    // `NOT NULL` constraints (`n`, Postgres 18) are `attnotnull`; inherited ones are the parent's.
+    let constraints = format!(
+        "SELECT n.nspname, cl.relname, co.conname, co.contype, pg_get_constraintdef(co.oid), co.condeferrable, co.condeferred, \
+                co.convalidated, co.conkey, fn.nspname, fc.relname, co.confkey, ci.relname, obj_description(co.oid, 'pg_constraint') \
+         FROM pg_constraint co \
+         JOIN pg_class cl ON cl.oid = co.conrelid \
+         JOIN pg_namespace n ON n.oid = cl.relnamespace \
+         LEFT JOIN pg_class fc ON fc.oid = co.confrelid \
+         LEFT JOIN pg_namespace fn ON fn.oid = fc.relnamespace \
+         LEFT JOIN pg_class ci ON ci.oid = co.conindid \
+         WHERE co.contype IN ('p', 'u', 'c', 'f', 'x') AND co.conislocal AND cl.relkind IN ('r', 'p') AND {USER_SCHEMA} \
+         ORDER BY 1, 2, 3"
+    );
+    for row in run(conn, "constraints", &constraints)? {
+        let what = "constraints";
+        let table = QualName::new(text(&row, 0, what)?, text(&row, 1, what)?);
+        let kind = match text(&row, 3, what)?.as_str() {
+            "p" => ConstraintKind::PrimaryKey,
+            "u" => ConstraintKind::Unique,
+            "c" => ConstraintKind::Check,
+            "f" => ConstraintKind::ForeignKey,
+            _ => ConstraintKind::Exclusion,
+        };
+        let names = |table: &QualName, column: usize| -> Vec<String> {
+            let numbers = row.get(column).cloned().flatten().unwrap_or_default();
+            int_array(&numbers).filter_map(|n| attnames.get(&(table.clone(), n)).cloned()).collect()
+        };
+        let references = match (kind, row.get(9).cloned().flatten(), row.get(10).cloned().flatten()) {
+            (ConstraintKind::ForeignKey, Some(schema), Some(name)) => {
+                let referenced = QualName::new(schema, name);
+                Some(References { columns: names(&referenced, 11), table: referenced, constraint: row.get(12).cloned().flatten() })
+            }
+            _ => None,
+        };
+        let constraint = Constraint {
+            name: text(&row, 2, what)?,
+            kind,
+            definition: text(&row, 4, what)?,
+            deferrable: text(&row, 5, what)? == "t",
+            deferred: text(&row, 6, what)? == "t",
+            validated: text(&row, 7, what)? == "t",
+            columns: names(&table, 8),
+            references,
+            comment: row.get(13).cloned().flatten(),
+        };
+        if let Some(t) = model.tables.get_mut(&table) {
+            t.constraints.push(constraint);
+        }
+    }
+    // By name in byte order, whatever the server's collation.
+    for t in model.tables.values_mut() {
+        t.constraints.sort_by(|x, y| x.name.cmp(&y.name));
+    }
+
     Ok(model)
+}
+
+/// The elements of an `int2[]` as the server prints it (`{1,2}`), as text.
+fn int_array(printed: &str) -> impl Iterator<Item = String> + '_ {
+    printed.trim_start_matches('{').trim_end_matches('}').split(',').map(str::trim).filter(|n| !n.is_empty()).map(str::to_owned)
 }
 
 /// The column's type when it lives in a user schema: columns 6 (schema) and 7 (name).
@@ -231,7 +299,15 @@ fn text(row: &Row, column: usize, what: &'static str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::nextval_arguments;
+    use super::{int_array, nextval_arguments};
+
+    #[test]
+    fn int_arrays_are_read_as_printed() {
+        assert_eq!(int_array("{1,2}").collect::<Vec<_>>(), ["1", "2"]);
+        assert_eq!(int_array("{3}").collect::<Vec<_>>(), ["3"]);
+        assert!(int_array("{}").next().is_none());
+        assert!(int_array("").next().is_none());
+    }
 
     #[test]
     fn nextval_arguments_are_read_from_printed_defaults() {
