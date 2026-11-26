@@ -1,7 +1,8 @@
 //! The diff corpus: `corpus/<area>/<case>/{from.sql,to.sql,plan.sql}`.
 //!
 //! For each case: load `from` into a target and `to` into a shadow, diff, compare the plan with
-//! `plan.sql` (`PGMIG_BLESS=1` rewrites it), apply the plan to the target, and check that nothing
+//! `plan.sql` (`PGMIG_BLESS=1` rewrites it), apply the plan to the target (one transaction per
+//! [`pgmig::Plan::batches`] entry), and check that nothing
 //! is left to change. On pgmem, the failing cases must be exactly those in
 //! `corpus/pgmem_known_failures.txt`; on Postgres, every case must pass.
 
@@ -56,7 +57,8 @@ fn run_case(dir: &Path) -> Result<(), String> {
     sh.load(&read_opt(&dir.join("to.sql"))).map_err(|e| format!("loading to.sql into the shadow: {e}"))?;
     let b = inspect(sh.conn()).map_err(|e| format!("inspecting the shadow: {e}"))?;
 
-    let sql = plan(&diff(&a, &b)).map_err(|e| format!("planning: {e}"))?.to_sql();
+    let planned = plan(&diff(&a, &b)).map_err(|e| format!("planning: {e}"))?;
+    let sql = planned.to_sql();
     let plan_file = dir.join("plan.sql");
     if std::env::var_os("PGMIG_BLESS").is_some() {
         fs::write(&plan_file, &sql).map_err(|e| format!("writing plan.sql: {e}"))?;
@@ -67,7 +69,10 @@ fn run_case(dir: &Path) -> Result<(), String> {
         }
     }
 
-    conn.batch(&sql).map_err(|e| format!("applying the plan: {e}\n{sql}"))?;
+    // One transaction per batch: a new enum value is only usable once committed.
+    for batch in planned.batches() {
+        conn.batch(&batch).map_err(|e| format!("applying the plan: {e}\n{sql}"))?;
+    }
     let applied = inspect(&mut conn).map_err(|e| format!("inspecting after apply: {e}"))?;
     let left = diff(&applied, &b);
     if !left.is_empty() {

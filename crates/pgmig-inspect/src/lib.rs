@@ -4,7 +4,7 @@
 //! `information_schema` hides objects the current user doesn't own.
 
 use pgmig_conn::{Conn, Row};
-use pgmig_model::{Column, Model, QualName, Schema, Table};
+use pgmig_model::{Column, Enum, Model, QualName, Schema, Table};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -34,6 +34,22 @@ pub fn inspect(conn: &mut Conn) -> Result<Model> {
     for row in run(conn, "tables", &tables)? {
         let name = QualName::new(text(&row, 0, "tables")?, text(&row, 1, "tables")?);
         model.tables.insert(name.clone(), Table { name, columns: Vec::new(), comment: row.get(2).cloned().flatten() });
+    }
+
+    let enums = format!(
+        "SELECT n.nspname, t.typname, obj_description(t.oid, 'pg_type'), e.enumlabel \
+         FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace \
+         LEFT JOIN pg_enum e ON e.enumtypid = t.oid \
+         WHERE t.typtype = 'e' AND {USER_SCHEMA} ORDER BY 1, 2, e.enumsortorder"
+    );
+    for row in run(conn, "enums", &enums)? {
+        let name = QualName::new(text(&row, 0, "enums")?, text(&row, 1, "enums")?);
+        let e =
+            model.enums.entry(name.clone()).or_insert_with(|| Enum { name, labels: Vec::new(), comment: row.get(2).cloned().flatten() });
+        // NULL for an enum with no values.
+        if let Some(label) = row.get(3).cloned().flatten() {
+            e.labels.push(label);
+        }
     }
 
     let columns = format!(
