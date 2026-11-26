@@ -8,6 +8,10 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
 
 ### Added
 
+- `pgmig migrate ls`, `show`, `edit`, `rm` and `rebase`: list files (with applied status given
+  `--url`), print, edit in `$VISUAL`/`$EDITOR`, remove, or move out-of-order files to the end with new
+  versions after a merge, each keeping `pgmig.sum` valid. `rm` and `rebase` refuse applied files
+  unless `--force`.
 - `pgmig migrate apply --url <target> --dir <dir>`: applies pending migrations under an advisory
   lock (`--lock-name`, `--lock-timeout`, `--no-lock`), in `--tx-mode file` (default), `all` or
   `none` (or `-- pgmig:txmode none` per file), with `--exec-order linear`, `linear-skip` or

@@ -1,6 +1,6 @@
 //! `migrate hash` and `migrate validate`: text and JSON output, exit codes.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -268,4 +268,103 @@ fn apply_reports_the_failing_statement_and_reads_the_config_file() {
     assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
     let out = pgmig(&["migrate", "apply", "--config", &cfg, "--lock-timeout", "soon"]);
     assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+}
+
+const M1: &str = "20261101000000_create_a.sql";
+const M2: &str = "20261102000000_create_b.sql";
+const M3: &str = "20261103000000_create_c.sql";
+
+fn hashed_three() -> Dir {
+    let d = Dir::new(&[(M1, "CREATE TABLE a (id int);\n"), (M2, "CREATE TABLE b (id int);\n"), (M3, "CREATE TABLE c (id int);\n")]);
+    assert_eq!(pgmig(&["migrate", "hash", "--dir", &d.arg()]).status.code(), Some(0));
+    d
+}
+
+fn validates(d: &Dir) {
+    let out = pgmig(&["migrate", "validate", "--dir", &d.arg()]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+}
+
+#[test]
+fn ls_lists_versions_and_with_url_their_status() {
+    let d = hashed_three();
+    let out = pgmig(&["migrate", "ls", "--dir", &d.arg()]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "20261101000000  create_a\n20261102000000  create_b\n20261103000000  create_c\n");
+
+    let db = TestDb::new();
+    let out = pgmig(&["migrate", "apply", "1", "--url", &db.conninfo, "--dir", &d.arg()]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let out = pgmig(&["migrate", "ls", "--dir", &d.arg(), "--url", &db.conninfo]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "applied  20261101000000  create_a\npending  20261102000000  create_b\npending  20261103000000  create_c\n");
+    let v = parse(&pgmig(&["migrate", "ls", "--dir", &d.arg(), "--url", &db.conninfo, "--format", "json"]));
+    assert_eq!(v["files"][0]["status"], "applied");
+    assert_eq!(v["files"][1]["file"], M2);
+    assert_eq!(v["missing"], serde_json::json!([]));
+}
+
+#[test]
+fn show_prints_the_file() {
+    let d = hashed_three();
+    let out = pgmig(&["migrate", "show", "20261102000000", "--dir", &d.arg()]);
+    assert_eq!((out.status.code(), stdout(&out).as_str()), (Some(0), "CREATE TABLE b (id int);\n"));
+    let v = parse(&pgmig(&["migrate", "show", M3, "--dir", &d.arg(), "--format", "json"]));
+    assert_eq!((v["version"].as_str(), v["sql"].as_str()), (Some("20261103000000"), Some("CREATE TABLE c (id int);\n")));
+    let out = pgmig(&["migrate", "show", "2026110", "--dir", &d.arg(), "--format", "json"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(parse(&out)["code"], "migration_ambiguous");
+    let out = pgmig(&["migrate", "show", "42", "--dir", &d.arg()]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("no migration has the version or file name \"42\""), "{}", stderr(&out));
+}
+
+#[test]
+fn edit_refuses_without_a_terminal() {
+    let d = hashed_three();
+    let out = pgmig(&["migrate", "edit", M1, "--dir", &d.arg()]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(stderr(&out).contains("stdin is not a terminal"), "{}", stderr(&out));
+    validates(&d);
+}
+
+#[test]
+fn rm_removes_and_refuses_applied_files() {
+    let d = hashed_three();
+    let db = TestDb::new();
+    assert_eq!(pgmig(&["migrate", "apply", "1", "--url", &db.conninfo, "--dir", &d.arg()]).status.code(), Some(0));
+    let out = pgmig(&["migrate", "rm", M1, "--dir", &d.arg(), "--url", &db.conninfo, "--format", "json"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(parse(&out)["code"], "migration_applied");
+    assert!(d.0.join(M1).is_file());
+
+    let out = pgmig(&["migrate", "rm", "20261103000000", "--dir", &d.arg(), "--url", &db.conninfo]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(stderr(&out).contains("removed"), "{}", stderr(&out));
+    assert!(!d.0.join(M3).exists());
+    validates(&d);
+
+    let out = pgmig(&["migrate", "rm", M1, "--dir", &d.arg(), "--url", &db.conninfo, "--force", "--format", "json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(parse(&out)["recorded"], true);
+    validates(&d);
+}
+
+#[test]
+fn rebase_moves_a_branch_file_after_the_others() {
+    let d = Dir::new(&[(M1, "CREATE TABLE a (id int);\n"), (M3, "CREATE TABLE theirs (id int);\n")]);
+    assert_eq!(pgmig(&["migrate", "hash", "--dir", &d.arg()]).status.code(), Some(0));
+    std::fs::write(d.0.join(M2), "CREATE TABLE ours (id int);\n").expect("ours");
+    assert_eq!(pgmig(&["migrate", "validate", "--dir", &d.arg()]).status.code(), Some(1));
+    let out = pgmig(&["migrate", "rebase", "20261102000000", "--dir", &d.arg(), "--format", "json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stdout));
+    let v = parse(&out);
+    let to = v["moved"][0]["to"].as_str().expect("to").to_owned();
+    assert!(to.ends_with("_create_b.sql") && Path::new(&to).is_file(), "{v}");
+    assert!(!d.0.join(M2).exists(), "the old name is gone");
+    let files = sql_files(&d.0);
+    assert_eq!(files.last().map(String::as_str), Path::new(&to).file_name().and_then(|n| n.to_str()));
+    validates(&d);
+    let out = pgmig(&["migrate", "rebase", &to, "--dir", &d.arg()]);
+    assert!(stderr(&out).contains("nothing to move"), "{}", stderr(&out));
 }

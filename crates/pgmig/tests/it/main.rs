@@ -10,6 +10,7 @@ mod load;
 mod migrate;
 mod migrate_apply;
 mod migrate_diff;
+mod migrate_maintain;
 mod quoting;
 mod revisions;
 mod search_path;

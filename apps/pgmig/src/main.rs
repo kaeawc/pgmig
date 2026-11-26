@@ -154,6 +154,65 @@ enum MigrateCommand {
         #[command(flatten)]
         format: FormatArg,
     },
+    /// List the migrations in version order: version and description, and with --url their status
+    /// in that database (applied, pending, partial, changed), read from its revisions table without
+    /// writing. Applied versions without a file are listed as missing.
+    Ls {
+        #[command(flatten)]
+        dir: DirArg,
+        /// Read this database's revisions table for each file's status (only the flag: `migrate ls`
+        /// connects only when asked).
+        #[arg(long)]
+        url: Option<String>,
+        #[command(flatten)]
+        format: FormatArg,
+    },
+    /// Print a migration file.
+    Show {
+        /// The file name, the version, or the start of exactly one file's version.
+        migration: String,
+        #[command(flatten)]
+        dir: DirArg,
+        #[command(flatten)]
+        format: FormatArg,
+    },
+    /// Open a migration in $VISUAL, else $EDITOR, else vi (split on whitespace: `code -w` works;
+    /// no shell), then update pgmig.sum. Needs a terminal; the directory must match pgmig.sum.
+    Edit {
+        /// The file name, the version, or the start of exactly one file's version.
+        migration: String,
+        #[command(flatten)]
+        dir: DirArg,
+        #[command(flatten)]
+        format: FormatArg,
+    },
+    /// Delete a migration and update pgmig.sum. With a database (--url, or `url` in the config
+    /// file), refuses a file its revisions table records unless --force.
+    Rm {
+        /// The file name, the version, or the start of exactly one file's version.
+        migration: String,
+        #[command(flatten)]
+        dir: DirArg,
+        #[command(flatten)]
+        guard: GuardArgs,
+        #[command(flatten)]
+        format: FormatArg,
+    },
+    /// Move migrations after every other file with new versions (descriptions kept), then update
+    /// pgmig.sum. After a merge in which both branches added files: keep the other branch's
+    /// pgmig.sum, then rebase your own files. With a database (--url, or `url` in the config file),
+    /// refuses a file its revisions table records unless --force.
+    Rebase {
+        /// The files to move: file names, versions, or unique version prefixes.
+        #[arg(required = true)]
+        migrations: Vec<String>,
+        #[command(flatten)]
+        dir: DirArg,
+        #[command(flatten)]
+        guard: GuardArgs,
+        #[command(flatten)]
+        format: FormatArg,
+    },
     /// Check the files against the sum file, and with --shadow replay them in order; prints
     /// nothing on success.
     Validate {
@@ -166,6 +225,33 @@ enum MigrateCommand {
         #[command(flatten)]
         format: FormatArg,
     },
+}
+
+#[derive(clap::Args)]
+struct GuardArgs {
+    /// Check this database's revisions table (read only) for the files first (config: `url`).
+    #[arg(long)]
+    url: Option<String>,
+    /// Go ahead even when the database records the file.
+    #[arg(long)]
+    force: bool,
+}
+
+impl GuardArgs {
+    fn guard(self, s: &Settings) -> pgmig::Guard {
+        pgmig::Guard {
+            target: self.url.or_else(|| s.url.clone()),
+            force: self.force,
+            revisions_schema: s.migrations_revisions_schema.clone().unwrap_or_else(|| pgmig::revisions::DEFAULT_SCHEMA.to_owned()),
+        }
+    }
+}
+
+/// The editor of `migrate edit`: $VISUAL, else $EDITOR, else `vi`, split on whitespace.
+fn editor() -> Vec<String> {
+    let var = |k| std::env::var(k).ok().filter(|v: &String| !v.trim().is_empty());
+    let cmd = var("VISUAL").or_else(|| var("EDITOR")).unwrap_or_else(|| "vi".to_owned());
+    cmd.split_whitespace().map(str::to_owned).collect()
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -397,6 +483,11 @@ impl Cli {
                 | MigrateCommand::Diff { format, .. }
                 | MigrateCommand::New { format, .. }
                 | MigrateCommand::Apply { format, .. }
+                | MigrateCommand::Ls { format, .. }
+                | MigrateCommand::Show { format, .. }
+                | MigrateCommand::Edit { format, .. }
+                | MigrateCommand::Rm { format, .. }
+                | MigrateCommand::Rebase { format, .. }
                 | MigrateCommand::Validate { format, .. },
             )
             | Command::Config(ConfigCommand::Validate { format }) => format.format,
@@ -594,6 +685,82 @@ fn migrate(command: MigrateCommand, s: &Settings, format: Format) -> anyhow::Res
             let res = api::migrate_new(&api::MigrateNewRequest { dir: dir(d)?, name })?;
             match format {
                 Format::Text => eprintln!("wrote {}", res.file.display()),
+                Format::Json => print_json(&res)?,
+            }
+        }
+        MigrateCommand::Ls { dir: d, url, format: _ } => {
+            let req = api::MigrateLsRequest {
+                dir: dir(d)?,
+                target: url,
+                revisions_schema: s.migrations_revisions_schema.clone().unwrap_or_else(|| pgmig::revisions::DEFAULT_SCHEMA.to_owned()),
+            };
+            let res = api::migrate_ls(&req)?;
+            match format {
+                Format::Text => {
+                    for f in &res.files {
+                        match f.status {
+                            Some(st) => println!("{:<8} {}  {}", st.as_str(), f.version, f.description),
+                            None => println!("{}  {}", f.version, f.description),
+                        }
+                    }
+                    for m in &res.missing {
+                        println!("{:<8} {}  {}", "missing", m.version, m.description);
+                    }
+                    if !res.missing.is_empty() {
+                        let n = res.missing.len();
+                        eprintln!("warning: {n} applied version{} without a file", if n == 1 { "" } else { "s" });
+                    }
+                }
+                Format::Json => print_json(&res)?,
+            }
+        }
+        MigrateCommand::Show { migration, dir: d, format: _ } => {
+            let res = api::migrate_show(&api::MigrateShowRequest { dir: dir(d)?, migration })?;
+            match format {
+                Format::Text => {
+                    let mut out = std::io::stdout().lock();
+                    out.write_all(res.sql.as_bytes())?;
+                    out.flush()?;
+                }
+                Format::Json => print_json(&res)?,
+            }
+        }
+        MigrateCommand::Edit { migration, dir: d, format: _ } => {
+            let dir = dir(d)?;
+            if !std::io::stdin().is_terminal() {
+                return Err(ApiError::usage(
+                    "stdin is not a terminal, so pgmig cannot run an editor; edit the file, then run `pgmig migrate hash`",
+                )
+                .into());
+            }
+            let res = api::migrate_edit(&api::MigrateEditRequest { dir, migration, editor: editor() })?;
+            match format {
+                Format::Text if res.changed => eprintln!("updated {} for {}", res.sum_file.display(), res.file.display()),
+                Format::Text => eprintln!("{} unchanged", res.file.display()),
+                Format::Json => print_json(&res)?,
+            }
+        }
+        MigrateCommand::Rm { migration, dir: d, guard, format: _ } => {
+            let res = api::migrate_rm(&api::MigrateRmRequest { dir: dir(d)?, migration, guard: guard.guard(s) })?;
+            match format {
+                Format::Text => {
+                    eprintln!("removed {}", res.file.display());
+                    if res.recorded {
+                        eprintln!("warning: the database records version {}; `migrate apply` refuses until that row is fixed", res.version);
+                    }
+                }
+                Format::Json => print_json(&res)?,
+            }
+        }
+        MigrateCommand::Rebase { migrations, dir: d, guard, format: _ } => {
+            let res = api::migrate_rebase(&api::MigrateRebaseRequest { dir: dir(d)?, migrations, guard: guard.guard(s) })?;
+            match format {
+                Format::Text if res.moved.is_empty() => eprintln!("nothing to move: already after every other file"),
+                Format::Text => {
+                    for m in &res.moved {
+                        eprintln!("moved {} -> {}", m.from.display(), m.to.display());
+                    }
+                }
                 Format::Json => print_json(&res)?,
             }
         }
