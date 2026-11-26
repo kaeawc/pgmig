@@ -16,6 +16,16 @@
 //! the point as a comment. pgmig does not check which later statements use a new value; any
 //! statement after an `ADD VALUE` waits for the commit.
 //!
+//! # Sequences
+//!
+//! `CREATE SEQUENCE` and identity columns print only the options that differ from what Postgres
+//! would pick for the type and direction ([`SequenceOptions::defaults`]); `ALTER SEQUENCE` and
+//! `ALTER COLUMN ... SET` print the options that changed (and both bounds when the type changes,
+//! since Postgres resets bounds that were the old type's limits). `OWNED BY` is set after the
+//! owning table exists, so a `serial` column plans as `CREATE SEQUENCE`, `CREATE TABLE` with its
+//! `nextval` default, then `ALTER SEQUENCE ... OWNED BY`. Plans never `RESTART` a sequence: a
+//! sequence whose current value falls outside new bounds fails to apply.
+//!
 //! Changes Postgres cannot make in place (removing or reordering enum values) fail the plan with
 //! [`Error::Unsupported`].
 
@@ -23,7 +33,7 @@ pub mod graph;
 
 use graph::{Deps, Node, Object};
 use pgmig_diff::{Change, CommentTarget, EnumPosition};
-use pgmig_model::{Column, QualName, quote_ident, quote_literal};
+use pgmig_model::{Column, Generated, Identity, OwnedBy, QualName, SequenceOptions, quote_ident, quote_literal};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Plan {
@@ -105,21 +115,26 @@ fn phase(change: &Change) -> u8 {
         // Planned on their own, before everything else (see the module doc).
         Change::AddEnumValue { .. } | Change::UnsupportedEnumChange { .. } => 0,
         Change::CreateSchema(_) => 0,
-        Change::CreateEnum(_) => 1,
+        Change::CreateEnum(_) | Change::CreateSequence(_) => 1,
         // Before defaults that print the new name are set.
-        Change::RenameEnumValue { .. } => 2,
+        Change::RenameEnumValue { .. } | Change::AlterSequence { .. } => 2,
         Change::CreateTable(_) => 3,
         Change::AddColumn { .. } => 4,
-        Change::DropDefault { .. } => 5,
+        // A column cannot have a default and an identity at once.
+        Change::DropIdentity { .. } | Change::DropDefault { .. } => 5,
         Change::AlterColumnType { .. } => 6,
         Change::SetDefault { .. } => 7,
         Change::DropNotNull { .. } | Change::SetNotNull { .. } => 8,
-        Change::DropColumn { .. } => 9,
-        Change::DropTable(_) => 10,
-        Change::DropEnum(_) => 11,
-        Change::DropSchema(_) => 12,
+        // After the type, the dropped default and NOT NULL that adding an identity needs.
+        Change::AddIdentity { .. } | Change::AlterIdentity { .. } => 9,
+        Change::SetSequenceOwner { .. } => 10,
+        Change::DropColumn { .. } => 11,
+        Change::DropTable { .. } => 12,
+        Change::DropSequence(_) => 13,
+        Change::DropEnum(_) => 14,
+        Change::DropSchema(_) => 15,
         // After the object it describes exists and has settled.
-        Change::SetComment { .. } => 13,
+        Change::SetComment { .. } => 16,
     }
 }
 
@@ -132,12 +147,56 @@ fn deps(change: &Change) -> Deps {
         Change::CreateTable(t) => {
             let mut requires = vec![Object::Schema(t.name.schema.clone())];
             requires.extend(types(t.columns.iter().map(|c| &c.type_ref)));
-            Deps { creates: vec![Object::Table(t.name.clone()), Object::Type(t.name.clone())], requires, ..Deps::default() }
+            requires.extend(sequences(t.columns.iter().flat_map(|c| &c.default_sequences)));
+            let mut creates = vec![Object::Table(t.name.clone()), Object::Type(t.name.clone())];
+            creates.extend(t.columns.iter().filter_map(|c| Some(identity_sequence(&t.name, &c.name, c.identity.as_ref()?))));
+            Deps { creates, requires, ..Deps::default() }
         }
-        Change::DropTable(t) => {
+        Change::DropTable { table: t, owned_sequences } => {
             let mut releases = vec![Object::Schema(t.name.schema.clone())];
             releases.extend(types(t.columns.iter().map(|c| &c.type_ref)));
-            Deps { drops: vec![Object::Table(t.name.clone()), Object::Type(t.name.clone())], releases, ..Deps::default() }
+            releases.extend(sequences(t.columns.iter().flat_map(|c| &c.default_sequences)));
+            // With the table go the sequences its columns own and its identity sequences.
+            let mut drops = vec![Object::Table(t.name.clone()), Object::Type(t.name.clone())];
+            drops.extend(sequences(owned_sequences));
+            Deps { drops, releases, ..Deps::default() }
+        }
+        Change::CreateSequence(s) => Deps {
+            creates: vec![Object::Sequence(s.name.clone())],
+            requires: vec![Object::Schema(s.name.schema.clone())],
+            ..Deps::default()
+        },
+        Change::DropSequence(s) => {
+            Deps { drops: vec![Object::Sequence(s.name.clone())], releases: vec![Object::Schema(s.name.schema.clone())], ..Deps::default() }
+        }
+        Change::AlterSequence { to, .. } => Deps { alters: vec![Object::Sequence(to.name.clone())], ..Deps::default() },
+        Change::SetSequenceOwner { name, owned_by, old } => {
+            let owner = |o: &Option<OwnedBy>| match o {
+                Some(o) => vec![in_table(&o.table), column(&o.table, &o.column)],
+                None => Vec::new(),
+            };
+            Deps {
+                alters: vec![Object::Sequence(name.clone())],
+                requires: [vec![Object::Sequence(name.clone())], owner(owned_by)].concat(),
+                releases: owner(old),
+                ..Deps::default()
+            }
+        }
+        Change::AddIdentity { table, column: c, identity, .. } => Deps {
+            // The implicit sequence takes the name a dropped sequence may still hold.
+            creates: vec![identity_sequence(table, c, identity)],
+            alters: vec![column(table, c)],
+            requires: vec![in_table(table)],
+            ..Deps::default()
+        },
+        Change::DropIdentity { table, column: c, sequence } => Deps {
+            drops: vec![Object::Sequence(sequence.clone())],
+            alters: vec![column(table, c)],
+            requires: vec![in_table(table)],
+            ..Deps::default()
+        },
+        Change::AlterIdentity { table, column: c, .. } => {
+            Deps { alters: vec![column(table, c)], requires: vec![in_table(table)], ..Deps::default() }
         }
         Change::CreateEnum(e) => {
             Deps { creates: vec![Object::Type(e.name.clone())], requires: vec![Object::Schema(e.name.schema.clone())], ..Deps::default() }
@@ -152,10 +211,19 @@ fn deps(change: &Change) -> Deps {
         Change::AddColumn { table, column: c } => {
             let mut requires = vec![in_table(table)];
             requires.extend(types([&c.type_ref]));
-            Deps { creates: vec![column(table, &c.name)], requires, ..Deps::default() }
+            requires.extend(sequences(&c.default_sequences));
+            let mut creates = vec![column(table, &c.name)];
+            if let Some(identity) = &c.identity {
+                creates.push(identity_sequence(table, &c.name, identity));
+            }
+            Deps { creates, requires, ..Deps::default() }
         }
-        Change::DropColumn { table, column: c, type_ref } => {
-            Deps { drops: vec![column(table, c)], requires: vec![in_table(table)], releases: types([type_ref]), ..Deps::default() }
+        Change::DropColumn { table, column: c, type_ref, sequences: used, owned_sequences } => {
+            let mut releases = types([type_ref]);
+            releases.extend(sequences(used));
+            // Postgres drops the sequences the column owns with it.
+            let drops = [vec![column(table, c)], sequences(owned_sequences)].concat();
+            Deps { drops, requires: vec![in_table(table)], releases, ..Deps::default() }
         }
         Change::AlterColumnType { table, column: c, type_ref, old_type_ref, .. } => {
             let mut requires = vec![in_table(table)];
@@ -170,13 +238,20 @@ fn deps(change: &Change) -> Deps {
                 CommentTarget::Table(t) => vec![in_table(t)],
                 CommentTarget::Column(t, c) => vec![in_table(t), column(t, c)],
                 CommentTarget::Type(t) => vec![Object::Type(t.clone())],
+                CommentTarget::Sequence(s) => vec![Object::Sequence(s.clone())],
             };
             Deps { requires, ..Deps::default() }
         }
-        Change::SetNotNull { table, column: c }
-        | Change::DropNotNull { table, column: c }
-        | Change::SetDefault { table, column: c, .. }
-        | Change::DropDefault { table, column: c } => {
+        Change::SetDefault { table, column: c, sequences: used, old_sequences, .. } => Deps {
+            alters: vec![column(table, c)],
+            requires: [vec![in_table(table)], sequences(used)].concat(),
+            releases: sequences(old_sequences.iter().filter(|s| !used.contains(s))),
+            ..Deps::default()
+        },
+        Change::DropDefault { table, column: c, sequences: used } => {
+            Deps { alters: vec![column(table, c)], requires: vec![in_table(table)], releases: sequences(used), ..Deps::default() }
+        }
+        Change::SetNotNull { table, column: c } | Change::DropNotNull { table, column: c } => {
             Deps { alters: vec![column(table, c)], requires: vec![in_table(table)], ..Deps::default() }
         }
     }
@@ -185,6 +260,88 @@ fn deps(change: &Change) -> Deps {
 /// The user-defined types among column type references.
 fn types<'a>(refs: impl IntoIterator<Item = &'a Option<QualName>>) -> Vec<Object> {
     refs.into_iter().flatten().map(|t| Object::Type(t.clone())).collect()
+}
+
+fn sequences<'a>(names: impl IntoIterator<Item = &'a QualName>) -> Vec<Object> {
+    names.into_iter().map(|s| Object::Sequence(s.clone())).collect()
+}
+
+/// An identity column's sequence, by the name the catalog gave it ([`Identity::sequence_name`]).
+/// Only used to order the identity against a drop or create of a sequence holding that name.
+fn identity_sequence(table: &QualName, column: &str, identity: &Identity) -> Object {
+    Object::Sequence(identity.sequence_name(table, column))
+}
+
+/// `CREATE SEQUENCE` / identity options that differ from Postgres' defaults for the type and
+/// direction; every option when the type has no known defaults.
+fn creation_options(data_type: &str, o: &SequenceOptions) -> Vec<String> {
+    let Some(d) = SequenceOptions::defaults(data_type, o.increment) else {
+        return option_clauses(None, o, true);
+    };
+    let mut out = Vec::new();
+    if o.increment != 1 {
+        out.push(format!("INCREMENT BY {}", o.increment));
+    }
+    if o.min != d.min {
+        out.push(format!("MINVALUE {}", o.min));
+    }
+    if o.max != d.max {
+        out.push(format!("MAXVALUE {}", o.max));
+    }
+    // Postgres starts at the minimum (ascending) or the maximum (descending) given.
+    if o.start != if o.increment > 0 { o.min } else { o.max } {
+        out.push(format!("START WITH {}", o.start));
+    }
+    if o.cache != d.cache {
+        out.push(format!("CACHE {}", o.cache));
+    }
+    if o.cycle {
+        out.push("CYCLE".to_owned());
+    }
+    out
+}
+
+/// The options that differ between `old` and `new` (all of them without `old`); `bounds` forces
+/// `MINVALUE` and `MAXVALUE`.
+fn option_clauses(old: Option<&SequenceOptions>, new: &SequenceOptions, bounds: bool) -> Vec<String> {
+    let changed = |f: fn(&SequenceOptions) -> i64| old.is_none_or(|o| f(o) != f(new));
+    let mut out = Vec::new();
+    if changed(|o| o.increment) {
+        out.push(format!("INCREMENT BY {}", new.increment));
+    }
+    if bounds || changed(|o| o.min) {
+        out.push(format!("MINVALUE {}", new.min));
+    }
+    if bounds || changed(|o| o.max) {
+        out.push(format!("MAXVALUE {}", new.max));
+    }
+    if changed(|o| o.start) {
+        out.push(format!("START WITH {}", new.start));
+    }
+    if changed(|o| o.cache) {
+        out.push(format!("CACHE {}", new.cache));
+    }
+    if old.is_none_or(|o| o.cycle != new.cycle) {
+        out.push(if new.cycle { "CYCLE" } else { "NO CYCLE" }.to_owned());
+    }
+    out
+}
+
+fn generated(g: Generated) -> &'static str {
+    match g {
+        Generated::Always => "ALWAYS",
+        Generated::ByDefault => "BY DEFAULT",
+    }
+}
+
+/// `GENERATED ... AS IDENTITY [(options)]` for a column of `type_name`.
+fn identity_clause(type_name: &str, identity: &Identity) -> String {
+    let options = creation_options(type_name, &identity.options);
+    let mut s = format!("GENERATED {} AS IDENTITY", generated(identity.generated));
+    if !options.is_empty() {
+        s.push_str(&format!(" ({})", options.join(" ")));
+    }
+    s
 }
 
 fn statement(change: &Change) -> String {
@@ -199,12 +356,52 @@ fn statement(change: &Change) -> String {
                 format!("CREATE TABLE {} (\n{}\n)", t.name, cols.join(",\n"))
             }
         }
-        Change::DropTable(t) => format!("DROP TABLE {}", t.name),
+        Change::DropTable { table: t, .. } => format!("DROP TABLE {}", t.name),
         Change::CreateEnum(e) => {
             let labels: Vec<String> = e.labels.iter().map(|l| quote_literal(l)).collect();
             format!("CREATE TYPE {} AS ENUM ({})", e.name, labels.join(", "))
         }
         Change::DropEnum(e) => format!("DROP TYPE {}", e.name),
+        Change::CreateSequence(seq) => {
+            let mut s = format!("CREATE SEQUENCE {}", seq.name);
+            if seq.data_type != "bigint" {
+                s.push_str(&format!(" AS {}", seq.data_type));
+            }
+            for o in creation_options(&seq.data_type, &seq.options) {
+                s.push(' ');
+                s.push_str(&o);
+            }
+            s
+        }
+        Change::DropSequence(seq) => format!("DROP SEQUENCE {}", seq.name),
+        Change::AlterSequence { from, to } => {
+            let retyped = from.data_type != to.data_type;
+            let mut s = format!("ALTER SEQUENCE {}", to.name);
+            if retyped {
+                s.push_str(&format!(" AS {}", to.data_type));
+            }
+            for o in option_clauses(Some(&from.options), &to.options, retyped) {
+                s.push(' ');
+                s.push_str(&o);
+            }
+            s
+        }
+        Change::SetSequenceOwner { name, owned_by, .. } => match owned_by {
+            Some(o) => format!("ALTER SEQUENCE {name} OWNED BY {}.{}", o.table, quote_ident(&o.column)),
+            None => format!("ALTER SEQUENCE {name} OWNED BY NONE"),
+        },
+        Change::AddIdentity { table, column, type_name, identity } => {
+            format!("ALTER TABLE {table} ALTER COLUMN {} ADD {}", quote_ident(column), identity_clause(type_name, identity))
+        }
+        Change::DropIdentity { table, column, .. } => format!("ALTER TABLE {table} ALTER COLUMN {} DROP IDENTITY", quote_ident(column)),
+        Change::AlterIdentity { table, column, from, to, type_changed, .. } => {
+            let mut parts = Vec::new();
+            if from.generated != to.generated {
+                parts.push(format!("SET GENERATED {}", generated(to.generated)));
+            }
+            parts.extend(option_clauses(Some(&from.options), &to.options, *type_changed).into_iter().map(|o| format!("SET {o}")));
+            format!("ALTER TABLE {table} ALTER COLUMN {} {}", quote_ident(column), parts.join(" "))
+        }
         Change::AddEnumValue { name, value, position } => {
             let at = match position {
                 EnumPosition::Before(l) => format!(" BEFORE {}", quote_literal(l)),
@@ -232,16 +429,17 @@ fn statement(change: &Change) -> String {
         }
         Change::SetNotNull { table, column } => format!("ALTER TABLE {table} ALTER COLUMN {} SET NOT NULL", quote_ident(column)),
         Change::DropNotNull { table, column } => format!("ALTER TABLE {table} ALTER COLUMN {} DROP NOT NULL", quote_ident(column)),
-        Change::SetDefault { table, column, default } => {
+        Change::SetDefault { table, column, default, .. } => {
             format!("ALTER TABLE {table} ALTER COLUMN {} SET DEFAULT {default}", quote_ident(column))
         }
-        Change::DropDefault { table, column } => format!("ALTER TABLE {table} ALTER COLUMN {} DROP DEFAULT", quote_ident(column)),
+        Change::DropDefault { table, column, .. } => format!("ALTER TABLE {table} ALTER COLUMN {} DROP DEFAULT", quote_ident(column)),
         Change::SetComment { target, comment } => {
             let object = match target {
                 CommentTarget::Schema(s) => format!("SCHEMA {}", quote_ident(s)),
                 CommentTarget::Table(t) => format!("TABLE {t}"),
                 CommentTarget::Column(t, c) => format!("COLUMN {t}.{}", quote_ident(c)),
                 CommentTarget::Type(t) => format!("TYPE {t}"),
+                CommentTarget::Sequence(s) => format!("SEQUENCE {s}"),
             };
             format!("COMMENT ON {object} IS {}", comment.as_deref().map_or("NULL".to_owned(), quote_literal))
         }
@@ -250,6 +448,10 @@ fn statement(change: &Change) -> String {
 
 fn column_def(c: &Column) -> String {
     let mut s = format!("{} {}", quote_ident(&c.name), c.type_name);
+    if let Some(identity) = &c.identity {
+        s.push(' ');
+        s.push_str(&identity_clause(&c.type_name, identity));
+    }
     if let Some(d) = &c.default {
         s.push_str(" DEFAULT ");
         s.push_str(d);
@@ -263,11 +465,20 @@ fn column_def(c: &Column) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pgmig_model::{Enum, Table};
+    use pgmig_model::{Enum, Sequence, Table};
 
     fn col(name: &str, type_ref: Option<QualName>) -> Column {
         let type_name = type_ref.as_ref().map_or("integer".to_owned(), |t| t.name.clone());
-        Column { name: name.into(), type_name, type_ref, not_null: false, default: None, comment: None }
+        Column {
+            name: name.into(),
+            type_name,
+            type_ref,
+            not_null: false,
+            default: None,
+            comment: None,
+            default_sequences: Vec::new(),
+            identity: None,
+        }
     }
 
     fn table(schema: &str, name: &str, columns: Vec<Column>) -> Table {
@@ -276,6 +487,10 @@ mod tests {
 
     fn row_type(schema: &str, name: &str) -> Option<QualName> {
         Some(QualName::new(schema, name))
+    }
+
+    fn drop_table(table: Table) -> Change {
+        Change::DropTable { table, owned_sequences: vec![] }
     }
 
     fn sql(changes: &[Change]) -> Vec<String> {
@@ -287,7 +502,7 @@ mod tests {
         let t = table("app", "t", vec![col("id", None)]);
         let created = sql(&[Change::CreateTable(t.clone()), Change::CreateSchema("app".into())]);
         assert_eq!(created, ["CREATE SCHEMA app", "CREATE TABLE app.t (\n    id integer\n)"]);
-        let dropped = sql(&[Change::DropSchema("app".into()), Change::DropTable(t)]);
+        let dropped = sql(&[Change::DropSchema("app".into()), drop_table(t)]);
         assert_eq!(dropped, ["DROP TABLE app.t", "DROP SCHEMA app"]);
     }
 
@@ -301,7 +516,7 @@ mod tests {
 
         let point = table("public", "apoint", vec![col("x", None)]);
         let path = table("public", "zpath", vec![col("start", row_type("public", "apoint"))]);
-        let dropped = sql(&[Change::DropTable(point), Change::DropTable(path)]);
+        let dropped = sql(&[drop_table(point), drop_table(path)]);
         assert_eq!(dropped, ["DROP TABLE public.zpath", "DROP TABLE public.apoint"]);
     }
 
@@ -311,8 +526,14 @@ mod tests {
         let new = table("public", "znew", vec![col("x", None)]);
         let old = table("public", "aold", vec![col("x", None)]);
         let changes = [
-            Change::DropTable(old),
-            Change::DropColumn { table: t.clone(), column: "gone".into(), type_ref: row_type("public", "aold") },
+            drop_table(old),
+            Change::DropColumn {
+                table: t.clone(),
+                column: "gone".into(),
+                type_ref: row_type("public", "aold"),
+                sequences: vec![],
+                owned_sequences: vec![],
+            },
             Change::AlterColumnType {
                 table: t.clone(),
                 column: "c".into(),
@@ -342,7 +563,7 @@ mod tests {
             Change::DropSchema("old".into()),
             Change::SetNotNull { table: t.clone(), column: "a".into() },
             Change::CreateTable(table("public", "b", vec![])),
-            Change::DropDefault { table: t.clone(), column: "a".into() },
+            Change::DropDefault { table: t.clone(), column: "a".into(), sequences: vec![] },
             Change::CreateTable(table("public", "a", vec![])),
             Change::CreateSchema("new".into()),
         ];
@@ -425,8 +646,8 @@ mod tests {
         let dropped = sql(&[
             Change::DropSchema("app".into()),
             Change::DropEnum(mood(&["a"])),
-            Change::DropTable(users),
-            Change::DropColumn { table: t, column: "m".into(), type_ref: m },
+            drop_table(users),
+            Change::DropColumn { table: t, column: "m".into(), type_ref: m, sequences: vec![], owned_sequences: vec![] },
         ]);
         assert_eq!(dropped, ["ALTER TABLE public.t DROP COLUMN m", "DROP TABLE public.users", "DROP TYPE app.mood", "DROP SCHEMA app"]);
     }
@@ -435,7 +656,13 @@ mod tests {
     fn added_values_come_first_in_diff_order_and_are_committed_before_the_rest() {
         let t = QualName::new("public", "t");
         let changes = [
-            Change::SetDefault { table: t.clone(), column: "m".into(), default: "'b'::app.mood".into() },
+            Change::SetDefault {
+                table: t.clone(),
+                column: "m".into(),
+                default: "'b'::app.mood".into(),
+                sequences: vec![],
+                old_sequences: vec![],
+            },
             add("a", EnumPosition::Before("c".into())),
             Change::CreateSchema("other".into()),
             add("b", EnumPosition::After("a".into())),
@@ -466,7 +693,13 @@ mod tests {
     fn a_renamed_value_runs_before_defaults_that_use_it() {
         let t = QualName::new("public", "t");
         let changes = [
-            Change::SetDefault { table: t, column: "m".into(), default: "'new'::app.mood".into() },
+            Change::SetDefault {
+                table: t,
+                column: "m".into(),
+                default: "'new'::app.mood".into(),
+                sequences: vec![],
+                old_sequences: vec![],
+            },
             Change::RenameEnumValue { name: QualName::new("app", "mood"), from: "it's".into(), to: "new".into() },
         ];
         let p = plan(&changes).expect("plan");
@@ -492,5 +725,212 @@ mod tests {
             "unsupported changes: enum app.mood: values ('a', 'b') cannot become ('b'); only adding values and renaming one value \
              in place are supported, not removing or reordering values"
         );
+    }
+
+    fn opts(data_type: &str, increment: i64) -> SequenceOptions {
+        SequenceOptions::defaults(data_type, increment).expect("integer type")
+    }
+
+    fn sequence(name: &str, data_type: &str, options: SequenceOptions) -> Sequence {
+        Sequence { name: QualName::new("public", name), data_type: data_type.into(), options, owned_by: None, comment: None }
+    }
+
+    #[test]
+    fn create_sequence_prints_only_options_that_differ_from_the_defaults() {
+        let create = |data_type: &str, options| sql(&[Change::CreateSequence(sequence("s", data_type, options))]);
+        assert_eq!(create("bigint", opts("bigint", 1)), ["CREATE SEQUENCE public.s"]);
+        assert_eq!(create("integer", opts("integer", -1)), ["CREATE SEQUENCE public.s AS integer INCREMENT BY -1"]);
+        let custom = SequenceOptions { start: 5, increment: 2, min: 3, max: 100, cache: 4, cycle: true };
+        assert_eq!(
+            create("smallint", custom),
+            ["CREATE SEQUENCE public.s AS smallint INCREMENT BY 2 MINVALUE 3 MAXVALUE 100 START WITH 5 CACHE 4 CYCLE"]
+        );
+        // The start follows the minimum given.
+        assert_eq!(create("bigint", SequenceOptions { start: 3, min: 3, ..opts("bigint", 1) }), ["CREATE SEQUENCE public.s MINVALUE 3"]);
+    }
+
+    #[test]
+    fn alter_sequence_prints_changed_options_and_both_bounds_on_a_new_type() {
+        let from = sequence("s", "smallint", opts("smallint", 1));
+        let to = sequence("s", "smallint", SequenceOptions { cache: 10, cycle: true, ..opts("smallint", 1) });
+        assert_eq!(sql(&[Change::AlterSequence { from: from.clone(), to }]), ["ALTER SEQUENCE public.s CACHE 10 CYCLE"]);
+        let to = sequence("s", "integer", opts("integer", 1));
+        assert_eq!(
+            sql(&[Change::AlterSequence { from: from.clone(), to }]),
+            ["ALTER SEQUENCE public.s AS integer MINVALUE 1 MAXVALUE 2147483647"]
+        );
+        let back = sequence("s", "smallint", SequenceOptions { cycle: false, ..opts("smallint", 1) });
+        let cycling = sequence("s", "smallint", SequenceOptions { cycle: true, ..opts("smallint", 1) });
+        assert_eq!(sql(&[Change::AlterSequence { from: cycling, to: back }]), ["ALTER SEQUENCE public.s NO CYCLE"]);
+    }
+
+    fn serial_column(seq: &str) -> Column {
+        Column {
+            default: Some(format!("nextval('{seq}'::regclass)")),
+            default_sequences: vec![QualName::new("public", seq)],
+            not_null: true,
+            ..col("id", None)
+        }
+    }
+
+    #[test]
+    fn a_serial_table_creates_its_sequence_first_and_owns_it_last() {
+        let t = QualName::new("public", "t");
+        let owned = Some(OwnedBy { table: t.clone(), column: "id".into() });
+        let changes = [
+            Change::SetSequenceOwner { name: QualName::new("public", "t_id_seq"), owned_by: owned, old: None },
+            Change::CreateTable(table("public", "t", vec![serial_column("t_id_seq")])),
+            Change::CreateSequence(sequence("t_id_seq", "integer", opts("integer", 1))),
+        ];
+        assert_eq!(
+            sql(&changes),
+            [
+                "CREATE SEQUENCE public.t_id_seq AS integer",
+                "CREATE TABLE public.t (\n    id integer DEFAULT nextval('t_id_seq'::regclass) NOT NULL\n)",
+                "ALTER SEQUENCE public.t_id_seq OWNED BY public.t.id",
+            ]
+        );
+    }
+
+    #[test]
+    fn serial_to_identity_drops_the_default_then_the_sequence_then_adds_the_identity() {
+        let t = QualName::new("public", "t");
+        let seq = QualName::new("public", "t_id_seq");
+        let identity = Identity { generated: Generated::Always, options: opts("integer", 1), sequence: None };
+        let changes = [
+            Change::AddIdentity { table: t.clone(), column: "id".into(), type_name: "integer".into(), identity },
+            Change::DropSequence(sequence("t_id_seq", "integer", opts("integer", 1))),
+            Change::DropDefault { table: t.clone(), column: "id".into(), sequences: vec![seq] },
+        ];
+        assert_eq!(
+            sql(&changes),
+            [
+                "ALTER TABLE public.t ALTER COLUMN id DROP DEFAULT",
+                "DROP SEQUENCE public.t_id_seq",
+                "ALTER TABLE public.t ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY",
+            ]
+        );
+    }
+
+    #[test]
+    fn identity_to_serial_drops_the_identity_before_creating_the_sequence() {
+        let t = QualName::new("public", "t");
+        let seq = QualName::new("public", "t_id_seq");
+        let changes = [
+            Change::CreateSequence(sequence("t_id_seq", "integer", opts("integer", 1))),
+            Change::SetDefault {
+                table: t.clone(),
+                column: "id".into(),
+                default: "nextval('t_id_seq'::regclass)".into(),
+                sequences: vec![seq.clone()],
+                old_sequences: vec![],
+            },
+            Change::SetSequenceOwner { name: seq, owned_by: Some(OwnedBy { table: t.clone(), column: "id".into() }), old: None },
+            Change::DropIdentity { table: t, column: "id".into(), sequence: QualName::new("public", "t_id_seq") },
+        ];
+        assert_eq!(
+            sql(&changes),
+            [
+                "ALTER TABLE public.t ALTER COLUMN id DROP IDENTITY",
+                "CREATE SEQUENCE public.t_id_seq AS integer",
+                "ALTER TABLE public.t ALTER COLUMN id SET DEFAULT nextval('t_id_seq'::regclass)",
+                "ALTER SEQUENCE public.t_id_seq OWNED BY public.t.id",
+            ]
+        );
+    }
+
+    #[test]
+    fn identity_changes_set_what_changed() {
+        let t = QualName::new("public", "t");
+        let always = Identity { generated: Generated::Always, options: opts("integer", 1), sequence: None };
+        let by_default =
+            Identity { generated: Generated::ByDefault, options: SequenceOptions { start: 7, ..opts("integer", 1) }, sequence: None };
+        let alter = |from: &Identity, to: &Identity, type_changed| Change::AlterIdentity {
+            table: t.clone(),
+            column: "id".into(),
+            type_name: "bigint".into(),
+            from: from.clone(),
+            to: to.clone(),
+            type_changed,
+        };
+        assert_eq!(
+            sql(&[alter(&always, &by_default, false)]),
+            ["ALTER TABLE public.t ALTER COLUMN id SET GENERATED BY DEFAULT SET START WITH 7"]
+        );
+        let wide = Identity { options: opts("bigint", 1), ..always.clone() };
+        assert_eq!(
+            sql(&[alter(&always, &wide, true)]),
+            ["ALTER TABLE public.t ALTER COLUMN id SET MINVALUE 1 SET MAXVALUE 9223372036854775807"]
+        );
+        let mut c = col("id", None);
+        c.identity = Some(Identity { options: SequenceOptions { start: 10, increment: 5, ..opts("integer", 5) }, ..always });
+        c.not_null = true;
+        assert_eq!(
+            sql(&[Change::AddColumn { table: t.clone(), column: c }]),
+            ["ALTER TABLE public.t ADD COLUMN id integer GENERATED ALWAYS AS IDENTITY (INCREMENT BY 5 START WITH 10) NOT NULL"]
+        );
+        assert_eq!(
+            sql(&[Change::DropIdentity { table: t, column: "id".into(), sequence: QualName::new("public", "t_id_seq") }]),
+            ["ALTER TABLE public.t ALTER COLUMN id DROP IDENTITY"]
+        );
+    }
+
+    #[test]
+    fn dropping_a_table_runs_before_dropping_a_sequence_its_defaults_use() {
+        let changes = [
+            Change::DropSequence(sequence("free", "bigint", opts("bigint", 1))),
+            drop_table(table("public", "t", vec![serial_column("free")])),
+            Change::SetComment { target: CommentTarget::Sequence(QualName::new("public", "kept")), comment: Some("c".into()) },
+        ];
+        assert_eq!(sql(&changes), ["DROP TABLE public.t", "DROP SEQUENCE public.free", "COMMENT ON SEQUENCE public.kept IS 'c'"]);
+    }
+
+    #[test]
+    fn dropping_the_owner_of_a_shared_sequence_runs_after_what_still_uses_it() {
+        // t.id is serial; z.x takes values from t's sequence too. Dropping t.id drops the
+        // sequence, so z (and its default) must go first (2BP01 otherwise).
+        let t = QualName::new("public", "t");
+        let seq = QualName::new("public", "t_id_seq");
+        let mut x = serial_column("t_id_seq");
+        x.name = "x".into();
+        let z = table("public", "z", vec![x]);
+        let drop_id = Change::DropColumn {
+            table: t.clone(),
+            column: "id".into(),
+            type_ref: None,
+            sequences: vec![seq.clone()],
+            owned_sequences: vec![seq.clone()],
+        };
+        assert_eq!(sql(&[drop_id, drop_table(z.clone())]), ["DROP TABLE public.z", "ALTER TABLE public.t DROP COLUMN id"]);
+
+        // Both tables dropped, the owner first in diff order.
+        let owner = Change::DropTable { table: table("public", "t", vec![serial_column("t_id_seq")]), owned_sequences: vec![seq] };
+        assert_eq!(sql(&[owner, drop_table(z)]), ["DROP TABLE public.z", "DROP TABLE public.t"]);
+    }
+
+    #[test]
+    fn identity_to_serial_orders_by_the_identity_sequences_real_name() {
+        // Postgres truncates `<table>_<column>_seq` to 63 bytes; the catalog's name is what counts.
+        let long = "a".repeat(40);
+        let t = QualName::new("public", long.clone());
+        let truncated = format!("{long}_{}", "b".repeat(18));
+        assert_eq!(truncated.len(), 59);
+        let name = QualName::new("public", truncated.clone());
+        let changes = [
+            Change::CreateSequence(sequence(&truncated, "integer", opts("integer", 1))),
+            Change::DropIdentity { table: t.clone(), column: "b".repeat(30), sequence: name },
+        ];
+        let planned = sql(&changes);
+        assert!(planned[0].ends_with("DROP IDENTITY"), "{planned:?}");
+        assert!(planned[1].starts_with("CREATE SEQUENCE"), "{planned:?}");
+
+        // Adding an identity whose sequence takes a dropped sequence's name waits for the drop.
+        let identity =
+            Identity { generated: Generated::Always, options: opts("integer", 1), sequence: Some(QualName::new("public", "t_id_seq1")) };
+        let changes = [
+            Change::AddIdentity { table: QualName::new("public", "t"), column: "id".into(), type_name: "integer".into(), identity },
+            Change::DropSequence(sequence("t_id_seq1", "integer", opts("integer", 1))),
+        ];
+        assert_eq!(sql(&changes)[0], "DROP SEQUENCE public.t_id_seq1");
     }
 }
