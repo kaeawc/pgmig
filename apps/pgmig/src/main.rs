@@ -37,6 +37,13 @@ enum SchemaCommand {
         #[command(flatten)]
         shadow: ShadowArg,
     },
+    /// Load SQL files into the shadow database and report errors; prints nothing on success.
+    Validate {
+        /// SQL file or directory of SQL files.
+        source: String,
+        #[command(flatten)]
+        shadow: ShadowArg,
+    },
 }
 
 #[derive(clap::Args)]
@@ -61,6 +68,9 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     let plan = match cli.command {
         Command::Schema(SchemaCommand::Diff { from, to, shadow }) => {
             pgmig::schema_diff(&Source::parse(&from), &Source::parse(&to), &ShadowSpec::parse(&shadow.shadow))?
+        }
+        Command::Schema(SchemaCommand::Validate { source, shadow }) => {
+            return Ok(pgmig::schema_validate(&Source::parse(&source), &ShadowSpec::parse(&shadow.shadow))?);
         }
         Command::Schema(SchemaCommand::Inspect { source, shadow }) => {
             pgmig::schema_inspect(&Source::parse(&source), &ShadowSpec::parse(&shadow.shadow))?

@@ -21,6 +21,7 @@ pgmig-inspect = { path = "crates/pgmig-inspect", version = "=0.1.0" }
 pgmig-model = { path = "crates/pgmig-model", version = "=0.1.0" }
 pgmig-plan = { path = "crates/pgmig-plan", version = "=0.1.0" }
 pgmig-shadow = { path = "crates/pgmig-shadow", version = "=0.1.0" }
+pgmig-sql = { path = "crates/pgmig-sql", version = "=0.1.0" }
 
 # Versions of shared dependencies (postgres, tokio) must match pgmem's or `cargo deny` fails on duplicates.
 pgmem = { version = "0.1.1", default-features = false }
