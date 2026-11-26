@@ -112,6 +112,21 @@ fn flags_win_over_the_config_file() {
 }
 
 #[test]
+fn the_configured_revisions_schema_is_never_managed() {
+    let (shadow, _keep) = shadow_arg();
+    let toml = |extra: &str| format!("shadow = {}\nfrom = \"a.sql\"\nto = \"ops.sql\"\n{extra}", toml_str(&shadow));
+    let ops = "CREATE TABLE a (id int);\nCREATE SCHEMA ops;\nCREATE TABLE ops.t (id int);\nCREATE SCHEMA pgmig;\nCREATE TABLE pgmig.t (id int);\n";
+    let p = Project::new(&[("a.sql", A), ("ops.sql", ops), ("pgmig.toml", &toml("[migrations]\nrevisions_schema = \"ops\"\n"))]);
+    // `ops` is left out; `pgmig` is an ordinary schema now.
+    let out = ok(&p.run(&["schema", "diff"]));
+    assert!(!out.contains("ops") && out.contains("CREATE TABLE pgmig.t"), "{out}");
+    // By default `pgmig` is the one left out.
+    p.write("pgmig.toml", &toml(""));
+    let out = ok(&p.run(&["schema", "diff"]));
+    assert!(out.contains("CREATE TABLE ops.t") && !out.contains("pgmig"), "{out}");
+}
+
+#[test]
 fn config_path_and_variables() {
     let (shadow, _keep) = shadow_arg();
     let files = Project::new(&[("a.sql", A), ("b.sql", B), ("c.sql", C)]);
@@ -203,7 +218,7 @@ fn config_validate() {
         v["diagnostics"].as_array().expect("diagnostics").iter().map(|d| d["message"].as_str().expect("message")).collect();
     assert_eq!(messages.len(), 3, "{messages:?}");
     assert_eq!(messages[0], "custom.toml: env.prod.format: expected \"text\" or \"json\"");
-    assert_eq!(messages[1], "custom.toml: env.prod.migrations.dirr: unknown key (expected `dir`)");
+    assert_eq!(messages[1], "custom.toml: env.prod.migrations.dirr: unknown key (expected `dir` or `revisions_schema`)");
     assert!(messages[2].starts_with("custom.toml: shadoww: unknown key"), "{messages:?}");
     assert_eq!(v["diagnostics"][0]["code"], "config");
     assert_eq!(v["diagnostics"][0]["file"], "custom.toml");

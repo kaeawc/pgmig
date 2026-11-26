@@ -8,6 +8,8 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
 
 ### Added
 
+- Revisions table library (`pgmig_revisions` in the `pgmig` schema, configurable with
+  `[migrations] revisions_schema`): versioned format, per-row hashes that reveal hand edits.
 - `pgmig migrate diff <name>` writes the next migration from the desired state (nothing when there
   are no changes) and `pgmig migrate new <name>` writes an empty one; both rehash `pgmig.sum`. A
   directory holding `pgmig.sum` is read as a migration directory wherever a state is accepted.
@@ -60,6 +62,9 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
 
 ### Changed
 
+- The revisions schema (`pgmig` by default) is never managed by `schema` commands: it is left out
+  of inspect, diff and apply on both sides. A project with its own schema named `pgmig` must set
+  `[migrations] revisions_schema` to another name.
 - Inspection runs with `search_path = pg_catalog`, so names inside server-printed definitions
   (defaults, types, constraint definitions) are always schema-qualified, and the same schema reads
   the same whatever the connection's search path.

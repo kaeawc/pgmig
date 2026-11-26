@@ -232,22 +232,41 @@ guarantees a version-control conflict instead of a silent merge; `migrate rebase
 
 ### Revisions table
 
-`pgmig_revisions` in a configurable schema (default: `pgmig`):
+`pgmig_revisions` in a configurable schema (`[migrations] revisions_schema`, default `pgmig`), one
+row per migration file:
 
 | column | type | |
 |---|---|---|
-| `version` | text, primary key | |
-| `description` | text | |
-| `kind` | smallint | normal, baseline, checkpoint |
-| `applied` | int | statements applied |
-| `total` | int | statements in the file |
-| `executed_at` | timestamptz | |
-| `execution_ms` | bigint | |
-| `error` | text | last error, if any |
-| `error_stmt` | text | statement that failed |
-| `hash` | text | file hash from the sum file |
-| `partial_hashes` | text[] | hash of each applied statement, for resuming |
-| `pgmig_version` | text | |
+| `version` | `text` primary key | |
+| `description` | `text not null` | |
+| `kind` | `smallint not null` | 0 normal, 1 baseline, 2 checkpoint |
+| `applied` | `integer not null` | statements applied |
+| `total` | `integer not null` | statements in the file |
+| `executed_at` | `timestamptz not null` | when the file started (the server's `now()`) |
+| `execution_ms` | `bigint not null` | |
+| `error` | `text` | last error, if any |
+| `error_stmt` | `text` | statement that failed |
+| `hash` | `text not null` | file hash from the sum file |
+| `partial_hashes` | `text[] not null` | hash of each applied statement, for resuming |
+| `pgmig_version` | `text not null` | |
+| `row_hash` | `text not null` | SHA-256 over the row, to catch hand edits |
+
+The table is created on first use, with its schema, and is versioned by its comment:
+`pgmig revisions table, format 1`. pgmig refuses a table with a newer format than it knows, and a
+table of that name without the comment; an older format is where a later pgmig upgrades the table
+in place.
+
+`row_hash` covers every other column except `executed_at` (whose text depends on the session's time
+zone and date style), each length-prefixed. Reading the table recomputes it and reports the first
+row that does not match as edited by hand, naming its version, so an `UPDATE` that marks a file
+applied is caught. It guards against accidents, not against someone who recomputes the hash;
+`migrate set` (`MIG-14`) is the supported way to change rows. Values are sent as quoted literals
+over the simple protocol, in the caller's transaction.
+
+pgmig never manages the revisions schema: `schema inspect`, `schema diff`, `schema apply` and
+`migrate diff` leave it and everything in it out of both sides, as if `--exclude
+schema:<revisions_schema>` were always given (an exact name, not a pattern, and no `--include` brings
+it back). Otherwise `schema apply` against a migrated database would drop the table.
 
 ### Apply engine
 
@@ -303,7 +322,8 @@ schema = "app"
 
 Keys are named after the flags they stand for: `url`, `shadow`, `from`, `to` (also the source of
 `schema inspect` and `schema validate`), `include`, `exclude`, `schema` (the `--schema` scope),
-`format`, and `migrations.dir` (`--dir`). Top-level keys apply to every environment;
+`format`, `migrations.dir` (`--dir`), and `migrations.revisions_schema` (the schema of the
+revisions table; no flag). Top-level keys apply to every environment;
 `[env.<name>]`, selected with `--env`, overrides them key by key (arrays replace), and a flag wins
 over both. `--dry-run`, `--auto-approve` and `--exit-code` stay on the command line. Unknown keys
 are errors, so a typo never silently falls back to a default.
@@ -318,7 +338,6 @@ Later sections, rejected as unknown keys until they exist:
 
 ```toml
 [env.local.migrations]
-revisions_schema = "pgmig"
 tx_mode = "file"
 
 [diff]

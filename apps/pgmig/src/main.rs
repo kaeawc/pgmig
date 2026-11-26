@@ -28,7 +28,8 @@ Configuration: every flag except --dry-run, --auto-approve and --exit-code can b
 pgmig.toml (or the file given to --config), under the flag's name: `url`, `shadow`, `from`, `to`
 (also the SOURCE of `schema inspect` and `schema validate`, and the desired state of `migrate
 diff`), `include`, `exclude`, `schema`,
-`format`, and `dir` as `[migrations] dir`. `[env.NAME]` sections, selected with --env NAME,
+`format`, and `dir` as `[migrations] dir`. `[migrations] revisions_schema` (default `pgmig`) names
+the schema of the revisions table; pgmig never manages that schema. `[env.NAME]` sections, selected with --env NAME,
 override the top level. A flag wins over both. `${KEY}` in a value is replaced by --var KEY=VALUE,
 or else by the environment variable KEY; `$${` is a literal `${`.";
 
@@ -249,6 +250,7 @@ impl ScopeArgs {
         Ok(Options {
             filter: Filter::parse(&include, &exclude).map_err(ApiError::from)?,
             schema: self.schema.or_else(|| settings.schema.clone()),
+            revisions_schema: settings.migrations_revisions_schema.clone().unwrap_or_else(|| pgmig::revisions::DEFAULT_SCHEMA.to_owned()),
         })
     }
 }

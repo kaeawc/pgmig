@@ -439,6 +439,7 @@ impl From<&Error> for ApiError {
             Error::ImportEmpty { path, pos, .. } => err(ErrorCode::ImportEmpty).at(path, Some(*pos)),
             Error::ImportCycle { .. } => err(ErrorCode::ImportCycle),
             Error::MigrationDescription { .. } => err(ErrorCode::Usage),
+            Error::Options(_) => err(ErrorCode::Usage),
             Error::MigrationImport { path, pos } => err(ErrorCode::MigrationImport).at(path, Some(*pos)),
             Error::Migrate(m) => match m {
                 pgmig_migrate::Error::Io { path, .. } => err(ErrorCode::Io).at(path, None),
@@ -559,6 +560,7 @@ fn is_diagnostic(e: &Error) -> bool {
         | Error::Checksum(_) => true,
         Error::NotSql
         | Error::MigrationDescription { .. }
+        | Error::Options(_)
         | Error::Conn(_)
         | Error::Shadow(_)
         | Error::Inspect(_)
@@ -651,7 +653,7 @@ mod tests {
     }
 
     fn options() -> Options {
-        Options { filter: Filter::parse(&["app"], &["app.tmp_*"]).expect("patterns"), schema: Some("app".into()) }
+        Options { filter: Filter::parse(&["app"], &["app.tmp_*"]).expect("patterns"), schema: Some("app".into()), ..Options::default() }
     }
 
     fn plan() -> Plan {
@@ -756,7 +758,7 @@ mod tests {
         assert_eq!(req.options, Options::default());
         let req: InspectRequest =
             serde_json::from_str(r#"{"source":{"kind":"sql","data":"s.sql"},"options":{"schema":"app"}}"#).expect("request");
-        assert_eq!(req.options, Options { filter: Filter::default(), schema: Some("app".into()) });
+        assert_eq!(req.options, Options { filter: Filter::default(), schema: Some("app".into()), ..Options::default() });
     }
 
     /// Request JSON is part of pgmig's interface: a change here must be deliberate.
