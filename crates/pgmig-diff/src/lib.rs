@@ -2,6 +2,15 @@
 
 use pgmig_model::{Column, Model, QualName, Table};
 
+/// An object that can carry a comment. New kinds (constraints, indexes) add a variant here, a
+/// matching `Object` in the planner, and a comparison in [`diff`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommentTarget {
+    Schema(String),
+    Table(QualName),
+    Column(QualName, String),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Change {
     CreateSchema(String),
@@ -44,6 +53,12 @@ pub enum Change {
         table: QualName,
         column: String,
     },
+    /// `COMMENT ON ... IS <comment>`; `None` removes the comment. Never emitted for an object
+    /// that is being dropped.
+    SetComment {
+        target: CommentTarget,
+        comment: Option<String>,
+    },
 }
 
 pub fn diff(a: &Model, b: &Model) -> Vec<Change> {
@@ -52,13 +67,23 @@ pub fn diff(a: &Model, b: &Model) -> Vec<Change> {
     for name in b.schemas.keys().filter(|n| !a.schemas.contains_key(*n)) {
         changes.push(Change::CreateSchema(name.clone()));
     }
+    for (name, schema) in &b.schemas {
+        let old = a.schemas.get(name).and_then(|s| s.comment.as_ref());
+        set_comment(CommentTarget::Schema(name.clone()), old, schema.comment.as_ref(), &mut changes);
+    }
     for name in a.schemas.keys().filter(|n| !b.schemas.contains_key(*n)) {
         changes.push(Change::DropSchema(name.clone()));
     }
 
     for (name, table) in &b.tables {
         match a.tables.get(name) {
-            None => changes.push(Change::CreateTable(table.clone())),
+            None => {
+                changes.push(Change::CreateTable(table.clone()));
+                set_comment(CommentTarget::Table(name.clone()), None, table.comment.as_ref(), &mut changes);
+                for col in &table.columns {
+                    set_comment(CommentTarget::Column(name.clone(), col.name.clone()), None, col.comment.as_ref(), &mut changes);
+                }
+            }
             Some(old) => diff_table(old, table, &mut changes),
         }
     }
@@ -69,11 +94,20 @@ pub fn diff(a: &Model, b: &Model) -> Vec<Change> {
     changes
 }
 
+/// Emit a `SetComment` when the comment differs (`old` is `None` for a new object).
+fn set_comment(target: CommentTarget, old: Option<&String>, new: Option<&String>, changes: &mut Vec<Change>) {
+    if old != new {
+        changes.push(Change::SetComment { target, comment: new.cloned() });
+    }
+}
+
 fn diff_table(a: &Table, b: &Table, changes: &mut Vec<Change>) {
     let table = &b.name;
+    set_comment(CommentTarget::Table(table.clone()), a.comment.as_ref(), b.comment.as_ref(), changes);
     for col in &b.columns {
         let Some(old) = a.column(&col.name) else {
             changes.push(Change::AddColumn { table: table.clone(), column: col.clone() });
+            set_comment(CommentTarget::Column(table.clone(), col.name.clone()), None, col.comment.as_ref(), changes);
             continue;
         };
         let column = || col.name.clone();
@@ -93,6 +127,7 @@ fn diff_table(a: &Table, b: &Table, changes: &mut Vec<Change>) {
             (Some(_), None) => changes.push(Change::DropDefault { table: table.clone(), column: column() }),
             _ => {}
         }
+        set_comment(CommentTarget::Column(table.clone(), column()), old.comment.as_ref(), col.comment.as_ref(), changes);
         match (old.not_null, col.not_null) {
             (false, true) => changes.push(Change::SetNotNull { table: table.clone(), column: column() }),
             (true, false) => changes.push(Change::DropNotNull { table: table.clone(), column: column() }),
@@ -109,13 +144,13 @@ mod tests {
     use super::*;
 
     fn col(name: &str, type_name: &str) -> Column {
-        Column { name: name.into(), type_name: type_name.into(), type_ref: None, not_null: false, default: None }
+        Column { name: name.into(), type_name: type_name.into(), type_ref: None, not_null: false, default: None, comment: None }
     }
 
     fn model(columns: Vec<Column>) -> Model {
         let mut m = Model::empty_database();
         let name = QualName::new("public", "t");
-        m.tables.insert(name.clone(), Table { name, columns });
+        m.tables.insert(name.clone(), Table { name, columns, comment: None });
         m
     }
 
@@ -154,5 +189,67 @@ mod tests {
                 Change::DropColumn { table: t, column: "gone".into(), type_ref: None },
             ]
         );
+    }
+
+    fn commented(comment: Option<&str>) -> Model {
+        let mut m = Model::empty_database();
+        m.schemas.insert("app".into(), pgmig_model::Schema { name: "app".into(), comment: comment.map(Into::into) });
+        let mut c = col("id", "integer");
+        c.comment = comment.map(Into::into);
+        let name = QualName::new("public", "t");
+        m.tables.insert(name.clone(), Table { name, columns: vec![c], comment: comment.map(Into::into) });
+        m
+    }
+
+    fn set(target: CommentTarget, comment: Option<&str>) -> Change {
+        Change::SetComment { target, comment: comment.map(Into::into) }
+    }
+
+    fn targets() -> [CommentTarget; 3] {
+        let t = QualName::new("public", "t");
+        [CommentTarget::Schema("app".into()), CommentTarget::Table(t.clone()), CommentTarget::Column(t, "id".into())]
+    }
+
+    #[test]
+    fn comments_are_set_changed_and_removed() {
+        for (from, to) in [(None, Some("a")), (Some("a"), Some("b")), (Some("a"), None)] {
+            let expected: Vec<Change> =
+                [targets()[0].clone(), targets()[1].clone(), targets()[2].clone()].into_iter().map(|t| set(t, to)).collect();
+            assert_eq!(diff(&commented(from), &commented(to)), expected, "{from:?} -> {to:?}");
+        }
+        let m = commented(Some("same"));
+        assert!(diff(&m, &m).is_empty());
+    }
+
+    #[test]
+    fn new_objects_carry_their_comments_and_dropped_ones_need_none() {
+        let mut with = commented(Some("c"));
+        with.schemas.remove("public");
+        let base = Model::default();
+        let created = diff(&base, &with);
+        assert!(created.iter().any(|c| matches!(c, Change::CreateTable(_))));
+        for t in targets() {
+            assert!(created.contains(&set(t, Some("c"))));
+        }
+        let dropped = diff(&with, &base);
+        assert!(!dropped.iter().any(|c| matches!(c, Change::SetComment { .. })), "{dropped:?}");
+    }
+
+    #[test]
+    fn a_comment_added_with_a_new_column_follows_the_column() {
+        let a = model(vec![col("id", "integer")]);
+        let mut n = col("note", "text");
+        n.comment = Some("hi".into());
+        let b = model(vec![col("id", "integer"), n.clone()]);
+        let t = QualName::new("public", "t");
+        assert_eq!(
+            diff(&a, &b),
+            vec![Change::AddColumn { table: t.clone(), column: n }, set(CommentTarget::Column(t, "note".into()), Some("hi"))]
+        );
+    }
+
+    #[test]
+    fn the_public_schemas_default_comment_is_not_a_difference() {
+        assert!(diff(&Model::empty_database(), &Model::empty_database()).is_empty());
     }
 }

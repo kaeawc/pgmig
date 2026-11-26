@@ -13,13 +13,17 @@ pub struct Model {
 }
 
 impl Model {
-    /// The model of a freshly created database: only the `public` schema.
+    /// The model of a freshly created database: only the `public` schema, with the comment
+    /// Postgres gives it ([`PUBLIC_SCHEMA_COMMENT`]).
     pub fn empty_database() -> Model {
         let mut m = Model::default();
-        m.schemas.insert("public".to_owned(), Schema { name: "public".to_owned() });
+        m.schemas.insert("public".to_owned(), Schema { name: "public".to_owned(), comment: Some(PUBLIC_SCHEMA_COMMENT.to_owned()) });
         m
     }
 }
+
+/// The comment a new database's `public` schema carries (Postgres 15 and later).
+pub const PUBLIC_SCHEMA_COMMENT: &str = "standard public schema";
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct QualName {
@@ -42,6 +46,8 @@ impl fmt::Display for QualName {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Schema {
     pub name: String,
+    /// `obj_description` of the schema.
+    pub comment: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +55,8 @@ pub struct Table {
     pub name: QualName,
     /// In `attnum` order. Postgres can't reorder columns, so diffs match columns by name.
     pub columns: Vec<Column>,
+    /// `obj_description` of the table.
+    pub comment: Option<String>,
 }
 
 impl Table {
@@ -68,6 +76,14 @@ pub struct Column {
     pub not_null: bool,
     /// `pg_get_expr(adbin, adrelid)`.
     pub default: Option<String>,
+    /// `col_description` of the column.
+    pub comment: Option<String>,
+}
+
+/// Quote a string as a SQL literal: single quotes doubled. Backslashes and newlines are kept as
+/// they are, which is right under `standard_conforming_strings` (on by default since 9.1).
+pub fn quote_literal(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "''"))
 }
 
 /// Quote an identifier the way Postgres' `quote_ident` does.
@@ -258,6 +274,22 @@ mod tests {
     #[test]
     fn keywords_sorted() {
         assert!(QUOTED_KEYWORDS.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn literal_quoting() {
+        assert_eq!(quote_literal("plain"), "'plain'");
+        assert_eq!(quote_literal(""), "''");
+        assert_eq!(quote_literal("it's"), "'it''s'");
+        assert_eq!(quote_literal("''"), "''''''");
+        assert_eq!(quote_literal("a\\b"), "'a\\b'");
+        assert_eq!(quote_literal("line1\nline2"), "'line1\nline2'");
+    }
+
+    #[test]
+    fn empty_database_has_the_public_comment() {
+        let m = Model::empty_database();
+        assert_eq!(m.schemas["public"].comment.as_deref(), Some("standard public schema"));
     }
 
     #[test]

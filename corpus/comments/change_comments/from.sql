@@ -1,0 +1,11 @@
+CREATE SCHEMA keep;
+CREATE SCHEMA gone_comment;
+COMMENT ON SCHEMA keep IS 'old schema comment';
+COMMENT ON SCHEMA gone_comment IS 'to be removed';
+CREATE TABLE keep.items (id int, name text, note text, extra text);
+COMMENT ON TABLE keep.items IS 'old table comment';
+COMMENT ON COLUMN keep.items.name IS 'old name comment';
+COMMENT ON COLUMN keep.items.note IS 'to be removed';
+CREATE TABLE keep.plain (id int);
+CREATE TABLE keep.dropped (id int);
+COMMENT ON TABLE keep.dropped IS 'dropped with its table';

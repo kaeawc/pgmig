@@ -6,6 +6,11 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
 
 ## [Unreleased]
 
+### Added
+
+- Comments on schemas, tables and columns are inspected and planned (`COMMENT ON`), after the
+  object they describe.
+
 ### Changed
 
 - Plans are ordered by a dependency graph: each statement runs after what it references, and drops
