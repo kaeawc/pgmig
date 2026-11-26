@@ -16,6 +16,7 @@ exclude = ["tests/"]
 doctest = false
 
 [dependencies]
+pgmig-config = { workspace = true }
 pgmig-conn = { workspace = true }
 pgmig-diff = { workspace = true }
 pgmig-inspect = { workspace = true }

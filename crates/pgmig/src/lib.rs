@@ -14,6 +14,8 @@ mod files;
 pub mod filter;
 
 pub use filter::{Filter, Pattern, PatternError, filter_model, scope_model};
+/// `pgmig.toml`: project configuration.
+pub use pgmig_config as config;
 pub use pgmig_conn::Conn;
 pub use pgmig_diff::{Change, diff};
 pub use pgmig_inspect::inspect;

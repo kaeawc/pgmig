@@ -65,6 +65,7 @@ run.
 - `crates/pgmig-conn` — synchronous `Conn` over the `postgres` crate (simple protocol, text values,
   SQLSTATE errors). Used for targets and for pgmem.
 - `crates/pgmig-shadow` — `Shadow`: embedded pgmem or an empty real Postgres, wiped after use.
+- `crates/pgmig-config` — `pgmig.toml`: environments, `${VAR}` interpolation, `config validate`.
 - `crates/pgmig-sql` — `split`: SQL text → statements with positions and `-- pgmig:` directives.
 - `crates/pgmig-inspect` — catalog queries → `Model`.
 - `crates/pgmig-diff` — `diff(a, b) -> Vec<Change>`.

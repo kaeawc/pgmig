@@ -8,6 +8,10 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
 
 ### Added
 
+- `pgmig.toml`: every command's options can come from a config file with top-level defaults and
+  `[env.<name>]` sections (`--env`, `--config`), `${VAR}` interpolation and `--var NAME=VALUE`;
+  flags win over the selected environment, which wins over the top level. `pgmig config validate`
+  checks the file. `schema apply` now shows the target (password redacted) and where it came from.
 - Migration directories: `<version>_<description>.sql` files and a `pgmig.sum` whose per-file
   hashes chain, so an edit, insertion or deletion is detected and parallel additions conflict in
   version control. `pgmig migrate hash` writes the sum file; `pgmig migrate validate` checks it and,

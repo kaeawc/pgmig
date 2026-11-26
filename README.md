@@ -27,6 +27,17 @@ cargo run -p pgmig-cli -- schema diff --from old.sql --to new.sql
 cargo run -p pgmig-cli -- schema inspect postgres://localhost/app
 ```
 
+Flags can live in `pgmig.toml` under their own names, with `[env.<name>]` sections selected by
+`--env` (see [DESIGN.md](DESIGN.md#configuration)); `pgmig config validate` checks the file:
+
+```toml
+shadow = "pgmem"
+to = "schema/"
+
+[env.local]
+url = "postgres://localhost/app"
+```
+
 `--shadow <url>` runs SQL files in an empty real Postgres database instead of pgmem (for
 extensions pgmem doesn't have).
 

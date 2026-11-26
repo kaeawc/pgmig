@@ -5,6 +5,7 @@
 //! Requests may leave out `shadow` (pgmem) and `options` (manage everything, database mode).
 //! Responses hold everything a caller prints: the plan, and the changes or model it was made from.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -175,6 +176,42 @@ impl MigrateValidateResponse {
     }
 }
 
+/// `config validate`. `Debug` shows the `vars` names only: their values may be secrets.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigValidateRequest {
+    /// The `pgmig.toml` to check.
+    pub path: PathBuf,
+    /// Also check that this `[env.<name>]` section exists and resolves; `None` checks the top level.
+    #[serde(default)]
+    pub env: Option<String>,
+    /// `--var` values for `${NAME}` placeholders; names not here come from the environment.
+    #[serde(default)]
+    pub vars: BTreeMap<String, String>,
+}
+
+impl std::fmt::Debug for ConfigValidateRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConfigValidateRequest")
+            .field("path", &self.path)
+            .field("env", &self.env)
+            .field("vars", &self.vars.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigValidateResponse {
+    /// Everything wrong with the file; empty when it is valid. Messages name keys, never values.
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+impl ConfigValidateResponse {
+    pub fn is_valid(&self) -> bool {
+        self.diagnostics.is_empty()
+    }
+}
+
 /// A stable identifier for each kind of failure, serialized in snake_case.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -233,6 +270,9 @@ pub enum ErrorCode {
     FileNotHashed,
     /// The files in the directory are in a different order than in the sum file.
     FileReordered,
+    /// `pgmig.toml` is invalid: a syntax error, an unknown key, an undefined `${NAME}`, an unknown
+    /// `--env`.
+    Config,
 }
 
 impl ErrorCode {
@@ -265,6 +305,7 @@ impl ErrorCode {
             ErrorCode::FileDeleted => "file_deleted",
             ErrorCode::FileNotHashed => "file_not_hashed",
             ErrorCode::FileReordered => "file_reordered",
+            ErrorCode::Config => "config",
         }
     }
 }
@@ -406,6 +447,41 @@ impl From<Error> for ApiError {
     }
 }
 
+impl ApiError {
+    /// One problem of a `pgmig.toml`, as a diagnostic.
+    pub fn config(path: &std::path::Path, problem: &crate::config::Problem) -> ApiError {
+        let mut e = ApiError::new(ErrorCode::Config, &problem.in_file(path));
+        e.file = Some(path.to_owned());
+        (e.line, e.col) = (problem.line, problem.col);
+        e
+    }
+}
+
+/// An unreadable file is `io`, a bad `--var` is `usage`, the rest `config` (positioned at the first
+/// problem; the message has them all).
+impl From<&crate::config::ConfigError> for ApiError {
+    fn from(e: &crate::config::ConfigError) -> ApiError {
+        use crate::config::ConfigError;
+        match e {
+            ConfigError::Io { path, .. } => ApiError::new(ErrorCode::Io, e).at(path, None),
+            ConfigError::Var { .. } | ConfigError::VarSyntax => ApiError::usage(e.to_string()),
+            ConfigError::Invalid { path, problems } => {
+                let mut err = ApiError::new(ErrorCode::Config, e).at(path, None);
+                if let Some(p) = problems.first() {
+                    (err.line, err.col) = (p.line, p.col);
+                }
+                err
+            }
+        }
+    }
+}
+
+impl From<crate::config::ConfigError> for ApiError {
+    fn from(e: crate::config::ConfigError) -> ApiError {
+        ApiError::from(&e)
+    }
+}
+
 impl From<&PatternError> for ApiError {
     fn from(e: &PatternError) -> ApiError {
         ApiError::new(ErrorCode::Pattern, e)
@@ -474,6 +550,14 @@ pub fn migrate_validate(req: &MigrateValidateRequest) -> Result<MigrateValidateR
         Err(e) if is_diagnostic(&e) => Ok(MigrateValidateResponse { diagnostics: vec![ApiError::from(&e)], replayed: false }),
         Err(e) => Err(e.into()),
     }
+}
+
+/// [`crate::config::validate`]: problems with the file are diagnostics; an `Err` means it could
+/// not be read.
+pub fn config_validate(req: &ConfigValidateRequest) -> Result<ConfigValidateResponse, ApiError> {
+    let vars = crate::config::Vars::new(req.vars.clone());
+    let problems = crate::config::validate(&req.path, req.env.as_deref(), &vars)?;
+    Ok(ConfigValidateResponse { diagnostics: problems.iter().map(|p| ApiError::config(&req.path, p)).collect() })
 }
 
 /// [`crate::schema_plan_apply`].
@@ -638,6 +722,7 @@ mod tests {
             FileDeleted,
             FileNotHashed,
             FileReordered,
+            Config,
         ] {
             assert_eq!(serde_json::to_string(&code).expect("serialize"), format!("\"{}\"", code.as_str()));
         }
