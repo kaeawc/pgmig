@@ -12,12 +12,14 @@ use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 
 pub mod api;
+pub mod edit;
 mod files;
 pub mod filter;
 pub mod migrate_apply;
 pub mod migrate_maintain;
 pub mod migrate_status;
 
+pub use edit::{EDITED_PLAN, edit_sql, plan_from_sql};
 pub use filter::{Filter, Pattern, PatternError, filter_model, scope_model, without_schema};
 pub use migrate_apply::{
     ApplyOptions, ExecOrder, FileReport, FileStatus, MigrateApplyReport, MigrationOutcome, StatementTiming, TxMode, migrate_apply,
@@ -163,7 +165,7 @@ pub enum Error {
         if *.partial { "started (not finished)" } else { "applied" }
     )]
     MigrationApplied { path: PathBuf, table: String, partial: bool },
-    /// `migrate edit`: the editor could not be run or failed.
+    /// `migrate edit` or `--edit`: the editor could not be run or failed.
     #[error("editor `{command}`: {reason}")]
     Editor { command: String, reason: String },
     /// `migrate apply` onto a database without history that already holds objects.
@@ -441,15 +443,23 @@ pub struct NewMigration {
 /// What [`migrate_diff`] found and wrote.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MigrateDiff {
-    /// The file written; `None` when there were no changes and nothing was written.
+    /// The file written; `None` when there were no changes (or the edit left no statement) and
+    /// nothing was written.
     pub written: Option<NewMigration>,
-    /// The changes from the replayed directory to the desired state that the file makes.
+    /// The changes from the replayed directory to the desired state that the plan makes.
     pub changes: Vec<Change>,
-    /// The changes the policy ([`Options::skip`]) left out of the file.
+    /// The changes the policy ([`Options::skip`]) left out of the plan.
     pub skipped: Vec<Skipped>,
-    /// The plan written to the file.
+    /// The plan from the replayed directory to the desired state.
     pub plan: Plan,
+    /// The file's contents: [`Plan::to_sql`], or what the editor saved.
+    pub sql: String,
+    /// Whether the plan was edited ([`migrate_diff_edited`]).
+    pub edited: bool,
 }
+
+/// The label errors give the text an editor saved for [`migrate_diff_edited`].
+pub const EDITED_MIGRATION: &str = "edited migration";
 
 /// `migrate diff`: the next migration of the directory at `dir`. The directory is checked against
 /// its sum file (it may be missing or empty: nothing to check) and replayed in a fresh shadow
@@ -462,12 +472,38 @@ pub struct MigrateDiff {
 /// [`schema_plan_apply`]). The version is the UTC time, or one more than the newest file's when
 /// that is not greater ([`pgmig_migrate::next_version`]); `name` is sanitized to `[a-z0-9_]`.
 pub fn migrate_diff(dir: &Path, name: &str, to: &Source, shadow: &ShadowSpec, opts: &Options) -> Result<MigrateDiff> {
-    migrate_diff_at(dir, name, to, shadow, opts, SystemTime::now())
+    migrate_diff_at(dir, name, to, shadow, opts, None, SystemTime::now())
 }
 
-fn migrate_diff_at(dir: &Path, name: &str, to: &Source, shadow: &ShadowSpec, opts: &Options, now: SystemTime) -> Result<MigrateDiff> {
+/// [`migrate_diff`], opening the plan in `editor` ([`edit_sql`]) before it is written: the file
+/// holds exactly what the editor saved, once it splits and its directives are well placed (as
+/// `migrate apply` reads them; errors name [`EDITED_MIGRATION`]). Text without a statement writes
+/// nothing; so does an editor that fails. With no changes the editor is not run.
+pub fn migrate_diff_edited(
+    dir: &Path,
+    name: &str,
+    to: &Source,
+    shadow: &ShadowSpec,
+    opts: &Options,
+    editor: &[String],
+) -> Result<MigrateDiff> {
+    migrate_diff_at(dir, name, to, shadow, opts, Some(editor), SystemTime::now())
+}
+
+fn migrate_diff_at(
+    dir: &Path,
+    name: &str,
+    to: &Source,
+    shadow: &ShadowSpec,
+    opts: &Options,
+    editor: Option<&[String]>,
+    now: SystemTime,
+) -> Result<MigrateDiff> {
     opts.validate()?;
     let description = description(name)?;
+    if editor.is_some_and(<[String]>::is_empty) {
+        return Err(Error::Options("no editor: set VISUAL or EDITOR".into()));
+    }
     // A directory that does not exist yet is an empty one; it is created when a file is written.
     let existing = if dir.exists() { Some(open_checked(dir)?) } else { None };
     // The replay's shadow is wiped (dropped) before `to`'s opens: a real Postgres shadow must start
@@ -485,8 +521,15 @@ fn migrate_diff_at(dir: &Path, name: &str, to: &Source, shadow: &ShadowSpec, opt
     let (changes, skipped) = opts.apply_policy(&diff_with_casts(&a, &b, loaded.conn()), &names);
     let plan = plan_with(&changes, &names)?;
     drop(loaded);
-    let written = if plan.is_empty() { None } else { Some(write_migration(dir, existing, &description, plan.to_sql(), now)?) };
-    Ok(MigrateDiff { written, changes, skipped, plan })
+    let mut sql = plan.to_sql();
+    let mut statements = plan.statements.len();
+    let edited = editor.is_some() && !plan.is_empty();
+    if let (Some(editor), true) = (editor, edited) {
+        sql = edit_sql(&sql, editor)?;
+        statements = edit::check_migration_sql(&sql, EDITED_MIGRATION)?;
+    }
+    let written = if statements == 0 { None } else { Some(write_migration(dir, existing, &description, sql.clone(), now)?) };
+    Ok(MigrateDiff { written, changes, skipped, plan, sql, edited })
 }
 
 /// `migrate new`: write an empty migration `<version>_<name>.sql` to the directory at `dir` (created

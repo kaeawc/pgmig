@@ -25,8 +25,8 @@ failure prints the error object ({\"code\", \"message\", \"sqlstate\", \"file\",
 \"apply\"}) on stdout and exits 1, or 2 when its code is \"usage\". Bad flags are reported by the
 argument parser as text on stderr (exit 2).
 
-Configuration: every flag except --dry-run, --auto-approve, --exit-code, --force, --baseline,
---allow-dirty and --no-lock can be set in
+Configuration: every flag except --dry-run, --auto-approve, --edit, --exit-code, --force,
+--baseline, --allow-dirty and --no-lock can be set in
 pgmig.toml (or the file given to --config), under the flag's name: `url`, `shadow`, `from`, `to`
 (also the SOURCE of `schema inspect`, `schema fingerprint` and `schema validate`, and the desired state of `migrate
 diff`), `include`, `exclude`, `schema`,
@@ -104,6 +104,11 @@ enum MigrateCommand {
         scope: ScopeArgs,
         #[command(flatten)]
         skip: SkipArg,
+        /// Open the plan in $VISUAL, else $EDITOR, else vi (split on whitespace; no shell) before
+        /// writing it: what you save is what is written (a file left without statements writes nothing), with no new diff. Needs a terminal; not with
+        /// --format json.
+        #[arg(long)]
+        edit: bool,
         #[command(flatten)]
         format: FormatArg,
     },
@@ -337,7 +342,19 @@ impl GuardArgs {
     }
 }
 
-/// The editor of `migrate edit`: $VISUAL, else $EDITOR, else `vi`, split on whitespace.
+/// `--edit` needs a terminal for the editor, and text output: refused (usage error, exit 2) before
+/// any work otherwise.
+fn check_edit(format: Format) -> anyhow::Result<()> {
+    if format == Format::Json {
+        return Err(ApiError::usage("--edit opens an editor, which --format json never does; drop one of them").into());
+    }
+    if !std::io::stdin().is_terminal() {
+        return Err(ApiError::usage("stdin is not a terminal, so pgmig cannot run an editor for --edit").into());
+    }
+    Ok(())
+}
+
+/// The editor of `migrate edit` and `--edit`: $VISUAL, else $EDITOR, else `vi`, split on whitespace.
 fn editor() -> Vec<String> {
     let var = |k| std::env::var(k).ok().filter(|v: &String| !v.trim().is_empty());
     let cmd = var("VISUAL").or_else(|| var("EDITOR")).unwrap_or_else(|| "vi".to_owned());
@@ -434,6 +451,11 @@ enum SchemaCommand {
         /// Apply without asking. Required when stdin is not a terminal.
         #[arg(long)]
         auto_approve: bool,
+        /// Open the plan in $VISUAL, else $EDITOR, else vi (split on whitespace; no shell) before
+        /// showing and applying it: what you save is what runs (a `-- pgmig:commit` line marks one commit point), with no new diff. Needs a terminal; not with
+        /// --format json.
+        #[arg(long)]
+        edit: bool,
         #[command(flatten)]
         format: FormatArg,
         /// With --dry-run, exit with status 3 when there are changes.
@@ -775,7 +797,10 @@ fn run(cli: Cli, loaded: &Loaded, format: Format) -> anyhow::Result<ExitCode> {
     };
     let s = settings;
     match command {
-        SchemaCommand::Apply { url, to, shadow, scope, skip, dry_run, auto_approve, format: _, exit_code } => {
+        SchemaCommand::Apply { url, to, shadow, scope, skip, dry_run, auto_approve, edit, format: _, exit_code } => {
+            if edit {
+                check_edit(format)?;
+            }
             let source = match &url {
                 Some(_) => "--url".to_owned(),
                 None => loaded.url_source.clone().unwrap_or_else(|| "`url` in the config file".to_owned()),
@@ -788,7 +813,8 @@ fn run(cli: Cli, loaded: &Loaded, format: Format) -> anyhow::Result<ExitCode> {
                 shadow: shadow.spec(s),
                 options: skip.add_to(scope.options(s)?, s)?,
             };
-            return schema_apply(req, &shown, dry_run, auto_approve, format, exit_code);
+            let flags = ApplyFlags { dry_run, auto_approve, edit, exit_code };
+            return schema_apply(req, &shown, flags, format);
         }
         SchemaCommand::Diff { from, to, shadow, scope, skip, format: _, exit_code } => {
             let req = api::DiffRequest {
@@ -867,13 +893,17 @@ fn migrate(command: MigrateCommand, s: &Settings, format: Format) -> anyhow::Res
                 Format::Json => print_json(&res)?,
             }
         }
-        MigrateCommand::Diff { name, dir: d, to, shadow, scope, skip, format: _ } => {
+        MigrateCommand::Diff { name, dir: d, to, shadow, scope, skip, edit, format: _ } => {
+            if edit {
+                check_edit(format)?;
+            }
             let req = api::MigrateDiffRequest {
                 dir: dir(d)?,
                 name,
                 to: Source::parse(&need(to, s.to.clone(), "--to", "to")?),
                 shadow: shadow.spec(s),
                 options: skip.add_to(scope.options(s)?, s)?,
+                editor: edit.then(editor),
             };
             let res = api::migrate_diff(&req)?;
             if format == Format::Text {
@@ -881,10 +911,12 @@ fn migrate(command: MigrateCommand, s: &Settings, format: Format) -> anyhow::Res
             }
             match format {
                 Format::Text => match &res.file {
+                    Some(file) if res.edited => eprintln!("wrote {} (as edited)", file.display()),
                     Some(file) => {
                         let n = res.plan.statements.len();
                         eprintln!("wrote {} ({n} statement{})", file.display(), if n == 1 { "" } else { "s" });
                     }
+                    None if res.edited => eprintln!("the edited migration has no statements: nothing written"),
                     None => eprintln!("no changes"),
                 },
                 Format::Json => print_json(&res)?,
@@ -1171,24 +1203,24 @@ struct ApplyOutput<'a> {
     report: Option<pgmig::ApplyReport>,
 }
 
-/// Shows the plan, asks (unless told not to), then applies it. In JSON mode it never asks and
-/// prints one document at the end.
-fn schema_apply(
-    req: api::PlanApplyRequest,
-    target: &Target,
+/// The flags of `schema apply` that decide what [`schema_apply`] does with the plan.
+struct ApplyFlags {
     dry_run: bool,
     auto_approve: bool,
-    format: Format,
+    edit: bool,
     exit_code: bool,
-) -> anyhow::Result<ExitCode> {
+}
+
+/// Shows the plan (with --edit, as edited), asks (unless told not to), then applies it. In JSON
+/// mode it never asks and prints one document at the end.
+fn schema_apply(req: api::PlanApplyRequest, target: &Target, flags: ApplyFlags, format: Format) -> anyhow::Result<ExitCode> {
+    let ApplyFlags { dry_run, auto_approve, edit, exit_code } = flags;
     let json = format == Format::Json;
-    let res = api::schema_plan_apply(&req)?;
+    let mut res = api::schema_plan_apply(&req)?;
     if !json {
         print_skipped(&res.skipped);
     }
-    let changes = !res.plan.is_empty();
-    let dry_code = if dry_run && exit_code && changes { ExitCode::from(CHANGES) } else { ExitCode::SUCCESS };
-    if !changes {
+    if res.plan.is_empty() {
         if json {
             print_json(&ApplyOutput { target, plan: res, applied: false, report: None })?;
         } else {
@@ -1196,6 +1228,17 @@ fn schema_apply(
         }
         return Ok(ExitCode::SUCCESS);
     }
+    if edit {
+        // What the editor saves is the plan from here on: `changes` still says what the diff found.
+        let edited = api::edit_plan(&api::EditPlanRequest { plan: res.plan, editor: editor() })?;
+        if edited.plan.is_empty() {
+            eprintln!("the edited plan has no statements: nothing to apply");
+            return Ok(ExitCode::SUCCESS);
+        }
+        res.sql = edited.plan.to_sql();
+        res.plan = edited.plan;
+    }
+    let dry_code = if dry_run && exit_code { ExitCode::from(CHANGES) } else { ExitCode::SUCCESS };
     if !json {
         print!("{}", res.plan.to_sql());
         std::io::stdout().flush()?;

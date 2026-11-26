@@ -2,6 +2,8 @@
 mod apply;
 mod apply_report;
 mod config;
+#[cfg(unix)]
+mod edit;
 mod filters;
 mod json;
 mod migrate;

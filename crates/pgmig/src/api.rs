@@ -126,6 +126,25 @@ pub struct PlanApplyResponse {
     pub sql: String,
 }
 
+/// `schema apply --edit`: open a plan in an editor and read back the plan it saves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditPlanRequest {
+    pub plan: Plan,
+    /// The editor and its arguments; the temp file's path is added last. Run without a shell, and
+    /// it needs a terminal.
+    pub editor: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EditPlanResponse {
+    /// The saved text as a plan ([`crate::plan_from_sql`]): exactly what [`apply`] runs, with no
+    /// new diff. Empty when every statement was deleted.
+    pub plan: Plan,
+    /// The text the editor saved.
+    pub sql: String,
+}
+
 /// `schema apply`, second half: run a plan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -217,6 +236,11 @@ pub struct MigrateDiffRequest {
     pub shadow: ShadowSpec,
     #[serde(default)]
     pub options: Options,
+    /// Open the plan in this editor (a program and its arguments; the file's path is added last,
+    /// no shell) before writing it, and write what it saves ([`crate::migrate_diff_edited`]). It
+    /// needs a terminal: null (the default) never runs one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -231,8 +255,12 @@ pub struct MigrateDiffResponse {
     /// The changes the options' policy (`skip`) left out of the file.
     #[serde(default)]
     pub skipped: Vec<Skipped>,
-    /// `plan` rendered as a SQL script ([`Plan::to_sql`]): the new file's contents.
+    /// The new file's contents: `plan` rendered as a SQL script ([`Plan::to_sql`]), or with
+    /// `editor`, what the editor saved.
     pub sql: String,
+    /// Whether the editor was run (only with `editor`, and changes to edit).
+    #[serde(default)]
+    pub edited: bool,
 }
 
 /// `migrate new`.
@@ -929,9 +957,12 @@ pub fn migrate_validate(req: &MigrateValidateRequest) -> Result<MigrateValidateR
 
 /// [`crate::migrate_diff`].
 pub fn migrate_diff(req: &MigrateDiffRequest) -> Result<MigrateDiffResponse, ApiError> {
-    let res = crate::migrate_diff(&req.dir, &req.name, &req.to, &req.shadow, &req.options)?;
+    let res = match &req.editor {
+        Some(editor) => crate::migrate_diff_edited(&req.dir, &req.name, &req.to, &req.shadow, &req.options, editor)?,
+        None => crate::migrate_diff(&req.dir, &req.name, &req.to, &req.shadow, &req.options)?,
+    };
     let (file, version) = res.written.map(|w| (w.path, w.version)).unzip();
-    Ok(MigrateDiffResponse { file, version, sql: res.plan.to_sql(), plan: res.plan, changes: res.changes, skipped: res.skipped })
+    Ok(MigrateDiffResponse { file, version, sql: res.sql, plan: res.plan, changes: res.changes, skipped: res.skipped, edited: res.edited })
 }
 
 /// [`crate::migrate_new`].
@@ -1000,6 +1031,12 @@ pub fn schema_plan_apply(req: &PlanApplyRequest) -> Result<PlanApplyResponse, Ap
     Ok(PlanApplyResponse { sql: d.plan.to_sql(), plan: d.plan, changes: d.changes, skipped: d.skipped })
 }
 
+/// [`crate::edit_sql`] on the plan's SQL, then [`crate::plan_from_sql`] on what was saved.
+pub fn edit_plan(req: &EditPlanRequest) -> Result<EditPlanResponse, ApiError> {
+    let sql = crate::edit_sql(&req.plan.to_sql(), &req.editor)?;
+    Ok(EditPlanResponse { plan: crate::plan_from_sql(&sql)?, sql })
+}
+
 /// [`crate::apply`].
 pub fn apply(req: &ApplyRequest) -> Result<ApplyResponse, ApiError> {
     Ok(crate::apply(&req.target, &req.plan)?)
@@ -1049,7 +1086,18 @@ mod tests {
             to: migrations.clone(),
             shadow: pg_spec(),
             options: options(),
+            editor: None,
         });
+        assert!(!json.contains("editor"), "{json}");
+        round_trip(&MigrateDiffRequest {
+            dir: "m".into(),
+            name: "x".into(),
+            to: migrations.clone(),
+            shadow: ShadowSpec::Pgmem,
+            options: Options::default(),
+            editor: Some(vec!["code".into(), "-w".into()]),
+        });
+        round_trip(&EditPlanRequest { plan: plan(), editor: vec!["vi".into()] });
         assert!(json.contains(r#""to":{"kind":"migrations","data":"migrations"}"#), "{json}");
         round_trip(&MigrateNewRequest { dir: "migrations".into(), name: "x".into() });
         let req: MigrateDiffRequest =
@@ -1113,7 +1161,9 @@ mod tests {
             sql: plan().to_sql(),
             changes: vec![],
             skipped: vec![],
+            edited: true,
         });
+        round_trip(&EditPlanResponse { plan: plan(), sql: plan().to_sql() });
         round_trip(&MigrateNewResponse { file: "m/1_a.sql".into(), version: "1".into() });
         let load = ApiError {
             code: ErrorCode::Load,
