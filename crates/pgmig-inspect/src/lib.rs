@@ -37,11 +37,14 @@ pub fn inspect(conn: &mut Conn) -> Result<Model> {
 
     let columns = format!(
         "SELECT n.nspname, c.relname, a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull, \
-                pg_get_expr(d.adbin, d.adrelid) \
+                pg_get_expr(d.adbin, d.adrelid), tn.nspname, COALESCE(e.typname, t.typname) \
          FROM pg_attribute a \
          JOIN pg_class c ON c.oid = a.attrelid \
          JOIN pg_namespace n ON n.oid = c.relnamespace \
          LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
+         LEFT JOIN pg_type t ON t.oid = a.atttypid \
+         LEFT JOIN pg_type e ON e.typarray = a.atttypid \
+         LEFT JOIN pg_namespace tn ON tn.oid = COALESCE(e.typnamespace, t.typnamespace) \
          WHERE c.relkind IN ('r', 'p') AND a.attnum > 0 AND NOT a.attisdropped AND {USER_SCHEMA} \
          ORDER BY 1, 2, a.attnum"
     );
@@ -52,6 +55,7 @@ pub fn inspect(conn: &mut Conn) -> Result<Model> {
             type_name: text(&row, 3, "columns")?,
             not_null: text(&row, 4, "columns")? == "t",
             default: row.get(5).cloned().flatten(),
+            type_ref: type_ref(&row),
         };
         if let Some(t) = model.tables.get_mut(&table) {
             t.columns.push(column);
@@ -59,6 +63,14 @@ pub fn inspect(conn: &mut Conn) -> Result<Model> {
     }
 
     Ok(model)
+}
+
+/// The column's type when it lives in a user schema: columns 6 (schema) and 7 (name).
+fn type_ref(row: &Row) -> Option<QualName> {
+    let schema = row.get(6).cloned().flatten()?;
+    let name = row.get(7).cloned().flatten()?;
+    let system = schema == "pg_catalog" || schema == "information_schema" || schema.starts_with("pg_");
+    (!system).then(|| QualName::new(schema, name))
 }
 
 fn run(conn: &mut Conn, what: &'static str, sql: &str) -> Result<Vec<Row>> {

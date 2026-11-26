@@ -62,6 +62,9 @@ pub struct Column {
     pub name: String,
     /// `format_type(atttypid, atttypmod)`.
     pub type_name: String,
+    /// The user-defined type the column uses (the element type for an array), from `pg_type`;
+    /// `None` for types in system schemas. A table's row type has the table's name.
+    pub type_ref: Option<QualName>,
     pub not_null: bool,
     /// `pg_get_expr(adbin, adrelid)`.
     pub default: Option<String>,
