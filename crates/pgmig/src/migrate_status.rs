@@ -196,8 +196,10 @@ pub fn migrate_status(target: &str, dir: &Path, revisions_schema: &str) -> Resul
                     (None, Some(e)) => issue(
                         IssueKind::Failed,
                         format!("{} failed ({done}): {e}", f.name),
-                        "fix the failing statement (or what it depends on) and run `pgmig migrate apply`: it retries the file after the \
-                         statements already committed"
+                        "the statements before the failing one are applied and recorded. Fix the failing statement (or what it depends on) \
+                         and edit only it and the statements after it, then run `pgmig migrate hash` and `pgmig migrate apply`: it resumes at the \
+                         failing statement. Changing an applied statement makes `apply` refuse; `pgmig migrate set <version> --force` records the \
+                         file as complete instead"
                             .into(),
                     ),
                     (None, None) => issue(

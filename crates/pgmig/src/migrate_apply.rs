@@ -297,7 +297,9 @@ pub(crate) fn outcome_message(outcome: MigrationOutcome, applied_files: usize) -
             "the file's transaction since its last commit point was rolled back; the statements committed before it stay applied, and running again resumes after them{earlier}"
         ),
         MigrationOutcome::Partial => {
-            format!("no transaction: the statements before it stay applied, and running again resumes after them{earlier}")
+            format!(
+                "no transaction: the statements before it stay applied. To recover, fix it or anything after it (statements before it must not change), run `pgmig migrate hash`, and run apply again: it resumes at the failing statement. Or record the file as complete with `pgmig migrate set <version> --force`{earlier}"
+            )
         }
         MigrationOutcome::Unknown => {
             format!("the connection failed during COMMIT, so the file may or may not be applied; check the revisions table{earlier}")
@@ -691,7 +693,7 @@ fn check_resume(p: &Prepared, r: &Revision) -> Result<()> {
     for (i, (want, s)) in r.partial_hashes.iter().zip(&p.sql.statements).enumerate() {
         if *want != history::statement_hash(&s.sql) {
             return refuse(format!(
-                "statement {} (line {}) was applied and has changed since; restore it, or fix the row with `pgmig migrate set`",
+                "statement {} (line {}) was applied and has changed since; restore it (only statements after the applied ones may change), or accept the change by recording the file with `pgmig migrate set <version> --force`",
                 i + 1,
                 s.pos.line
             ));
