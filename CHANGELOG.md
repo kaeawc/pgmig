@@ -21,6 +21,9 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
   runs in a transaction; a failure rolls it back and names the statement and how many earlier
   batches stayed applied. `--dry-run` prints the plan; without a terminal it needs
   `--auto-approve`.
+- TLS for target and shadow connections (rustls, no OpenSSL): `sslmode` disable, prefer (the new
+  default; falls back to plaintext when the handshake fails), require, verify-ca and verify-full,
+  with `sslrootcert` or the bundled Mozilla roots. Building now needs a C compiler (for `ring`).
 - `--include` / `--exclude` globs over `[kind:]schema.object[.column]` on `schema diff`, `inspect`
   and `apply`, applied to both sides. `--schema <name>` manages one schema and prints unqualified
   names; `apply` always executes qualified names.

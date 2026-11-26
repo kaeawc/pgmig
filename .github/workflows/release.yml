@@ -87,6 +87,9 @@ jobs:
           persist-credentials: false
       - run: rustup show active-toolchain || rustup toolchain install
       - run: rustup target add ${{ matrix.target }}
+      # ring (rustls' crypto) compiles a little C and assembly; musl targets need musl-gcc.
+      - if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo build --locked --profile dist -p pgmig-cli --target ${{ matrix.target }}
       - name: Package
         shell: bash

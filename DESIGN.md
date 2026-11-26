@@ -61,7 +61,7 @@ one integration-test binary per crate, injected clock, doctests off).
 |---|---|
 | `pgmig-model` | The schema model: object kinds, identities, references; canonical serialization and the schema fingerprint (`INS-4`). No I/O. |
 | `pgmig-sql` | Statement splitting (dollar quotes, `-- pgmig:` directives), SQL quoting and printing helpers, source positions for diagnostics. |
-| `pgmig-conn` | A synchronous `Conn` (`batch`, `query` returning text values, SQLSTATE errors) over the `postgres` crate, used for real servers and for pgmem alike. TLS (rustls) comes in M1. |
+| `pgmig-conn` | A synchronous `Conn` (`batch`, `query` returning text values, SQLSTATE errors) over the `postgres` crate, used for real servers and for pgmem alike. TLS on rustls (`ring`), chosen by the conninfo's `sslmode` (`disable` to `verify-full`) and `sslrootcert`. |
 | `pgmig-shadow` | The shadow database: create, wipe, load SQL files with errors mapped back to file and line, and fork (`SHD-1..4`). |
 | `pgmig-inspect` | Catalog queries → `Model`, per Postgres major version, scoped by include/exclude filters. |
 | `pgmig-diff` | `Model × Model → Vec<Change>`. |
