@@ -281,14 +281,38 @@ the plan that would bring the live database back to the expected state, plus a n
 `pgmig.toml`, TOML so it needs no new language:
 
 ```toml
-[env.local]
-url = "postgres://localhost/app"
 shadow = "pgmem"                       # or a DSN
-schema = ["schema/"]
+to = "schema/"                         # the desired state
 exclude = ["public.tmp_*"]
 
-[env.local.migrations]
+[migrations]
 dir = "migrations"
+
+[env.local]
+url = "postgres://localhost/app"
+
+[env.prod]
+url = "host=db user=app password=${PGPASSWORD}"
+schema = "app"
+```
+
+Keys are named after the flags they stand for: `url`, `shadow`, `from`, `to` (also the source of
+`schema inspect` and `schema validate`), `include`, `exclude`, `schema` (the `--schema` scope),
+`format`, and `migrations.dir` (`--dir`). Top-level keys apply to every environment;
+`[env.<name>]`, selected with `--env`, overrides them key by key (arrays replace), and a flag wins
+over both. `--dry-run`, `--auto-approve` and `--exit-code` stay on the command line. Unknown keys
+are errors, so a typo never silently falls back to a default.
+
+`${VAR}` interpolates `--var VAR=value`, or else the environment variable; `$${` is a literal `${`.
+Only the top level and the selected environment are interpolated, so another environment's
+variables need not be set. Errors name keys and variables, never values (URLs hold passwords).
+The file is `--config <path>`, or `pgmig.toml` in the current directory; parent directories are not
+searched. `pgmig config validate` checks it.
+
+Later sections, rejected as unknown keys until they exist:
+
+```toml
+[env.local.migrations]
 revisions_schema = "pgmig"
 tx_mode = "file"
 
@@ -300,9 +324,6 @@ concurrent_index = true
 "lock/*" = "error"
 "naming/table" = { level = "warn", pattern = "^[a-z_]+$" }
 ```
-
-`${VAR}` interpolates environment variables; `--var` overrides. Top-level sections apply to every
-environment; `[env.<name>.*]` overrides them.
 
 ## Errors
 
