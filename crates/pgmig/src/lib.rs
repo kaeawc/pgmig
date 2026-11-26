@@ -32,7 +32,7 @@ pub use migrate_status::{
 /// `pgmig.toml`: project configuration.
 pub use pgmig_config as config;
 pub use pgmig_conn::Conn;
-pub use pgmig_diff::{Change, diff};
+pub use pgmig_diff::{Change, ChangeKind, UnknownKind, diff};
 pub use pgmig_inspect::inspect;
 /// What a database's history leaves to apply, lock keys and statement hashes.
 pub use pgmig_migrate::history;
@@ -40,7 +40,7 @@ pub use pgmig_migrate::history;
 pub use pgmig_migrate::revisions;
 pub use pgmig_migrate::{Dir as MigrationDir, SUM_FILE, SumFile, SumLine, ValidateError as ChecksumError};
 pub use pgmig_model::{Model, fingerprint};
-pub use pgmig_plan::{Plan, PlanOptions, plan, plan_with};
+pub use pgmig_plan::{Cause as SkipCause, Plan, PlanOptions, Skipped, plan, plan_with};
 pub use pgmig_shadow::{PUBLIC_COMMENT as PUBLIC_SCHEMA_COMMENT_SQL, Shadow};
 
 #[derive(Debug, thiserror::Error)]
@@ -258,9 +258,9 @@ impl ShadowSpec {
     }
 }
 
-/// What pgmig manages, and how it prints names. Serialized as
-/// `{"filter": {...}, "schema": ..., "revisions_schema": ...}`; each may be left out, and
-/// `revisions_schema` is left out when it is the default.
+/// What pgmig manages, how it prints names, and which changes it never plans. Serialized as
+/// `{"filter": {...}, "schema": ..., "revisions_schema": ..., "skip": [...]}`; each may be left
+/// out, `revisions_schema` is left out when it is the default and `skip` when it is empty.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Options {
@@ -278,11 +278,17 @@ pub struct Options {
     /// would drop the table that records the applied migrations.
     #[serde(skip_serializing_if = "is_default_revisions_schema", deserialize_with = "revisions_schema_name")]
     pub revisions_schema: String,
+    /// The diff policy: kinds of change `schema diff`, `schema apply` and `migrate diff` never
+    /// plan, by name (`"drop_table"`; an unknown name is an error). They are left out with the
+    /// changes that depend on them and reported as skipped (see [`pgmig_plan::policy`]). Other
+    /// commands plan from an empty database, where the policy does not apply.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skip: Vec<ChangeKind>,
 }
 
 impl Default for Options {
     fn default() -> Options {
-        Options { filter: Filter::default(), schema: None, revisions_schema: revisions::DEFAULT_SCHEMA.to_owned() }
+        Options { filter: Filter::default(), schema: None, revisions_schema: revisions::DEFAULT_SCHEMA.to_owned(), skip: Vec::new() }
     }
 }
 
@@ -328,6 +334,12 @@ impl Options {
     /// How printed plans name objects under these options.
     pub fn plan_options(&self) -> PlanOptions {
         PlanOptions { unqualified_schema: self.schema.clone() }
+    }
+
+    /// The changes of `changes` to plan under [`Options::skip`], and those left out, statements
+    /// printed as `names` says.
+    pub fn apply_policy(&self, changes: &[Change], names: &PlanOptions) -> (Vec<Change>, Vec<Skipped>) {
+        pgmig_plan::skip(changes, &self.skip.iter().copied().collect(), names)
     }
 
     /// What a new database holds, as these options see it.
@@ -431,8 +443,10 @@ pub struct NewMigration {
 pub struct MigrateDiff {
     /// The file written; `None` when there were no changes and nothing was written.
     pub written: Option<NewMigration>,
-    /// The changes from the replayed directory to the desired state.
+    /// The changes from the replayed directory to the desired state that the file makes.
     pub changes: Vec<Change>,
+    /// The changes the policy ([`Options::skip`]) left out of the file.
+    pub skipped: Vec<Skipped>,
     /// The plan written to the file.
     pub plan: Plan,
 }
@@ -441,7 +455,8 @@ pub struct MigrateDiff {
 /// its sum file (it may be missing or empty: nothing to check) and replayed in a fresh shadow
 /// database, `to` is loaded in another, and the plan between them, for the objects `opts` manages,
 /// is written as `<version>_<name>.sql` ([`Plan::to_sql`], commit points included) and the sum
-/// file rehashed. With no changes nothing is written.
+/// file rehashed. With no changes nothing is written. Changes the policy skips
+/// ([`Options::skip`]) are not in the file; with only those, nothing is written.
 ///
 /// The file will be executed, so its names are schema-qualified in schema mode too (see
 /// [`schema_plan_apply`]). The version is the UTC time, or one more than the newest file's when
@@ -466,11 +481,12 @@ fn migrate_diff_at(dir: &Path, name: &str, to: &Source, shadow: &ShadowSpec, opt
     };
     let (b, mut loaded) = open_model(to, shadow)?;
     let b = opts.managed(&b);
-    let changes = diff_with_casts(&a, &b, loaded.conn());
-    let plan = plan_with(&changes, &PlanOptions::default())?;
+    let names = PlanOptions::default();
+    let (changes, skipped) = opts.apply_policy(&diff_with_casts(&a, &b, loaded.conn()), &names);
+    let plan = plan_with(&changes, &names)?;
     drop(loaded);
     let written = if plan.is_empty() { None } else { Some(write_migration(dir, existing, &description, plan.to_sql(), now)?) };
-    Ok(MigrateDiff { written, changes, plan })
+    Ok(MigrateDiff { written, changes, skipped, plan })
 }
 
 /// `migrate new`: write an empty migration `<version>_<name>.sql` to the directory at `dir` (created
@@ -589,22 +605,32 @@ pub fn schema_validate(source: &Source, shadow: &ShadowSpec) -> Result<()> {
     }
 }
 
-/// `schema diff`: the plan that turns `from` into `to`, for the objects `opts` manages.
+/// `schema diff`: the plan that turns `from` into `to`, for the objects `opts` manages, without the
+/// changes its policy skips ([`Options::skip`]).
 pub fn schema_diff(from: &Source, to: &Source, shadow: &ShadowSpec, opts: &Options) -> Result<Plan> {
-    diff_sources(from, to, shadow, opts, &opts.plan_options()).map(|(_, plan)| plan)
+    diff_sources(from, to, shadow, opts, &opts.plan_options()).map(|d| d.plan)
 }
 
-/// The changes that turn `from` into `to` for the objects `opts` manages, and their plan, naming
-/// them as `names` says.
-fn diff_sources(from: &Source, to: &Source, shadow: &ShadowSpec, opts: &Options, names: &PlanOptions) -> Result<(Vec<Change>, Plan)> {
+/// What [`diff_sources`] found.
+struct Diffed {
+    /// The changes the plan makes.
+    changes: Vec<Change>,
+    /// The changes the policy left out.
+    skipped: Vec<Skipped>,
+    plan: Plan,
+}
+
+/// The changes that turn `from` into `to` for the objects `opts` manages, under its policy, and
+/// their plan, naming them as `names` says.
+fn diff_sources(from: &Source, to: &Source, shadow: &ShadowSpec, opts: &Options, names: &PlanOptions) -> Result<Diffed> {
     opts.validate()?;
     // `from`'s shadow is wiped before `to`'s opens: a real Postgres shadow must start empty.
     let a = opts.managed(&load_model(from, shadow)?);
     let (b, mut loaded) = open_model(to, shadow)?;
     let b = opts.managed(&b);
-    let changes = diff_with_casts(&a, &b, loaded.conn());
+    let (changes, skipped) = opts.apply_policy(&diff_with_casts(&a, &b, loaded.conn()), names);
     let plan = plan_with(&changes, names)?;
-    Ok((changes, plan))
+    Ok(Diffed { changes, skipped, plan })
 }
 
 /// `diff(a, b)`, with each type change that has no assignment cast converting `USING` an explicit
@@ -658,12 +684,13 @@ fn inspect_source(source: &Source, shadow: &ShadowSpec, opts: &Options) -> Resul
 /// The plan is executed, so its names are always schema-qualified, in schema mode too: there
 /// `DROP TABLE x` would drop whichever `x` the target's `search_path` finds first, which need not
 /// be the managed schema's. Schema mode still limits which objects are managed.
+/// Changes the policy skips ([`Options::skip`]) are left out.
 pub fn schema_plan_apply(target: &str, desired: &Source, shadow: &ShadowSpec, opts: &Options) -> Result<Plan> {
-    plan_apply_changes(target, desired, shadow, opts).map(|(_, plan)| plan)
+    plan_apply_changes(target, desired, shadow, opts).map(|d| d.plan)
 }
 
-/// [`schema_plan_apply`], with the changes the plan makes.
-fn plan_apply_changes(target: &str, desired: &Source, shadow: &ShadowSpec, opts: &Options) -> Result<(Vec<Change>, Plan)> {
+/// [`schema_plan_apply`], with the changes the plan makes and those it skips.
+fn plan_apply_changes(target: &str, desired: &Source, shadow: &ShadowSpec, opts: &Options) -> Result<Diffed> {
     opts.validate()?;
     diff_sources(&Source::Database(target.to_owned()), desired, shadow, opts, &PlanOptions::default())
 }

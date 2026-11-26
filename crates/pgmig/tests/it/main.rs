@@ -14,6 +14,7 @@ mod migrate_diff;
 mod migrate_maintain;
 mod migrate_resume;
 mod migrate_status;
+mod policy;
 mod quoting;
 mod revisions;
 mod search_path;

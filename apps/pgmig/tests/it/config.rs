@@ -98,6 +98,25 @@ fn diff_runs_from_the_config_file_alone() {
 }
 
 #[test]
+fn diff_skip_comes_from_the_config_file() {
+    let (shadow, _keep) = shadow_arg();
+    let p = project(&shadow, "[diff]\nskip = [\"drop_table\"]\n");
+    p.write("pgmig.toml", &format!("shadow = {}\nfrom = \"b.sql\"\nto = \"a.sql\"\n[diff]\nskip = [\"drop_table\"]\n", toml_str(&shadow)));
+    let out = p.run(&["schema", "diff"]);
+    assert_eq!(ok(&out), "");
+    assert_eq!(stderr(&out), "skipped drop_table public.b (policy)\n");
+    // A --skip flag replaces the list.
+    let out = p.run(&["schema", "diff", "--skip", "drop_column"]);
+    assert_eq!(ok(&out), "DROP TABLE public.b;\n");
+    assert_eq!(stderr(&out), "");
+    // An unknown kind is a config error naming the key.
+    p.write("pgmig.toml", "[diff]\nskip = [\"drop_tabel\"]\n");
+    let out = p.run(&["schema", "diff"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("pgmig.toml: diff.skip[0]: unknown kind of change \"drop_tabel\""), "{}", stderr(&out));
+}
+
+#[test]
 fn flags_win_over_the_config_file() {
     let (shadow, _keep) = shadow_arg();
     let p = project(&shadow, "exclude = [\"public.c\"]\nformat = \"json\"\n");

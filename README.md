@@ -53,6 +53,25 @@ schema. Without it, every schema is managed and names are qualified.
 Databases are inspected with `search_path` set to `pg_catalog` alone, so a role's or session's
 `search_path` does not change how a schema prints.
 
+`--skip <kind>` (repeatable; on `schema diff`, `schema apply` and `migrate diff`; config: `[diff]
+skip = ["drop_table", ...]`, used when no flag is given) never plans that kind of change. Kinds are
+the `kind` names of the JSON changes (`drop_table`, `drop_column`, `drop_schema`, `drop_sequence`,
+`drop_constraint`, `alter_column_type`, `add_enum_value`, ...). A change that cannot run without a
+skipped one is skipped too: a schema whose table is kept, a column or identity whose sequence is
+kept (`drop_sequence`), a foreign key over a column keeping its type, a default naming an enum
+value not added. Skipped changes are printed on stderr (`skipped drop_schema app (because
+drop_table app.t is skipped)`), and since the difference stays, every later diff finds them again.
+
+| `skipped[]` field | Meaning |
+| --- | --- |
+| `kind` | The change's kind. |
+| `object` | What it is about: `app`, `public.t`, `public.t.c`. |
+| `statement` | The SQL it would have run (null for an unsupported enum change). |
+| `because` | Null when its kind is skipped; otherwise `{kind, object}` of the skipped change it needs. |
+
+The JSON responses of `schema diff`, `schema apply` and `migrate diff` carry `skipped` (empty
+without a policy); `changes` and the plan leave those changes out.
+
 `--format json` (on `inspect`, `diff`, `validate` and `apply`) prints the command's response as one
 pretty-printed JSON document on stdout and nothing on stderr; a failure prints the error object
 (`code`, `message`, `sqlstate`, `file`, `line`, `col`, `apply`) on stdout instead. Bad flags are
@@ -78,7 +97,8 @@ A failure prints the usual error object (`code` `migration`, `message`, `sqlstat
 | `baseline_skipped` | `--baseline` was ignored because the database is empty. |
 
 Exit codes: `0` success; `1` error (including `validate` finding errors); `2` usage (bad flags, or `apply` with no way to approve);
-`3` with `--exit-code` (`diff`, or `apply --dry-run`) when the plan is not empty.
+`3` with `--exit-code` (`diff`, or `apply --dry-run`) when the plan is not empty (skipped changes
+do not count: a diff with only skipped changes exits `0`).
 
 ## Layout
 

@@ -134,6 +134,7 @@ fn diff_prints_changes_and_statements() {
       }
     }
   ],
+  "skipped": [],
   "sql": "ALTER TABLE public.t ADD COLUMN n text;\n"
 }
 "#;

@@ -8,6 +8,11 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
 
 ### Added
 
+- Diff policy: `--skip <kind>` (repeatable, on `schema diff`, `schema apply` and `migrate diff`) or
+  `[diff] skip` in the config never plans that kind of change (`drop_table`, `drop_column`, ...).
+  Changes that need a skipped one are skipped too, and every skipped change is reported: on stderr,
+  and as `skipped` (`kind`, `object`, `statement`, `because`) in the JSON responses. `--exit-code`
+  ignores skipped changes.
 - `pgmig schema fingerprint <source>`: a stable `h1:` hash of the managed schema, the same for a
   live database, SQL files or a migration replay, on pgmem and Postgres 15–18.
 - `migrate apply --format json` reports pending files, per-file status and per-statement timings

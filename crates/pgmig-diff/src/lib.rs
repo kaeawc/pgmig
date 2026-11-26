@@ -248,6 +248,137 @@ pub enum Change {
     },
 }
 
+/// Declares [`ChangeKind`] with one variant per [`Change`] variant, and its names.
+macro_rules! change_kinds {
+    ($($variant:ident => $name:literal,)*) => {
+        /// What kind of change a [`Change`] is: one kind per variant, named like the variant's
+        /// `kind` tag (snake_case). The names are stable: a diff policy lists them (`skip`).
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        pub enum ChangeKind {
+            $($variant,)*
+        }
+
+        impl ChangeKind {
+            /// Every kind, in the order of [`Change`]'s variants.
+            pub const ALL: &[ChangeKind] = &[$(ChangeKind::$variant,)*];
+
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    $(ChangeKind::$variant => $name,)*
+                }
+            }
+        }
+
+        impl Change {
+            pub fn kind(&self) -> ChangeKind {
+                match self {
+                    $(Change::$variant { .. } => ChangeKind::$variant,)*
+                }
+            }
+        }
+    };
+}
+
+change_kinds! {
+    CreateSchema => "create_schema",
+    DropSchema => "drop_schema",
+    CreateTable => "create_table",
+    DropTable => "drop_table",
+    AddColumn => "add_column",
+    DropColumn => "drop_column",
+    AlterColumnType => "alter_column_type",
+    SetNotNull => "set_not_null",
+    DropNotNull => "drop_not_null",
+    SetDefault => "set_default",
+    DropDefault => "drop_default",
+    AddIdentity => "add_identity",
+    AlterIdentity => "alter_identity",
+    DropIdentity => "drop_identity",
+    CreateSequence => "create_sequence",
+    DropSequence => "drop_sequence",
+    AlterSequence => "alter_sequence",
+    SetSequenceOwner => "set_sequence_owner",
+    CreateEnum => "create_enum",
+    DropEnum => "drop_enum",
+    AddEnumValue => "add_enum_value",
+    RenameEnumValue => "rename_enum_value",
+    UnsupportedEnumChange => "unsupported_enum_change",
+    AddConstraint => "add_constraint",
+    DropConstraint => "drop_constraint",
+    RenameConstraint => "rename_constraint",
+    AlterConstraint => "alter_constraint",
+    SetComment => "set_comment",
+}
+
+impl std::fmt::Display for ChangeKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A name that is not a [`ChangeKind`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownKind(pub String);
+
+impl std::fmt::Display for UnknownKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let names: Vec<&str> = ChangeKind::ALL.iter().map(|k| k.as_str()).collect();
+        write!(f, "unknown kind of change {:?} (expected one of {})", self.0, names.join(", "))
+    }
+}
+
+impl std::error::Error for UnknownKind {}
+
+impl std::str::FromStr for ChangeKind {
+    type Err = UnknownKind;
+
+    fn from_str(s: &str) -> Result<ChangeKind, UnknownKind> {
+        ChangeKind::ALL.iter().copied().find(|k| k.as_str() == s).ok_or_else(|| UnknownKind(s.to_owned()))
+    }
+}
+
+impl Change {
+    /// The object the change is about, as messages name it: `app` (a schema), `public.t` (a
+    /// table, sequence or type), `public.t.c` (a column, or a constraint by its name), and for a
+    /// comment its target's kind first (`column public.t.c`).
+    pub fn object(&self) -> String {
+        let col = |t: &QualName, c: &str| format!("{t}.{}", quote_ident(c));
+        match self {
+            Change::CreateSchema(s) | Change::DropSchema(s) => quote_ident(s),
+            Change::CreateTable(t) | Change::DropTable { table: t, .. } => t.name.to_string(),
+            Change::AddColumn { table, column } => col(table, &column.name),
+            Change::DropColumn { table, column, .. }
+            | Change::AlterColumnType { table, column, .. }
+            | Change::SetNotNull { table, column }
+            | Change::DropNotNull { table, column }
+            | Change::SetDefault { table, column, .. }
+            | Change::DropDefault { table, column, .. }
+            | Change::AddIdentity { table, column, .. }
+            | Change::AlterIdentity { table, column, .. }
+            | Change::DropIdentity { table, column, .. } => col(table, column),
+            Change::CreateSequence(s) | Change::DropSequence(s) => s.name.to_string(),
+            Change::AlterSequence { to, .. } => to.name.to_string(),
+            Change::SetSequenceOwner { name, .. } => name.to_string(),
+            Change::CreateEnum(e) | Change::DropEnum(e) => e.name.to_string(),
+            Change::AddEnumValue { name, .. } | Change::RenameEnumValue { name, .. } | Change::UnsupportedEnumChange { name, .. } => {
+                name.to_string()
+            }
+            Change::AddConstraint { table, constraint } | Change::DropConstraint { table, constraint } => col(table, &constraint.name),
+            Change::RenameConstraint { table, from, .. } => col(table, from),
+            Change::AlterConstraint { table, to } => col(table, &to.name),
+            Change::SetComment { target, .. } => match target {
+                CommentTarget::Schema(s) => format!("schema {}", quote_ident(s)),
+                CommentTarget::Table(t) => format!("table {t}"),
+                CommentTarget::Column { table, column } => format!("column {}", col(table, column)),
+                CommentTarget::Type(t) => format!("type {t}"),
+                CommentTarget::Sequence(s) => format!("sequence {s}"),
+                CommentTarget::Constraint { table, name } => format!("constraint {}", col(table, name)),
+            },
+        }
+    }
+}
+
 /// Fills in `using` on the [`Change::AlterColumnType`]s of `diff(a, b)` whose old type has no
 /// assignment cast to the new one. `assignable(from, to)` answers that for two printed type names
 /// (`from` is `a`'s, `to` is `b`'s); the caller asks a server, and answers `false` when it cannot
@@ -676,6 +807,31 @@ fn diff_table(a: &Table, b: &Table, owned: &dyn Fn(&str) -> Vec<QualName>, chang
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Kind names are part of pgmig's interface (`skip`): they are the changes' `kind` tags.
+    #[test]
+    fn kinds_are_named_like_the_changes_tags() {
+        for kind in ChangeKind::ALL {
+            assert_eq!(serde_json::to_string(kind).expect("serialize"), format!("\"{kind}\""));
+            assert_eq!(kind.as_str().parse::<ChangeKind>(), Ok(*kind));
+        }
+        let changes = [
+            Change::DropSchema("app".into()),
+            Change::DropNotNull { table: QualName::new("public", "t"), column: "c".into() },
+            Change::SetComment { target: CommentTarget::Schema("app".into()), comment: None },
+        ];
+        for c in &changes {
+            let json = serde_json::to_value(c).expect("serialize");
+            assert_eq!(json["kind"], c.kind().as_str());
+        }
+        assert_eq!(changes[1].object(), "public.t.c");
+        assert_eq!(changes[2].object(), "schema app");
+        let err = "drop_tables".parse::<ChangeKind>().expect_err("unknown");
+        assert!(
+            err.to_string().starts_with("unknown kind of change \"drop_tables\" (expected one of create_schema, drop_schema,"),
+            "{err}"
+        );
+    }
 
     fn col(name: &str, type_name: &str) -> Column {
         Column {
