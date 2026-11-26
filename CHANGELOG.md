@@ -11,6 +11,11 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
 - SQL files are loaded one statement at a time, and load errors report `file:line:col` with the
   SQLSTATE and server message. Dollar-quoted bodies, quoted strings and identifiers, comments and
   `BEGIN ATOMIC` bodies may contain `;`.
+- `pgmig schema validate <source>`: load SQL files into the shadow database and report the first
+  error as `file:line:col`; prints nothing on success.
+- `-- pgmig:import <path>` above a file's first statement loads that file, or every `.sql` file in
+  that directory, first. Paths are relative to the importing file, each file loads once, and an
+  import cycle is an error naming the files. Files without imports keep lexical order.
 - `-- pgmig:<name> args` directive comments are parsed (new crate `pgmig-sql`).
 
 ### Changed
