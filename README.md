@@ -88,6 +88,21 @@ pretty-printed JSON document on stdout and nothing on stderr; a failure prints t
 still reported as text on stderr. `apply` never asks
 in JSON mode: pass `--auto-approve` or `--dry-run`.
 
+### `schema clean`
+
+`pgmig schema clean --url <db>` (or `url` in `pgmig.toml`) drops every managed object in a
+database, for local development: afterwards it equals a new database. It prints the drops and the
+target (password redacted, and where it came from) and asks for the database name to be typed;
+`--auto-approve` skips the question (needed without a terminal: otherwise usage error, exit `2`),
+`--dry-run` only prints. `public` stays, with its standard comment. `--include`, `--exclude` and
+`--schema` limit what is dropped (`--schema app` empties `app` and keeps it); an unmanaged object
+stays with the managed objects it needs (its schema, an enum a column uses, a sequence a default
+uses, a table a foreign key references), each reported as `kept` (on stderr; in JSON, `kept`
+with `object` and `because`). The revisions schema (`pgmig`) is never dropped, so drop it yourself
+for a full reset. Extensions, and objects pgmig does not model, are not dropped; one that depends
+on a dropped object makes the plan fail and roll back. With `--format json` the response has
+`target`, `database`, `plan`, `changes`, `kept`, `sql`, `applied` and `report`.
+
 ### `migrate apply` report
 
 `pgmig migrate apply --format json` prints the report below on success (`target`, then the fields).

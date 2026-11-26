@@ -335,3 +335,14 @@ fn an_environments_include_and_exclude_win_over_the_top_level() {
         assert_eq!(ok(&p.run(&["--env", "wide", "schema", "diff"])), CREATE_C, "{key}");
     }
 }
+
+#[test]
+fn clean_takes_its_target_from_the_config_file_and_names_it() {
+    let db = TestDb::new();
+    db.connect().batch(A).expect("load target");
+    let p = Project::new(&[("pgmig.toml", &format!("url = {}\n", toml_str(&db.conninfo)))]);
+    let out = p.run(&["schema", "clean", "--dry-run"]);
+    assert!(!ok(&out).is_empty());
+    let shown = pgmig::config::redact(&db.conninfo);
+    assert!(stderr(&out).contains(&format!("Target: {shown} (from `url` in pgmig.toml), database ")), "{}", stderr(&out));
+}

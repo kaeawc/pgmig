@@ -2,6 +2,7 @@
 mod api;
 mod apply;
 mod casts;
+mod clean;
 mod corpus;
 mod filters;
 mod fingerprint;

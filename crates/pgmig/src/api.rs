@@ -11,9 +11,9 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ApplyOptions, ApplyReport, Change, ChecksumError, Error, Guard, MigrateApplyReport, MigrateEdit, MigrateLs, MigrateRebase, MigrateRm,
-    MigrateSet, MigrateShow, MigrateStatus, MigrationOutcome, Model, Options, Plan, SetOptions, ShadowSpec, Skipped, Source, SumFile,
-    filter::PatternError,
+    ApplyOptions, ApplyReport, Change, ChecksumError, Error, Guard, Kept, MigrateApplyReport, MigrateEdit, MigrateLs, MigrateRebase,
+    MigrateRm, MigrateSet, MigrateShow, MigrateStatus, MigrationOutcome, Model, Options, Plan, SetOptions, ShadowSpec, Skipped, Source,
+    SumFile, filter::PatternError,
 };
 
 /// `schema diff`.
@@ -142,6 +142,31 @@ pub struct EditPlanResponse {
     /// new diff. Empty when every statement was deleted.
     pub plan: Plan,
     /// The text the editor saved.
+    pub sql: String,
+}
+
+/// `schema clean`, first half: the plan that drops every managed object.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CleanPlanRequest {
+    /// The database to clean.
+    pub target: String,
+    /// What is managed; `skip` does not apply.
+    #[serde(default)]
+    pub options: Options,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CleanPlanResponse {
+    /// `current_database()` of the target, which the CLI asks to be typed to confirm.
+    pub database: String,
+    /// The plan to pass to [`apply`]: schema-qualified.
+    pub plan: Plan,
+    pub changes: Vec<Change>,
+    /// Managed objects left in place because an object that stays needs them.
+    #[serde(default)]
+    pub kept: Vec<Kept>,
+    /// `plan` rendered as a SQL script ([`Plan::to_sql`]).
     pub sql: String,
 }
 
@@ -1031,6 +1056,12 @@ pub fn schema_plan_apply(req: &PlanApplyRequest) -> Result<PlanApplyResponse, Ap
     Ok(PlanApplyResponse { sql: d.plan.to_sql(), plan: d.plan, changes: d.changes, skipped: d.skipped })
 }
 
+/// [`crate::schema_plan_clean`].
+pub fn schema_plan_clean(req: &CleanPlanRequest) -> Result<CleanPlanResponse, ApiError> {
+    let c = crate::schema_plan_clean(&req.target, &req.options)?;
+    Ok(CleanPlanResponse { database: c.database, sql: c.plan.to_sql(), plan: c.plan, changes: c.changes, kept: c.kept })
+}
+
 /// [`crate::edit_sql`] on the plan's SQL, then [`crate::plan_from_sql`] on what was saved.
 pub fn edit_plan(req: &EditPlanRequest) -> Result<EditPlanResponse, ApiError> {
     let sql = crate::edit_sql(&req.plan.to_sql(), &req.editor)?;
@@ -1076,6 +1107,9 @@ mod tests {
         round_trip(&ValidateRequest { source: sql.clone(), shadow: pg.clone() });
         round_trip(&PlanApplyRequest { target: "host=localhost".into(), desired: sql, shadow: pg, options: options() });
         round_trip(&ApplyRequest { target: "host=localhost".into(), plan: plan() });
+        round_trip(&CleanPlanRequest { target: "host=localhost".into(), options: options() });
+        let req: CleanPlanRequest = serde_json::from_str(r#"{"target":"host=localhost"}"#).expect("request");
+        assert_eq!(req.options, Options::default());
         round_trip(&MigrateHashRequest { dir: "migrations".into() });
         round_trip(&MigrateValidateRequest { dir: "migrations".into(), shadow: None });
         round_trip(&MigrateValidateRequest { dir: "migrations".into(), shadow: Some(pg_spec()) });
