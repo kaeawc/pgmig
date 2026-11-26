@@ -7,6 +7,7 @@ mod filters;
 mod import;
 mod inspect;
 mod load;
+mod migrate;
 mod quoting;
 mod search_path;
 mod support;

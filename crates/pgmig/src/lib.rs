@@ -17,6 +17,7 @@ pub use filter::{Filter, Pattern, PatternError, filter_model, scope_model};
 pub use pgmig_conn::Conn;
 pub use pgmig_diff::{Change, diff};
 pub use pgmig_inspect::inspect;
+pub use pgmig_migrate::{Dir as MigrationDir, SUM_FILE, SumFile, SumLine, ValidateError as ChecksumError};
 pub use pgmig_model::Model;
 pub use pgmig_plan::{Plan, PlanOptions, plan, plan_with};
 pub use pgmig_shadow::{PUBLIC_COMMENT as PUBLIC_SCHEMA_COMMENT_SQL, Shadow};
@@ -42,8 +43,16 @@ pub enum Error {
     ImportMissing { path: PathBuf, pos: pgmig_sql::Pos, target: String },
     #[error("{path}:{pos}: cannot import {target}: no .sql files")]
     ImportEmpty { path: PathBuf, pos: pgmig_sql::Pos, target: String },
+    #[error("{path}:{pos}: pgmig:import is not allowed in a migration: migrations are self-contained")]
+    MigrationImport { path: PathBuf, pos: pgmig_sql::Pos },
     #[error("import cycle: {cycle}")]
     ImportCycle { cycle: String },
+    /// The migration directory cannot be read: a malformed file name, two files with one version.
+    #[error(transparent)]
+    Migrate(#[from] pgmig_migrate::Error),
+    /// The migration directory does not match its sum file.
+    #[error(transparent)]
+    Checksum(#[from] pgmig_migrate::ValidateError),
     #[error(transparent)]
     Conn(#[from] pgmig_conn::Error),
     #[error(transparent)]
@@ -205,14 +214,65 @@ fn open_model(source: &Source, shadow: &ShadowSpec) -> Result<(Model, Loaded)> {
 fn load_sql(path: &Path, shadow: &ShadowSpec) -> Result<Shadow> {
     let mut sh = shadow.open()?;
     for loaded in files::load_files(path)? {
-        let file = loaded.path;
-        for stmt in &loaded.file.statements {
-            sh.conn().batch(&stmt.sql).map_err(|source| Error::Load {
-                path: file.clone(),
-                pos: source.position.map_or(stmt.pos, |n| stmt.locate(n)),
-                source,
-            })?;
+        exec_file(sh.conn(), &loaded.path, &loaded.file)?;
+    }
+    Ok(sh)
+}
+
+/// Execute a split file's statements one at a time, so an error points at its statement in `path`.
+fn exec_file(conn: &mut Conn, path: &Path, file: &pgmig_sql::File) -> Result<()> {
+    for stmt in &file.statements {
+        conn.batch(&stmt.sql).map_err(|source| Error::Load {
+            path: path.to_owned(),
+            pos: source.position.map_or(stmt.pos, |n| stmt.locate(n)),
+            source,
+        })?;
+    }
+    Ok(())
+}
+
+/// `migrate hash`: write the sum file of the migration directory at `dir`. Returns it, and whether
+/// the file changed (it is left alone when it already matches).
+pub fn migrate_hash(dir: &Path) -> Result<(SumFile, bool)> {
+    Ok(MigrationDir::open(dir)?.write_sum()?)
+}
+
+/// `migrate validate`: check the migration directory at `dir` against its sum file and, with a
+/// shadow database, replay every migration into it in order, statement by statement. Reports the
+/// first problem.
+pub fn migrate_validate(dir: &Path, shadow: Option<&ShadowSpec>) -> Result<()> {
+    let dir = MigrationDir::open(dir)?;
+    pgmig_migrate::validate(&dir)?;
+    check_no_imports(&dir)?;
+    if let Some(spec) = shadow {
+        replay(&dir, spec)?;
+    }
+    Ok(())
+}
+
+/// Reject any `-- pgmig:import` in a migration, file-level or on a statement: migrations are
+/// self-contained. A file that is not UTF-8 or does not split is left to the replay to report.
+fn check_no_imports(dir: &MigrationDir) -> Result<()> {
+    for f in dir.files() {
+        let Ok(text) = std::str::from_utf8(&f.bytes) else { continue };
+        let Ok(file) = pgmig_sql::split(text) else { continue };
+        let all = file.directives.iter().chain(file.statements.iter().flat_map(|s| &s.directives));
+        if let Some(d) = all.filter(|d| d.name == "import").min_by_key(|d| d.pos) {
+            return Err(Error::MigrationImport { path: dir.path.join(&f.name), pos: d.pos });
         }
+    }
+    Ok(())
+}
+
+/// Execute every migration of `dir` in order in a fresh shadow database.
+fn replay(dir: &MigrationDir, shadow: &ShadowSpec) -> Result<Shadow> {
+    let mut sh = shadow.open()?;
+    for f in dir.files() {
+        let path = dir.path.join(&f.name);
+        let text = std::str::from_utf8(&f.bytes)
+            .map_err(|e| Error::Io { path: path.clone(), source: std::io::Error::new(std::io::ErrorKind::InvalidData, e) })?;
+        let file = pgmig_sql::split(text).map_err(|source| Error::Split { path: path.clone(), source })?;
+        exec_file(sh.conn(), &path, &file)?;
     }
     Ok(sh)
 }

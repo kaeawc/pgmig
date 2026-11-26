@@ -2,4 +2,5 @@
 mod apply;
 mod filters;
 mod json;
+mod migrate;
 mod support;

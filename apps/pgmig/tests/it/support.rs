@@ -96,3 +96,8 @@ impl Drop for SqlFile {
 pub fn pgmig(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_pgmig")).args(args).stdin(Stdio::null()).output().expect("run pgmig")
 }
+
+/// Whether tests run against real Postgres rather than pgmem.
+pub fn shadow_is_postgres() -> bool {
+    postgres_dsn().is_some()
+}

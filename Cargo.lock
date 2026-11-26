@@ -623,6 +623,7 @@ dependencies = [
  "pgmig-conn",
  "pgmig-diff",
  "pgmig-inspect",
+ "pgmig-migrate",
  "pgmig-model",
  "pgmig-plan",
  "pgmig-shadow",
@@ -667,6 +668,15 @@ version = "0.1.0"
 dependencies = [
  "pgmig-conn",
  "pgmig-model",
+ "thiserror",
+]
+
+[[package]]
+name = "pgmig-migrate"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "sha2",
  "thiserror",
 ]
 

@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ApplyReport, Change, Error, Model, Options, Plan, ShadowSpec, Source, filter::PatternError};
+use crate::{ApplyReport, Change, ChecksumError, Error, Model, Options, Plan, ShadowSpec, Source, SumFile, filter::PatternError};
 
 /// `schema diff`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,6 +108,73 @@ pub struct ApplyRequest {
 
 pub type ApplyResponse = ApplyReport;
 
+/// `migrate hash`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MigrateHashRequest {
+    /// The migration directory.
+    pub dir: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrateHashResponse {
+    /// The sum file's path.
+    pub sum_file: PathBuf,
+    /// Whether the sum file was written; `false` when it already matched.
+    pub written: bool,
+    /// Line one, `h1:<base64>`.
+    pub dir_hash: String,
+    /// One entry per migration, in order.
+    pub files: Vec<HashedFile>,
+}
+
+/// A line of the sum file after the first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HashedFile {
+    /// The migration's file name.
+    pub file: String,
+    /// `h1:<base64>`, chaining every earlier file.
+    pub hash: String,
+}
+
+impl MigrateHashResponse {
+    fn new(sum_file: PathBuf, sum: &SumFile, written: bool) -> MigrateHashResponse {
+        MigrateHashResponse {
+            sum_file,
+            written,
+            dir_hash: format!("h1:{}", sum.dir_hash),
+            files: sum.lines.iter().map(|l| HashedFile { file: l.file.clone(), hash: format!("h1:{}", l.hash) }).collect(),
+        }
+    }
+}
+
+/// `migrate validate`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MigrateValidateRequest {
+    /// The migration directory.
+    pub dir: PathBuf,
+    /// Also replay every migration in order into this shadow database. `None` checks only the sum
+    /// file.
+    #[serde(default)]
+    pub shadow: Option<ShadowSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrateValidateResponse {
+    /// What is wrong with the directory; empty when it is valid. Checking stops at the first
+    /// problem, so there is at most one for now.
+    pub diagnostics: Vec<Diagnostic>,
+    /// Whether every migration was replayed into the shadow database without error.
+    pub replayed: bool,
+}
+
+impl MigrateValidateResponse {
+    pub fn is_valid(&self) -> bool {
+        self.diagnostics.is_empty()
+    }
+}
+
 /// A stable identifier for each kind of failure, serialized in snake_case.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -131,6 +198,8 @@ pub enum ErrorCode {
     /// `-- pgmig:import` of a directory without `.sql` files.
     ImportEmpty,
     ImportCycle,
+    /// `-- pgmig:import` in a migration file.
+    MigrationImport,
     /// Connecting to, or querying, a database failed.
     Conn,
     /// The shadow database could not be started or is not empty.
@@ -145,6 +214,25 @@ pub enum ErrorCode {
     Pattern,
     /// The command line asks for something that cannot be done (applying without approval).
     Usage,
+    /// A `.sql` file in a migration directory is not named `<version>_<description>.sql`, or two
+    /// files have the same version.
+    MigrationName,
+    /// The migration directory has no sum file.
+    SumMissing,
+    /// The sum file cannot be parsed.
+    SumMalformed,
+    /// The sum file's directory hash does not match its lines: it was edited by hand.
+    SumEdited,
+    /// A migration file changed after it was hashed.
+    FileEdited,
+    /// A migration file was added before files already in the sum file.
+    FileInserted,
+    /// A file in the sum file is missing from the directory.
+    FileDeleted,
+    /// A migration file was added after the last hashed one and the sum file not updated.
+    FileNotHashed,
+    /// The files in the directory are in a different order than in the sum file.
+    FileReordered,
 }
 
 impl ErrorCode {
@@ -160,6 +248,7 @@ impl ErrorCode {
             ErrorCode::ImportMissing => "import_missing",
             ErrorCode::ImportEmpty => "import_empty",
             ErrorCode::ImportCycle => "import_cycle",
+            ErrorCode::MigrationImport => "migration_import",
             ErrorCode::Conn => "conn",
             ErrorCode::Shadow => "shadow",
             ErrorCode::Inspect => "inspect",
@@ -167,6 +256,15 @@ impl ErrorCode {
             ErrorCode::Apply => "apply",
             ErrorCode::Pattern => "pattern",
             ErrorCode::Usage => "usage",
+            ErrorCode::MigrationName => "migration_name",
+            ErrorCode::SumMissing => "sum_missing",
+            ErrorCode::SumMalformed => "sum_malformed",
+            ErrorCode::SumEdited => "sum_edited",
+            ErrorCode::FileEdited => "file_edited",
+            ErrorCode::FileInserted => "file_inserted",
+            ErrorCode::FileDeleted => "file_deleted",
+            ErrorCode::FileNotHashed => "file_not_hashed",
+            ErrorCode::FileReordered => "file_reordered",
         }
     }
 }
@@ -253,6 +351,30 @@ impl From<&Error> for ApiError {
             Error::ImportMissing { path, pos, .. } => err(ErrorCode::ImportMissing).at(path, Some(*pos)),
             Error::ImportEmpty { path, pos, .. } => err(ErrorCode::ImportEmpty).at(path, Some(*pos)),
             Error::ImportCycle { .. } => err(ErrorCode::ImportCycle),
+            Error::MigrationImport { path, pos } => err(ErrorCode::MigrationImport).at(path, Some(*pos)),
+            Error::Migrate(m) => match m {
+                pgmig_migrate::Error::Io { path, .. } => err(ErrorCode::Io).at(path, None),
+                pgmig_migrate::Error::Name { path, .. } => err(ErrorCode::MigrationName).at(path, None),
+                pgmig_migrate::Error::DuplicateVersion { second, .. } => err(ErrorCode::MigrationName).at(second, None),
+            },
+            Error::Checksum(c) => {
+                let code = match c {
+                    ChecksumError::MissingSum { .. } => ErrorCode::SumMissing,
+                    ChecksumError::Io { .. } => ErrorCode::Io,
+                    ChecksumError::Malformed { .. } => ErrorCode::SumMalformed,
+                    ChecksumError::SumEdited { .. } => ErrorCode::SumEdited,
+                    ChecksumError::Deleted { .. } => ErrorCode::FileDeleted,
+                    ChecksumError::Inserted { .. } => ErrorCode::FileInserted,
+                    ChecksumError::NotHashed { .. } => ErrorCode::FileNotHashed,
+                    ChecksumError::Reordered { .. } => ErrorCode::FileReordered,
+                    ChecksumError::Edited { .. } => ErrorCode::FileEdited,
+                };
+                let mut e = err(code).at(c.path(), None);
+                if let ChecksumError::Malformed { line, .. } = c {
+                    e.line = Some(*line);
+                }
+                e
+            }
             Error::Conn(c) => err(ErrorCode::Conn).sqlstate(c),
             Error::Shadow(pgmig_shadow::Error::Conn(c)) => err(ErrorCode::Shadow).sqlstate(c),
             Error::Shadow(_) => err(ErrorCode::Shadow),
@@ -308,7 +430,10 @@ fn is_diagnostic(e: &Error) -> bool {
         | Error::ImportPlacement { .. }
         | Error::ImportMissing { .. }
         | Error::ImportEmpty { .. }
-        | Error::ImportCycle { .. } => true,
+        | Error::ImportCycle { .. }
+        | Error::MigrationImport { .. }
+        | Error::Migrate(_)
+        | Error::Checksum(_) => true,
         Error::NotSql | Error::Conn(_) | Error::Shadow(_) | Error::Inspect(_) | Error::Plan(_) | Error::Apply { .. } => false,
     }
 }
@@ -331,6 +456,22 @@ pub fn schema_validate(req: &ValidateRequest) -> Result<ValidateResponse, ApiErr
     match crate::schema_validate(&req.source, &req.shadow) {
         Ok(()) => Ok(ValidateResponse { diagnostics: vec![] }),
         Err(e) if is_diagnostic(&e) => Ok(ValidateResponse { diagnostics: vec![ApiError::from(&e)] }),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// [`crate::migrate_hash`].
+pub fn migrate_hash(req: &MigrateHashRequest) -> Result<MigrateHashResponse, ApiError> {
+    let (sum, written) = crate::migrate_hash(&req.dir)?;
+    Ok(MigrateHashResponse::new(req.dir.join(crate::SUM_FILE), &sum, written))
+}
+
+/// [`crate::migrate_validate`]: problems with the directory, its sum file or a migration are
+/// diagnostics; an `Err` means they could not be checked (the shadow database would not start).
+pub fn migrate_validate(req: &MigrateValidateRequest) -> Result<MigrateValidateResponse, ApiError> {
+    match crate::migrate_validate(&req.dir, req.shadow.as_ref()) {
+        Ok(()) => Ok(MigrateValidateResponse { diagnostics: vec![], replayed: req.shadow.is_some() }),
+        Err(e) if is_diagnostic(&e) => Ok(MigrateValidateResponse { diagnostics: vec![ApiError::from(&e)], replayed: false }),
         Err(e) => Err(e.into()),
     }
 }
@@ -377,6 +518,37 @@ mod tests {
         round_trip(&ValidateRequest { source: sql.clone(), shadow: pg.clone() });
         round_trip(&PlanApplyRequest { target: "host=localhost".into(), desired: sql, shadow: pg, options: options() });
         round_trip(&ApplyRequest { target: "host=localhost".into(), plan: plan() });
+        round_trip(&MigrateHashRequest { dir: "migrations".into() });
+        round_trip(&MigrateValidateRequest { dir: "migrations".into(), shadow: None });
+        round_trip(&MigrateValidateRequest { dir: "migrations".into(), shadow: Some(pg_spec()) });
+    }
+
+    fn pg_spec() -> ShadowSpec {
+        ShadowSpec::Postgres("host=localhost dbname=shadow".into())
+    }
+
+    #[test]
+    fn migrate_requests_default_and_refuse_unknown_fields() {
+        let req: MigrateValidateRequest = serde_json::from_str(r#"{"dir":"m"}"#).expect("request");
+        assert_eq!(req, MigrateValidateRequest { dir: "m".into(), shadow: None });
+        let req: MigrateValidateRequest = serde_json::from_str(r#"{"dir":"m","shadow":{"kind":"pgmem"}}"#).expect("request");
+        assert_eq!(req.shadow, Some(ShadowSpec::Pgmem));
+        assert!(serde_json::from_str::<MigrateValidateRequest>(r#"{"dir":"m","shadows":{"kind":"pgmem"}}"#).is_err());
+        assert!(serde_json::from_str::<MigrateHashRequest>(r#"{"dir":"m","x":1}"#).is_err());
+    }
+
+    #[test]
+    fn checksum_errors_name_their_file() {
+        let e = ApiError::from(&Error::Checksum(ChecksumError::Edited { file: "m/2_b.sql".into() }));
+        assert_eq!((e.code, e.file.as_deref()), (ErrorCode::FileEdited, Some(std::path::Path::new("m/2_b.sql"))));
+        let malformed = ChecksumError::Malformed { path: "m/pgmig.sum".into(), line: 3, reason: "expected <file> h1:<hash>" };
+        let e = ApiError::from(&Error::Checksum(malformed));
+        assert_eq!((e.code, e.line), (ErrorCode::SumMalformed, Some(3)));
+        assert_eq!(e.message, "m/pgmig.sum:3: expected <file> h1:<hash>");
+        let name = pgmig_migrate::Error::Name { path: "m/x.sql".into(), reason: pgmig_migrate::NameError::NoVersion };
+        let e = ApiError::from(&Error::Migrate(name));
+        assert_eq!((e.code, e.file.as_deref()), (ErrorCode::MigrationName, Some(std::path::Path::new("m/x.sql"))));
+        assert!(is_diagnostic(&Error::Checksum(ChecksumError::SumEdited { path: "m/pgmig.sum".into() })));
     }
 
     #[test]
@@ -397,6 +569,10 @@ mod tests {
             apply: None,
         };
         round_trip(&ValidateResponse { diagnostics: vec![load.clone()] });
+        round_trip(&MigrateValidateResponse { diagnostics: vec![load.clone()], replayed: false });
+        let sum = SumFile::from_lines(vec![crate::SumLine { file: "1_a.sql".into(), hash: "x".into() }]);
+        let res = round_trip(&MigrateHashResponse::new("m/pgmig.sum".into(), &sum, true));
+        assert!(res.contains(r#""files":[{"file":"1_a.sql","hash":"h1:x"}]"#), "{res}");
         round_trip(&load);
     }
 
@@ -445,6 +621,7 @@ mod tests {
             ImportMissing,
             ImportEmpty,
             ImportCycle,
+            MigrationImport,
             Conn,
             Shadow,
             Inspect,
@@ -452,6 +629,15 @@ mod tests {
             Apply,
             Pattern,
             Usage,
+            MigrationName,
+            SumMissing,
+            SumMalformed,
+            SumEdited,
+            FileEdited,
+            FileInserted,
+            FileDeleted,
+            FileNotHashed,
+            FileReordered,
         ] {
             assert_eq!(serde_json::to_string(&code).expect("serialize"), format!("\"{}\"", code.as_str()));
         }
