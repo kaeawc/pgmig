@@ -22,6 +22,7 @@ pgmig-inspect = { workspace = true }
 pgmig-model = { workspace = true }
 pgmig-plan = { workspace = true }
 pgmig-shadow = { workspace = true }
+pgmig-sql = { workspace = true }
 thiserror = { workspace = true }
 
 [lints]

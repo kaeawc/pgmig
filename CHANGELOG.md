@@ -6,6 +6,13 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
 
 ## [Unreleased]
 
+### Added
+
+- SQL files are loaded one statement at a time, and load errors report `file:line:col` with the
+  SQLSTATE and server message. Dollar-quoted bodies, quoted strings and identifiers, comments and
+  `BEGIN ATOMIC` bodies may contain `;`.
+- `-- pgmig:<name> args` directive comments are parsed (new crate `pgmig-sql`).
+
 ## [0.1.0] - 2026-11-26
 
 ### Added

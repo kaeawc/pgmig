@@ -10,6 +10,8 @@ pub struct Error {
     /// SQLSTATE, when the server reported one.
     pub code: Option<String>,
     pub message: String,
+    /// The 1-based character position in the query the server reported the error at, if any.
+    pub position: Option<u32>,
 }
 
 impl fmt::Display for Error {
@@ -24,8 +26,15 @@ impl fmt::Display for Error {
 impl From<postgres::Error> for Error {
     fn from(e: postgres::Error) -> Error {
         match e.as_db_error() {
-            Some(db) => Error { code: Some(db.code().code().to_owned()), message: db.message().to_owned() },
-            None => Error { code: None, message: e.to_string() },
+            Some(db) => Error {
+                code: Some(db.code().code().to_owned()),
+                message: db.message().to_owned(),
+                position: match db.position() {
+                    Some(postgres::error::ErrorPosition::Original(n)) => Some(*n),
+                    _ => None,
+                },
+            },
+            None => Error { code: None, message: e.to_string(), position: None },
         }
     }
 }
