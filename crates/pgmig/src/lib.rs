@@ -15,8 +15,11 @@ pub enum Error {
     Io { path: PathBuf, source: std::io::Error },
     #[error("{path}: no .sql files")]
     NoSql { path: PathBuf },
-    #[error("{path}: {source}")]
-    Load { path: PathBuf, source: pgmig_shadow::Error },
+    #[error("{path}:{source}")]
+    Split { path: PathBuf, source: pgmig_sql::Error },
+    /// A statement failed in the shadow database; `pos` is where the server located the error.
+    #[error("{path}:{pos}: {source}")]
+    Load { path: PathBuf, pos: pgmig_sql::Pos, source: pgmig_conn::Error },
     #[error(transparent)]
     Conn(#[from] pgmig_conn::Error),
     #[error(transparent)]
@@ -78,8 +81,16 @@ pub fn load_model(source: &Source, shadow: &ShadowSpec) -> Result<Model> {
         Source::Sql(path) => {
             let mut sh = shadow.open()?;
             for file in sql_files(path)? {
-                let sql = std::fs::read_to_string(&file).map_err(|source| Error::Io { path: file.clone(), source })?;
-                sh.load(&sql).map_err(|source| Error::Load { path: file.clone(), source })?;
+                let text = std::fs::read_to_string(&file).map_err(|source| Error::Io { path: file.clone(), source })?;
+                let parsed = pgmig_sql::split(&text).map_err(|source| Error::Split { path: file.clone(), source })?;
+                // One statement at a time, so an error points at its statement.
+                for stmt in &parsed.statements {
+                    sh.conn().batch(&stmt.sql).map_err(|source| Error::Load {
+                        path: file.clone(),
+                        pos: source.position.map_or(stmt.pos, |n| stmt.locate(n)),
+                        source,
+                    })?;
+                }
             }
             Ok(inspect(sh.conn())?)
         }
