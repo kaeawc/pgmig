@@ -141,7 +141,7 @@ fn commit_points_are_written_and_replay() {
     let to = t.desired("CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy');\nCREATE TABLE people (id int, mood mood DEFAULT 'ok');\n");
     let w = diff(&t, "ok mood", &to, &spec).expect("diff").written.expect("second");
     let name = w.path.file_name().and_then(|n| n.to_str()).expect("name").to_owned();
-    assert!(t.read(&name).contains("-- commit:"), "{}", t.read(&name));
+    assert!(t.read(&name).contains("\n-- pgmig:commit\n"), "{}", t.read(&name));
     pgmig::migrate_validate(&t.dir(), Some(&spec)).expect("replays");
     assert_replay_matches(&t, &to, &spec);
 }

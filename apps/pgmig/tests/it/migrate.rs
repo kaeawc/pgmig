@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use serde_json::Value;
 
-use crate::support::{pgmig, shadow_arg};
+use crate::support::{TestDb, pgmig, shadow_arg};
 
 /// A temporary migration directory, removed on drop.
 struct Dir(PathBuf);
@@ -205,5 +205,67 @@ fn diff_refuses_an_edited_directory() {
     assert_eq!(parse(&out)["code"], "file_edited");
     assert_eq!(sql_files(&d.0), ["1_users.sql"]);
     let out = pgmig(&["migrate", "new", "!!", "--dir", &d.arg()]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+}
+
+fn stdout(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+#[test]
+fn apply_lists_applied_files_then_nothing() {
+    let db = TestDb::new();
+    let d = Dir::new(&[("1_users.sql", USERS), ("2_orders.sql", "CREATE TABLE orders (id int);\n")]);
+    assert_eq!(pgmig(&["migrate", "hash", "--dir", &d.arg()]).status.code(), Some(0));
+
+    let out = pgmig(&["migrate", "apply", "--url", &db.conninfo, "--dir", &d.arg(), "--dry-run"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "1_users.sql\n2_orders.sql\n");
+    assert!(stderr(&out).contains("2 migrations pending (dry run"), "{}", stderr(&out));
+
+    let out = pgmig(&["migrate", "apply", "1", "--url", &db.conninfo, "--dir", &d.arg()]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(stdout(&out).starts_with("1_users.sql (1 statement, "), "{}", stdout(&out));
+    assert!(stderr(&out).contains("applied 1 migration (1 statement); 1 left pending"), "{}", stderr(&out));
+
+    let out = pgmig(&["migrate", "apply", "--url", &db.conninfo, "--dir", &d.arg(), "--format", "json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let json = parse(&out);
+    assert_eq!((json["applied"].as_u64(), json["dry_run"].as_bool()), (Some(1), Some(false)));
+    assert_eq!(json["files"][0]["status"], "already_applied");
+    assert_eq!((json["files"][1]["status"].as_str(), json["files"][1]["tx_mode"].as_str()), (Some("applied"), Some("file")));
+    assert_eq!(json["target"]["source"], "--url");
+
+    let out = pgmig(&["migrate", "apply", "--url", &db.conninfo, "--dir", &d.arg()]);
+    assert_eq!((out.status.code(), stdout(&out).as_str()), (Some(0), ""));
+    assert!(stderr(&out).contains("nothing to apply"), "{}", stderr(&out));
+}
+
+#[test]
+fn apply_reports_the_failing_statement_and_reads_the_config_file() {
+    let db = TestDb::new();
+    let d = Dir::new(&[("1_orders.sql", BAD)]);
+    assert_eq!(pgmig(&["migrate", "hash", "--dir", &d.arg()]).status.code(), Some(0));
+    let config = d.0.join("pgmig.toml");
+    std::fs::write(
+        &config,
+        format!("url = {:?}\n[migrations]\ndir = {:?}\ntx_mode = \"none\"\nlock_timeout = \"2s\"\n", db.conninfo, d.arg()),
+    )
+    .expect("config");
+    let cfg = config.to_string_lossy().into_owned();
+    let out = pgmig(&["migrate", "apply", "--config", &cfg]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(stderr(&out).contains("1_orders.sql:2:") && stderr(&out).contains("42704"), "{}", stderr(&out));
+    assert!(stderr(&out).contains("no transaction"), "{}", stderr(&out));
+
+    let out = pgmig(&["migrate", "apply", "--config", &cfg, "--format", "json", "--tx-mode", "file"]);
+    assert_eq!(out.status.code(), Some(1));
+    let json = parse(&out);
+    assert_eq!((json["code"].as_str(), json["sqlstate"].as_str(), json["line"].as_u64()), (Some("migration"), Some("42704"), Some(2)));
+    assert_eq!(json["migration"]["outcome"], "file_rolled_back");
+
+    let out = pgmig(&["migrate", "apply", "--config", &cfg, "--no-lock", "--lock-name", "x"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    let out = pgmig(&["migrate", "apply", "--config", &cfg, "--lock-timeout", "soon"]);
     assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
 }

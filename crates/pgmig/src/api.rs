@@ -10,7 +10,10 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ApplyReport, Change, ChecksumError, Error, Model, Options, Plan, ShadowSpec, Source, SumFile, filter::PatternError};
+use crate::{
+    ApplyOptions, ApplyReport, Change, ChecksumError, Error, MigrateApplyReport, MigrationOutcome, Model, Options, Plan, ShadowSpec,
+    Source, SumFile, filter::PatternError,
+};
 
 /// `schema diff`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -222,6 +225,21 @@ pub struct MigrateNewResponse {
     pub version: String,
 }
 
+/// `migrate apply`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MigrateApplyRequest {
+    /// The database to migrate.
+    pub target: String,
+    /// The migration directory.
+    pub dir: PathBuf,
+    #[serde(default)]
+    pub options: ApplyOptions,
+}
+
+/// Every file of the directory with its status, and what this run applied.
+pub type MigrateApplyResponse = MigrateApplyReport;
+
 /// `config validate`. `Debug` shows the `vars` names only: their values may be secrets.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -319,6 +337,26 @@ pub enum ErrorCode {
     /// `pgmig.toml` is invalid: a syntax error, an unknown key, an undefined `${NAME}`, an unknown
     /// `--env`.
     Config,
+    /// A `-- pgmig:<name>` directive is misplaced or has bad arguments.
+    Directive,
+    /// The revisions table cannot be used (a newer format, a table pgmig did not create).
+    Revisions,
+    /// A row of the revisions table was edited by hand.
+    RevisionEdited,
+    /// An applied version has no file in the directory.
+    HistoryMissing,
+    /// An applied file was edited after it was applied.
+    HistoryChanged,
+    /// A pending file is older than the newest applied one under the linear order.
+    OutOfOrder,
+    /// Another `migrate apply` held the advisory lock past the timeout.
+    LockTimeout,
+    /// `--tx-mode all` with a file that runs without a transaction.
+    TxModeConflict,
+    /// A partly applied file cannot resume: its applied statements changed.
+    Resume,
+    /// A migration failed: a statement, a hook, `BEGIN` or `COMMIT`.
+    Migration,
 }
 
 impl ErrorCode {
@@ -352,6 +390,16 @@ impl ErrorCode {
             ErrorCode::FileNotHashed => "file_not_hashed",
             ErrorCode::FileReordered => "file_reordered",
             ErrorCode::Config => "config",
+            ErrorCode::Directive => "directive",
+            ErrorCode::Revisions => "revisions",
+            ErrorCode::RevisionEdited => "revision_edited",
+            ErrorCode::HistoryMissing => "history_missing",
+            ErrorCode::HistoryChanged => "history_changed",
+            ErrorCode::OutOfOrder => "out_of_order",
+            ErrorCode::LockTimeout => "lock_timeout",
+            ErrorCode::TxModeConflict => "tx_mode_conflict",
+            ErrorCode::Resume => "resume",
+            ErrorCode::Migration => "migration",
         }
     }
 }
@@ -372,6 +420,22 @@ pub struct ApiError {
     pub col: Option<u32>,
     /// Set for `apply` failures.
     pub apply: Option<Box<ApplyFailure>>,
+    /// Set for `migration` failures; left out otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migration: Option<Box<MigrationFailure>>,
+}
+
+/// Where a `migrate apply` stopped and what became of the work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationFailure {
+    /// 0-based index of the failing statement in its file; null when a hook, `BEGIN` or `COMMIT`
+    /// failed.
+    pub statement_index: Option<usize>,
+    /// The failing statement, or `before_sql`, `after_sql`, `BEGIN`, `COMMIT`.
+    pub statement: String,
+    /// Files of this run committed before the failure.
+    pub applied_files: usize,
+    pub outcome: MigrationOutcome,
 }
 
 /// Where an `apply` stopped and what became of the batch it was in.
@@ -403,12 +467,21 @@ pub type Diagnostic = ApiError;
 
 impl ApiError {
     fn new(code: ErrorCode, e: &impl std::fmt::Display) -> ApiError {
-        ApiError { code, message: e.to_string(), sqlstate: None, file: None, line: None, col: None, apply: None }
+        ApiError { code, message: e.to_string(), sqlstate: None, file: None, line: None, col: None, apply: None, migration: None }
     }
 
     /// A command line that cannot be run as given.
     pub fn usage(message: impl Into<String>) -> ApiError {
-        ApiError { code: ErrorCode::Usage, message: message.into(), sqlstate: None, file: None, line: None, col: None, apply: None }
+        ApiError {
+            code: ErrorCode::Usage,
+            message: message.into(),
+            sqlstate: None,
+            file: None,
+            line: None,
+            col: None,
+            apply: None,
+            migration: None,
+        }
     }
 
     fn sqlstate(mut self, e: &pgmig_conn::Error) -> ApiError {
@@ -482,6 +555,57 @@ impl From<&Error> for ApiError {
                     statement: statement.clone(),
                     committed_batches: *committed_batches,
                     outcome,
+                }));
+                e
+            }
+            Error::Directive { path, pos, .. } => err(ErrorCode::Directive).at(path, Some(*pos)),
+            Error::Revisions(r) => match r {
+                pgmig_migrate::revisions::Error::Edited { .. } => err(ErrorCode::RevisionEdited),
+                pgmig_migrate::revisions::Error::Conn(c) => err(ErrorCode::Revisions).sqlstate(c),
+                _ => err(ErrorCode::Revisions),
+            },
+            Error::History(h) => match h {
+                pgmig_migrate::history::HistoryError::Missing { .. } => err(ErrorCode::HistoryMissing),
+                pgmig_migrate::history::HistoryError::Changed { file, .. } => err(ErrorCode::HistoryChanged).at(file, None),
+                pgmig_migrate::history::HistoryError::OutOfOrder { file, .. } => err(ErrorCode::OutOfOrder).at(file, None),
+            },
+            Error::LockTimeout { .. } => err(ErrorCode::LockTimeout),
+            Error::TxModeConflict { path, .. } => err(ErrorCode::TxModeConflict).at(path, None),
+            Error::Resume { path, .. } => err(ErrorCode::Resume).at(path, None),
+            Error::MigrationFailed { path, pos, statement_index, statement, source, outcome, applied_files } => {
+                let mut e = err(ErrorCode::Migration).at(path, Some(*pos)).sqlstate(source);
+                e.migration = Some(Box::new(MigrationFailure {
+                    statement_index: Some(*statement_index),
+                    statement: statement.clone(),
+                    applied_files: *applied_files,
+                    outcome: *outcome,
+                }));
+                e
+            }
+            Error::MigrationRecord { path, statement_index, source, outcome, applied_files } => {
+                let mut e = match source.as_ref() {
+                    pgmig_migrate::revisions::Error::Conn(c) => err(ErrorCode::Revisions).sqlstate(c),
+                    _ => err(ErrorCode::Revisions),
+                }
+                .at(path, None);
+                e.migration = Some(Box::new(MigrationFailure {
+                    statement_index: *statement_index,
+                    statement: String::new(),
+                    applied_files: *applied_files,
+                    outcome: *outcome,
+                }));
+                e
+            }
+            Error::MigrationStep { path, step, source, outcome, applied_files } => {
+                let mut e = err(ErrorCode::Migration).sqlstate(source);
+                if let Some(p) = path {
+                    e = e.at(p, None);
+                }
+                e.migration = Some(Box::new(MigrationFailure {
+                    statement_index: None,
+                    statement: step.clone(),
+                    applied_files: *applied_files,
+                    outcome: *outcome,
                 }));
                 e
             }
@@ -565,7 +689,16 @@ fn is_diagnostic(e: &Error) -> bool {
         | Error::Shadow(_)
         | Error::Inspect(_)
         | Error::Plan(_)
-        | Error::Apply { .. } => false,
+        | Error::Apply { .. }
+        | Error::Directive { .. }
+        | Error::Revisions(_)
+        | Error::History(_)
+        | Error::LockTimeout { .. }
+        | Error::TxModeConflict { .. }
+        | Error::Resume { .. }
+        | Error::MigrationFailed { .. }
+        | Error::MigrationStep { .. }
+        | Error::MigrationRecord { .. } => false,
     }
 }
 
@@ -618,6 +751,11 @@ pub fn migrate_diff(req: &MigrateDiffRequest) -> Result<MigrateDiffResponse, Api
 pub fn migrate_new(req: &MigrateNewRequest) -> Result<MigrateNewResponse, ApiError> {
     let new = crate::migrate_new(&req.dir, &req.name)?;
     Ok(MigrateNewResponse { file: new.path, version: new.version })
+}
+
+/// [`crate::migrate_apply`].
+pub fn migrate_apply(req: &MigrateApplyRequest) -> Result<MigrateApplyResponse, ApiError> {
+    Ok(crate::migrate_apply(&req.target, &req.dir, &req.options)?)
 }
 
 /// [`crate::config::validate`]: problems with the file are diagnostics; an `Err` means it could
@@ -741,6 +879,7 @@ mod tests {
             line: Some(3),
             col: Some(1),
             apply: None,
+            migration: None,
         };
         round_trip(&ValidateResponse { diagnostics: vec![load.clone()] });
         round_trip(&MigrateValidateResponse { diagnostics: vec![load.clone()], replayed: false });
@@ -813,6 +952,16 @@ mod tests {
             FileNotHashed,
             FileReordered,
             Config,
+            Directive,
+            Revisions,
+            RevisionEdited,
+            HistoryMissing,
+            HistoryChanged,
+            OutOfOrder,
+            LockTimeout,
+            TxModeConflict,
+            Resume,
+            Migration,
         ] {
             assert_eq!(serde_json::to_string(&code).expect("serialize"), format!("\"{}\"", code.as_str()));
         }
@@ -851,6 +1000,46 @@ mod tests {
         assert!(apply(None, "COMMIT", Some("40001")).ends_with(&tail("null", "COMMIT", "rolled_back")));
         assert!(apply(None, "COMMIT", None).ends_with(&tail("null", "COMMIT", "unknown")));
         assert!(apply(None, "BEGIN", None).ends_with(&tail("null", "BEGIN", "not_started")));
+    }
+
+    #[test]
+    fn migrate_apply_requests_default_their_options() {
+        let req: MigrateApplyRequest = serde_json::from_str(r#"{"target":"host=a","dir":"m"}"#).expect("request");
+        assert_eq!(req.options, ApplyOptions::default());
+        let req: MigrateApplyRequest =
+            serde_json::from_str(r#"{"target":"host=a","dir":"m","options":{"tx_mode":"none","exec_order":"linear-skip","lock":false}}"#)
+                .expect("request");
+        assert_eq!(
+            (req.options.tx_mode, req.options.exec_order, req.options.lock),
+            (crate::TxMode::None, crate::ExecOrder::LinearSkip, false)
+        );
+        round_trip(&req);
+        assert!(serde_json::from_str::<MigrateApplyRequest>(r#"{"target":"h","dir":"m","options":{"txmode":"none"}}"#).is_err());
+        assert_eq!(ApplyOptions::default().lock_name(), "pgmig:pgmig");
+    }
+
+    #[test]
+    fn migration_errors_are_structured() {
+        let source = pgmig_conn::Error { code: Some("42P01".into()), message: "boom".into(), position: None };
+        let e = Error::MigrationFailed {
+            path: "m/2_b.sql".into(),
+            pos: pgmig_sql::Pos { line: 3, col: 1 },
+            statement_index: 1,
+            statement: "INSERT INTO nope VALUES (1)".into(),
+            source: Box::new(source),
+            outcome: MigrationOutcome::FileRolledBack,
+            applied_files: 1,
+        };
+        let json = serde_json::to_value(ApiError::from(&e)).expect("serialize");
+        assert_eq!((json["code"].as_str(), json["sqlstate"].as_str(), json["line"].as_u64()), (Some("migration"), Some("42P01"), Some(3)));
+        assert_eq!(json["migration"]["outcome"], "file_rolled_back");
+        assert_eq!(json["migration"]["statement_index"], 1);
+        assert_eq!(
+            e.to_string(),
+            "m/2_b.sql:3:1: boom (SQLSTATE 42P01)\nthe file's transaction was rolled back; 1 earlier file of this run stays applied"
+        );
+        // Other errors leave the field out.
+        assert!(serde_json::to_value(ApiError::from(&Error::NotSql)).expect("serialize").get("migration").is_none());
     }
 
     #[test]

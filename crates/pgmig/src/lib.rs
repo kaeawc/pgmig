@@ -14,13 +14,17 @@ use serde::{Deserialize, Serialize};
 pub mod api;
 mod files;
 pub mod filter;
+pub mod migrate_apply;
 
 pub use filter::{Filter, Pattern, PatternError, filter_model, scope_model, without_schema};
+pub use migrate_apply::{ApplyOptions, ExecOrder, FileReport, FileStatus, MigrateApplyReport, MigrationOutcome, TxMode, migrate_apply};
 /// `pgmig.toml`: project configuration.
 pub use pgmig_config as config;
 pub use pgmig_conn::Conn;
 pub use pgmig_diff::{Change, diff};
 pub use pgmig_inspect::inspect;
+/// What a database's history leaves to apply, lock keys and statement hashes.
+pub use pgmig_migrate::history;
 /// The revisions table in the target database.
 pub use pgmig_migrate::revisions;
 pub use pgmig_migrate::{Dir as MigrationDir, SUM_FILE, SumFile, SumLine, ValidateError as ChecksumError};
@@ -84,6 +88,53 @@ pub enum Error {
         source: pgmig_conn::Error,
         /// Batches committed before the failing one: their changes stay applied.
         committed_batches: usize,
+    },
+    /// A `-- pgmig:<name>` directive that is misplaced or has bad arguments.
+    #[error("{path}:{pos}: {message}")]
+    Directive { path: PathBuf, pos: pgmig_sql::Pos, message: String },
+    /// The revisions table cannot be read or written, or a row was edited by hand.
+    #[error(transparent)]
+    Revisions(#[from] pgmig_migrate::revisions::Error),
+    /// The database's history does not match the migration directory.
+    #[error(transparent)]
+    History(#[from] pgmig_migrate::history::HistoryError),
+    /// `migrate apply` could not take its advisory lock in time.
+    #[error(
+        "another migrate apply holds the advisory lock {name:?} (key {key}); gave up after {timeout_ms} ms: retry, raise --lock-timeout, or use another --lock-name"
+    )]
+    LockTimeout { name: String, key: i64, timeout_ms: u64 },
+    /// `--tx-mode all` with a pending file that runs without a transaction or has a commit point.
+    #[error("{path}: {reason}, so it cannot run inside the single transaction of --tx-mode all")]
+    TxModeConflict { path: PathBuf, reason: String },
+    /// A file an earlier run stopped part way through cannot resume.
+    #[error("{path}: cannot resume after the statements an earlier run applied: {reason}")]
+    Resume { path: PathBuf, reason: String },
+    /// A migration statement failed; `pos` is where the server located the error.
+    #[error("{path}:{pos}: {source}\n{}", migrate_apply::outcome_message(*.outcome, *.applied_files))]
+    MigrationFailed {
+        path: PathBuf,
+        pos: pgmig_sql::Pos,
+        /// 0-based index of the statement in its file.
+        statement_index: usize,
+        statement: String,
+        /// The server's error, verbatim with its SQLSTATE (boxed: it keeps [`Error`] small).
+        source: Box<pgmig_conn::Error>,
+        outcome: MigrationOutcome,
+        /// Files of this run committed before the failing one.
+        applied_files: usize,
+    },
+    /// Something around a migration's statements failed: `BEGIN`, `COMMIT`, a hook.
+    #[error("{}{step} failed: {source}\n{}", .path.as_ref().map(|p| format!("{}: ", p.display())).unwrap_or_default(), migrate_apply::outcome_message(*.outcome, *.applied_files))]
+    MigrationStep { path: Option<PathBuf>, step: String, source: pgmig_conn::Error, outcome: MigrationOutcome, applied_files: usize },
+    /// Writing a migration's revisions row failed; `statement_index` is the statement that ran
+    /// without a transaction and could not be recorded.
+    #[error("{path}: recording progress in the revisions table failed{}: {source}\n{}", .statement_index.map(|i| format!(" after statement {}", i + 1)).unwrap_or_default(), migrate_apply::outcome_message(*.outcome, *.applied_files))]
+    MigrationRecord {
+        path: PathBuf,
+        statement_index: Option<usize>,
+        source: Box<pgmig_migrate::revisions::Error>,
+        outcome: MigrationOutcome,
+        applied_files: usize,
     },
 }
 
@@ -416,7 +467,7 @@ fn write_migration(path: &Path, existing: Option<MigrationDir>, description: &st
 
 /// Reject any `-- pgmig:import` in a migration, file-level or on a statement: migrations are
 /// self-contained. A file that is not UTF-8 or does not split is left to the replay to report.
-fn check_no_imports(dir: &MigrationDir) -> Result<()> {
+pub(crate) fn check_no_imports(dir: &MigrationDir) -> Result<()> {
     for f in dir.files() {
         let Ok(text) = std::str::from_utf8(&f.bytes) else { continue };
         let Ok(file) = pgmig_sql::split(text) else { continue };

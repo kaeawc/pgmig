@@ -28,8 +28,9 @@ Configuration: every flag except --dry-run, --auto-approve and --exit-code can b
 pgmig.toml (or the file given to --config), under the flag's name: `url`, `shadow`, `from`, `to`
 (also the SOURCE of `schema inspect` and `schema validate`, and the desired state of `migrate
 diff`), `include`, `exclude`, `schema`,
-`format`, and `dir` as `[migrations] dir`. `[migrations] revisions_schema` (default `pgmig`) names
-the schema of the revisions table; pgmig never manages that schema. `[env.NAME]` sections, selected with --env NAME,
+`format`, and the `migrate apply` flags under `[migrations]`: `dir`, `tx_mode`, `exec_order`,
+`lock_name`, `lock_timeout`, `before_sql`, `after_sql`. `[migrations] revisions_schema` (default
+`pgmig`) names the schema of the revisions table; pgmig never manages that schema. `[env.NAME]` sections, selected with --env NAME,
 override the top level. A flag wins over both. `${KEY}` in a value is replaced by --var KEY=VALUE,
 or else by the environment variable KEY; `$${` is a literal `${`.";
 
@@ -110,6 +111,49 @@ enum MigrateCommand {
         #[command(flatten)]
         format: FormatArg,
     },
+    /// Apply the pending migrations to a database, in version order. Refuses when the directory
+    /// does not match pgmig.sum or the database's revisions table does not match the directory (an
+    /// applied file edited or deleted, a row edited by hand, an older pending file under the
+    /// linear order). Holds an advisory lock for the whole run, so concurrent runs wait.
+    Apply {
+        /// Apply at most N pending files.
+        n: Option<usize>,
+        /// The database to migrate (config: `url`).
+        #[arg(long)]
+        url: Option<String>,
+        #[command(flatten)]
+        dir: DirArg,
+        /// `file` (default): each file in its own transaction; `all`: every pending file in one;
+        /// `none`: no transaction, each statement recorded as it commits so a re-run resumes after
+        /// the last one. `-- pgmig:txmode none` before a file's first statement runs it without a
+        /// transaction.
+        #[arg(long, value_enum)]
+        tx_mode: Option<TxModeArg>,
+        /// For pending files older than the newest applied one: `linear` (default) refuses,
+        /// `linear-skip` skips them with a warning, `non-linear` applies them.
+        #[arg(long, value_enum)]
+        exec_order: Option<ExecOrderArg>,
+        /// The advisory lock's name (default `pgmig:<revisions schema>`).
+        #[arg(long, value_name = "NAME")]
+        lock_name: Option<String>,
+        /// How long to wait for the lock: `500ms`, `10s` (default), `2m`; `0` tries once.
+        #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+        lock_timeout: Option<u64>,
+        /// Do not take the advisory lock.
+        #[arg(long, conflicts_with_all = ["lock_name", "lock_timeout"])]
+        no_lock: bool,
+        /// SQL run right after each BEGIN, e.g. "SET LOCAL lock_timeout = '5s'".
+        #[arg(long, value_name = "SQL")]
+        before_sql: Option<String>,
+        /// SQL run right before each COMMIT.
+        #[arg(long, value_name = "SQL")]
+        after_sql: Option<String>,
+        /// List the pending files and change nothing.
+        #[arg(long)]
+        dry_run: bool,
+        #[command(flatten)]
+        format: FormatArg,
+    },
     /// Check the files against the sum file, and with --shadow replay them in order; prints
     /// nothing on success.
     Validate {
@@ -122,6 +166,24 @@ enum MigrateCommand {
         #[command(flatten)]
         format: FormatArg,
     },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum TxModeArg {
+    File,
+    All,
+    None,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ExecOrderArg {
+    Linear,
+    LinearSkip,
+    NonLinear,
+}
+
+fn parse_duration(s: &str) -> Result<u64, String> {
+    pgmig::config::parse_duration_ms(s).ok_or_else(|| "expected a duration such as 500ms, 10s or 2m".to_owned())
 }
 
 #[derive(clap::Args)]
@@ -334,6 +396,7 @@ impl Cli {
                 MigrateCommand::Hash { format, .. }
                 | MigrateCommand::Diff { format, .. }
                 | MigrateCommand::New { format, .. }
+                | MigrateCommand::Apply { format, .. }
                 | MigrateCommand::Validate { format, .. },
             )
             | Command::Config(ConfigCommand::Validate { format }) => format.format,
@@ -355,6 +418,61 @@ fn run(cli: Cli, loaded: &Loaded, format: Format) -> anyhow::Result<ExitCode> {
     let settings = &loaded.settings;
     let command = match cli.command {
         Command::Schema(command) => command,
+        Command::Migrate(MigrateCommand::Apply {
+            n,
+            url,
+            dir,
+            tx_mode,
+            exec_order,
+            lock_name,
+            lock_timeout,
+            no_lock,
+            before_sql,
+            after_sql,
+            dry_run,
+            format: _,
+        }) => {
+            let s = settings;
+            let source = match &url {
+                Some(_) => "--url".to_owned(),
+                None => loaded.url_source.clone().unwrap_or_else(|| "`url` in the config file".to_owned()),
+            };
+            let target = need(url, s.url.clone(), "--url", "url")?;
+            let shown = Target { display: pgmig::config::redact(&target), source };
+            // Values in the config file were checked when it was read.
+            let tx_mode = match tx_mode {
+                Some(TxModeArg::File) => pgmig::TxMode::File,
+                Some(TxModeArg::All) => pgmig::TxMode::All,
+                Some(TxModeArg::None) => pgmig::TxMode::None,
+                None => s.migrations_tx_mode.as_deref().and_then(pgmig::TxMode::parse).unwrap_or_default(),
+            };
+            let exec_order = match exec_order {
+                Some(ExecOrderArg::Linear) => pgmig::ExecOrder::Linear,
+                Some(ExecOrderArg::LinearSkip) => pgmig::ExecOrder::LinearSkip,
+                Some(ExecOrderArg::NonLinear) => pgmig::ExecOrder::NonLinear,
+                None => s.migrations_exec_order.as_deref().and_then(pgmig::ExecOrder::parse).unwrap_or_default(),
+            };
+            let lock_timeout_ms = lock_timeout
+                .or_else(|| s.migrations_lock_timeout.as_deref().and_then(pgmig::config::parse_duration_ms))
+                .unwrap_or(pgmig::migrate_apply::DEFAULT_LOCK_TIMEOUT_MS);
+            let req = api::MigrateApplyRequest {
+                target,
+                dir: need(dir.dir, s.migrations_dir.clone().map(PathBuf::from), "--dir", "migrations.dir")?,
+                options: pgmig::ApplyOptions {
+                    tx_mode,
+                    exec_order,
+                    lock: !no_lock,
+                    lock_name: lock_name.or_else(|| s.migrations_lock_name.clone()),
+                    lock_timeout_ms,
+                    before_sql: before_sql.or_else(|| s.migrations_before_sql.clone()),
+                    after_sql: after_sql.or_else(|| s.migrations_after_sql.clone()),
+                    limit: n,
+                    dry_run,
+                    revisions_schema: s.migrations_revisions_schema.clone().unwrap_or_else(|| pgmig::revisions::DEFAULT_SCHEMA.to_owned()),
+                },
+            };
+            return migrate_apply(&req, &shown, format);
+        }
         Command::Migrate(command) => return migrate(command, settings, format),
         Command::Config(ConfigCommand::Validate { .. }) => {
             let req = api::ConfigValidateRequest {
@@ -479,6 +597,8 @@ fn migrate(command: MigrateCommand, s: &Settings, format: Format) -> anyhow::Res
                 Format::Json => print_json(&res)?,
             }
         }
+        // Handled by `run`, which knows where `url` came from.
+        MigrateCommand::Apply { .. } => unreachable!("migrate apply is run by `run`"),
         MigrateCommand::Validate { dir: d, shadow, format: _ } => {
             // The config file's `shadow` turns the replay on too.
             let shadow = shadow.or_else(|| s.shadow.clone());
@@ -496,6 +616,61 @@ fn migrate(command: MigrateCommand, s: &Settings, format: Format) -> anyhow::Res
                 return Ok(ExitCode::FAILURE);
             }
         }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// What `migrate apply --format json` prints: the target and the report.
+#[derive(Serialize)]
+struct MigrateApplyOutput<'a> {
+    target: &'a Target,
+    #[serde(flatten)]
+    report: api::MigrateApplyResponse,
+}
+
+/// `migrate apply`: the files applied (or with --dry-run pending) on stdout, one per line; skipped
+/// files and the summary on stderr.
+fn migrate_apply(req: &api::MigrateApplyRequest, target: &Target, format: Format) -> anyhow::Result<ExitCode> {
+    use pgmig::FileStatus;
+    if format == Format::Text {
+        eprintln!("Target: {} (from {})", target.display, target.source);
+    }
+    let report = api::migrate_apply(req)?;
+    if format == Format::Json {
+        print_json(&MigrateApplyOutput { target, report })?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    let plural = |n: usize| if n == 1 { "" } else { "s" };
+    for f in &report.files {
+        match f.status {
+            FileStatus::Skipped => {
+                eprintln!("warning: skipped {}: older than the newest applied migration (--exec-order linear-skip)", f.file);
+            }
+            FileStatus::Applied => {
+                let resumed = if f.resumed_after > 0 { format!(", resumed after {}", f.resumed_after) } else { String::new() };
+                println!("{} ({} statement{}{resumed}, {} ms)", f.file, f.statements, plural(f.statements), f.execution_ms);
+            }
+            FileStatus::Pending if report.dry_run => println!("{}", f.file),
+            FileStatus::Pending | FileStatus::AlreadyApplied => {}
+        }
+    }
+    let pending = report.files.iter().filter(|f| f.status == FileStatus::Pending).count();
+    if report.dry_run {
+        match pending {
+            0 => eprintln!("nothing to apply"),
+            n => eprintln!("{n} migration{} pending (dry run: nothing applied)", plural(n)),
+        }
+    } else if report.applied == 0 {
+        eprintln!("nothing to apply");
+    } else {
+        let left = if pending > 0 { format!("; {pending} left pending") } else { String::new() };
+        eprintln!(
+            "applied {} migration{} ({} statement{}){left}",
+            report.applied,
+            plural(report.applied),
+            report.statements,
+            plural(report.statements)
+        );
     }
     Ok(ExitCode::SUCCESS)
 }

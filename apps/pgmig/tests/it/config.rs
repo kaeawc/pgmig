@@ -218,7 +218,10 @@ fn config_validate() {
         v["diagnostics"].as_array().expect("diagnostics").iter().map(|d| d["message"].as_str().expect("message")).collect();
     assert_eq!(messages.len(), 3, "{messages:?}");
     assert_eq!(messages[0], "custom.toml: env.prod.format: expected \"text\" or \"json\"");
-    assert_eq!(messages[1], "custom.toml: env.prod.migrations.dirr: unknown key (expected `dir` or `revisions_schema`)");
+    assert!(
+        messages[1].starts_with("custom.toml: env.prod.migrations.dirr: unknown key (expected one of `dir`, `revisions_schema`, "),
+        "{messages:?}"
+    );
     assert!(messages[2].starts_with("custom.toml: shadoww: unknown key"), "{messages:?}");
     assert_eq!(v["diagnostics"][0]["code"], "config");
     assert_eq!(v["diagnostics"][0]["file"], "custom.toml");

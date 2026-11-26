@@ -8,6 +8,11 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
 
 ### Added
 
+- `pgmig migrate apply --url <target> --dir <dir>`: applies pending migrations under an advisory
+  lock (`--lock-name`, `--lock-timeout`, `--no-lock`), in `--tx-mode file` (default), `all` or
+  `none` (or `-- pgmig:txmode none` per file), with `--exec-order linear`, `linear-skip` or
+  `non-linear`, session hooks (`--before-sql`, `--after-sql`), resume of partly applied files, and
+  refusal when the directory or the recorded history does not match. `--dry-run` lists pending files.
 - Revisions table library (`pgmig_revisions` in the `pgmig` schema, configurable with
   `[migrations] revisions_schema`): versioned format, per-row hashes that reveal hand edits.
 - `pgmig migrate diff <name>` writes the next migration from the desired state (nothing when there
@@ -62,6 +67,7 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
 
 ### Changed
 
+- Plans mark commit points with a `-- pgmig:commit` directive line after the explanatory comment.
 - The revisions schema (`pgmig` by default) is never managed by `schema` commands: it is left out
   of inspect, diff and apply on both sides. A project with its own schema named `pgmig` must set
   `[migrations] revisions_schema` to another name.

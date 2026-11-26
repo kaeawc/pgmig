@@ -14,9 +14,9 @@
 //! | `total` | `integer not null` | statements in the file |
 //! | `executed_at` | `timestamptz not null` | when the file started (the server's `now()`) |
 //! | `execution_ms` | `bigint not null` | how long it took, so far |
-//! | `error` | `text` | the last error, if any |
+//! | `error` | `text` | the last error, if any, or the in-flight marker ([`Revision::start_statement`]) |
 //! | `error_stmt` | `text` | the statement that failed |
-//! | `hash` | `text not null` | the file's hash in the sum file |
+//! | `hash` | `text not null` | the file's own hash ([`crate::File::hash`]) |
 //! | `partial_hashes` | `text[] not null` | hash of each applied statement, in order, for resuming |
 //! | `pgmig_version` | `text not null` | the pgmig that wrote the row |
 //! | `row_hash` | `text not null` | [`Revision::row_hash`], to catch hand edits |
@@ -69,6 +69,9 @@ pub const FORMAT: u32 = 1;
 const ENSURE_LOCK_KEY: i64 = 0x7067_6d69_6772_6576;
 
 const COMMENT_PREFIX: &str = "pgmig revisions table, format ";
+
+/// How `error` starts while a statement runs without a transaction ([`Revision::start_statement`]).
+const IN_FLIGHT_PREFIX: &str = "in flight: statement ";
 
 /// The columns, in the order [`Table::read`] selects them.
 const COLUMNS: &str = "version, description, kind, applied, total, executed_at, execution_ms, error, error_stmt, hash, \
@@ -153,7 +156,7 @@ pub struct Revision {
     pub execution_ms: u64,
     pub error: Option<String>,
     pub error_stmt: Option<String>,
-    /// The file's hash in the sum file (base64, without `h1:`).
+    /// The file's own hash ([`crate::File::hash`], base64): its name and bytes, not chained.
     pub hash: String,
     /// The hash of each applied statement, in order.
     pub partial_hashes: Vec<String>,
@@ -186,6 +189,22 @@ impl Revision {
         self.partial_hashes.push(statement_hash.to_owned());
         self.error = None;
         self.error_stmt = None;
+    }
+
+    /// Statement `index` (0-based) is about to run without a transaction. Written before it runs,
+    /// the row says so until [`Revision::progress`] or [`Revision::fail`] replaces it: a row still
+    /// in flight means a run stopped without knowing whether the statement took effect
+    /// ([`Revision::in_flight`]).
+    pub fn start_statement(&mut self, index: usize, statement: &str) {
+        self.error = Some(format!("{IN_FLIGHT_PREFIX}{} started without a transaction; whether it finished was not recorded", index + 1));
+        self.error_stmt = Some(statement.to_owned());
+    }
+
+    /// The 0-based index of the statement [`Revision::start_statement`] marked, while the row still
+    /// says so.
+    pub fn in_flight(&self) -> Option<usize> {
+        let rest = self.error.as_deref()?.strip_prefix(IN_FLIGHT_PREFIX)?;
+        rest.split(' ').next()?.parse::<usize>().ok()?.checked_sub(1)
     }
 
     /// The statement `statement` failed with `error`.
@@ -425,6 +444,38 @@ impl Table {
         Ok(())
     }
 
+    /// Replace the row for `rev.version` (if any) with `rev`, `executed_at` as for
+    /// [`Table::insert`], in one round trip. Outside a transaction (`in_tx` false) the delete and
+    /// the insert are wrapped in one, so the row is never missing, even if the session dies
+    /// between them; inside one (`in_tx` true) they are part of it.
+    pub fn replace(&self, conn: &mut Conn, rev: &Revision, in_tx: bool) -> Result<()> {
+        let sql = self.replace_sql(rev, in_tx)?;
+        conn.batch(&sql).map_err(|e| {
+            if !in_tx {
+                let _ = conn.batch("ROLLBACK");
+            }
+            Error::Conn(e)
+        })
+    }
+
+    fn replace_sql(&self, rev: &Revision, in_tx: bool) -> Result<String> {
+        rev.check()?;
+        let mut cols = vec!["version", "executed_at"];
+        let mut vals = vec![lit(&rev.version), rev.executed_at_sql().unwrap_or_else(|| "now()".to_owned())];
+        for (c, v) in rev.fields() {
+            cols.push(c);
+            vals.push(v);
+        }
+        let table = self.name();
+        let body = format!(
+            "DELETE FROM {table} WHERE version = {};\nINSERT INTO {table} ({}) VALUES ({})",
+            lit(&rev.version),
+            cols.join(", "),
+            vals.join(", ")
+        );
+        Ok(if in_tx { body } else { format!("BEGIN;\n{body};\nCOMMIT") })
+    }
+
     /// Remove the row for `version`; whether there was one.
     pub fn delete(&self, conn: &mut Conn, version: &str) -> Result<bool> {
         let rows = conn.query(&format!("DELETE FROM {} WHERE version = {} RETURNING version", self.name(), lit(version)))?;
@@ -586,6 +637,39 @@ mod tests {
             c(&mut r);
             assert!(matches!(r.check(), Err(Error::Invalid { .. })), "case {i}");
         }
+    }
+
+    #[test]
+    fn in_flight_marker() {
+        let mut r = rev();
+        assert_eq!(r.in_flight(), None);
+        r.start_statement(1, "CREATE INDEX CONCURRENTLY i ON t (c)");
+        assert_eq!((r.in_flight(), r.error_stmt.as_deref()), (Some(1), Some("CREATE INDEX CONCURRENTLY i ON t (c)")));
+        assert!(!r.is_complete());
+        r.check().expect("valid");
+        let mut done = r.clone();
+        done.progress("s1");
+        assert_eq!((done.in_flight(), done.error.as_deref()), (None, None));
+        r.fail("boom (SQLSTATE 42P01)", "x");
+        assert_eq!(r.in_flight(), None);
+    }
+
+    /// The row is replaced in one round trip, and outside a transaction in one transaction: a
+    /// session that dies after the delete never leaves the file without its row.
+    #[test]
+    fn replace_is_one_transaction() {
+        let t = Table { schema: DEFAULT_SCHEMA.into() };
+        let r = rev();
+        let alone = t.replace_sql(&r, false).expect("sql");
+        assert!(alone.starts_with("BEGIN;\nDELETE FROM pgmig.pgmig_revisions WHERE version = E'20261126103000';\nINSERT INTO"), "{alone}");
+        assert!(alone.ends_with(";\nCOMMIT"), "{alone}");
+        assert_eq!((alone.matches("DELETE").count(), alone.matches("INSERT").count()), (1, 1));
+        let inside = t.replace_sql(&r, true).expect("sql");
+        assert!(inside.starts_with("DELETE") && !inside.contains("BEGIN") && !inside.contains("COMMIT"), "{inside}");
+        assert!(alone.contains(&inside));
+        let mut bad = r.clone();
+        bad.applied = 3;
+        assert!(matches!(t.replace_sql(&bad, false), Err(Error::Invalid { .. })));
     }
 
     #[test]
