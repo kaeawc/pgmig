@@ -16,12 +16,16 @@ mod files;
 pub mod filter;
 pub mod migrate_apply;
 pub mod migrate_maintain;
+pub mod migrate_status;
 
 pub use filter::{Filter, Pattern, PatternError, filter_model, scope_model, without_schema};
 pub use migrate_apply::{ApplyOptions, ExecOrder, FileReport, FileStatus, MigrateApplyReport, MigrationOutcome, TxMode, migrate_apply};
 pub use migrate_maintain::{
     Guard, ListedMigration, MigrateEdit, MigrateLs, MigrateRebase, MigrateRm, MigrateShow, MissingRevision, RebasedFile, RevisionStatus,
     migrate_edit, migrate_ls, migrate_rebase, migrate_rm, migrate_show,
+};
+pub use migrate_status::{
+    IssueKind, MigrateSet, MigrateStatus, SetAction, SetChange, SetOptions, StatusFile, StatusIssue, migrate_set, migrate_status,
 };
 /// `pgmig.toml`: project configuration.
 pub use pgmig_config as config;
@@ -150,6 +154,22 @@ pub enum Error {
     /// `migrate edit`: the editor could not be run or failed.
     #[error("editor `{command}`: {reason}")]
     Editor { command: String, reason: String },
+    /// `migrate apply` onto a database without history that already holds objects.
+    #[error(
+        "the database has no migration history but already holds {count} object{} ({}{}): pass --baseline <version> to record the migrations up to that version as applied without running them (write a baseline file with `pgmig migrate baseline`), or --allow-dirty to apply every migration onto it anyway",
+        if *.count == 1 { "" } else { "s" },
+        .objects.join(", "),
+        if *.count > .objects.len() { ", ..." } else { "" }
+    )]
+    DirtyDatabase {
+        /// How many objects it holds.
+        count: usize,
+        /// The first few, as `table public.users`.
+        objects: Vec<String>,
+    },
+    /// `migrate set` would drop or overwrite history that records a complete migration.
+    #[error("{table}: `migrate set {version}` would {}; pass --force to do it anyway", .reasons.join("; "))]
+    NeedsForce { table: String, version: String, reasons: Vec<String> },
 }
 
 fn apply_message(index: &Option<usize>, statement: &str, source: &pgmig_conn::Error, committed: &usize) -> String {
@@ -477,6 +497,47 @@ fn write_migration(path: &Path, existing: Option<MigrationDir>, description: &st
     all.push(new);
     MigrationDir::from_files(path, all)?.write_sum()?;
     Ok(NewMigration { path: file, version })
+}
+
+/// The file of `dir` whose name (a path is reduced to its last component) or version is exactly
+/// `key`: unlike [`MigrationDir::find`], never a prefix, for commands that change history.
+pub(crate) fn exact_file<'a>(dir: &'a MigrationDir, key: &str) -> Result<&'a pgmig_migrate::File> {
+    let name = Path::new(key).file_name().and_then(|n| n.to_str()).unwrap_or(key);
+    let digits = !key.is_empty() && key.bytes().all(|b| b.is_ascii_digit());
+    dir.files()
+        .iter()
+        .find(|f| f.name == name || (digits && pgmig_migrate::compare_versions(&f.version, key).is_eq()))
+        .ok_or_else(|| Error::Migrate(pgmig_migrate::Error::NotFound { dir: dir.path.clone(), key: key.to_owned() }))
+}
+
+/// `migrate baseline`: write the schema of the live database at `target` (the objects `opts`
+/// manages, never the revisions schema) as the first migration `<version>_<name>.sql` of the
+/// directory at `dir` (created when missing), and rehash. It is `schema inspect` of the database,
+/// schema-qualified because it will be executed; in schema mode the schema itself is not in it.
+///
+/// A directory that already holds migrations is refused: a fresh database replays every file in
+/// order, so a file recreating the whole schema after them would fail. Mark the file applied on
+/// the database it came from with `migrate apply --baseline <version>`.
+pub fn migrate_baseline(dir: &Path, name: &str, target: &str, opts: &Options) -> Result<NewMigration> {
+    migrate_baseline_at(dir, name, target, opts, SystemTime::now())
+}
+
+fn migrate_baseline_at(dir: &Path, name: &str, target: &str, opts: &Options, now: SystemTime) -> Result<NewMigration> {
+    opts.validate()?;
+    let description = description(name)?;
+    let existing = if dir.exists() { Some(open_checked(dir)?) } else { None };
+    if let Some(d) = existing.as_ref().filter(|d| !d.files().is_empty()) {
+        return Err(Error::Options(format!(
+            "{} already holds {} migration(s); a baseline must be the directory's first file (a fresh database replays every file in order)",
+            d.path.display(),
+            d.files().len()
+        )));
+    }
+    let mut conn = Conn::connect(target)?;
+    let model = opts.managed(&inspect(&mut conn)?);
+    drop(conn);
+    let plan = plan_with(&diff(&opts.empty_database(), &model), &PlanOptions::default())?;
+    write_migration(dir, existing, &description, plan.to_sql(), now)
 }
 
 /// Reject any `-- pgmig:import` in a migration, file-level or on a statement: migrations are

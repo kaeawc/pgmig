@@ -404,14 +404,24 @@ impl Table {
 
     /// Every row, in version order. A row whose hash does not match is [`Error::Edited`].
     pub fn read(&self, conn: &mut Conn) -> Result<Vec<Revision>> {
+        let out = self.read_unchecked(conn)?;
+        if let Some(r) = out.iter().find(|r| r.edited) {
+            return Err(Error::Edited { table: self.name(), version: r.revision.version.clone() });
+        }
+        Ok(out.into_iter().map(|r| r.revision).collect())
+    }
+
+    /// Every row, in version order, each with whether it was edited by hand, instead of refusing
+    /// those: for `migrate status`, which reports them, and `migrate set`, which rewrites them. A
+    /// row whose columns cannot be read at all ([`Error::Malformed`]) is still an error.
+    pub fn read_unchecked(&self, conn: &mut Conn) -> Result<Vec<Stored>> {
         let table = self.name();
         let rows = conn.query(&format!("SELECT {COLUMNS} FROM {table}"))?;
         let mut out = rows.into_iter().map(|r| parse_row(&table, r)).collect::<Result<Vec<_>>>()?;
-        out.sort_by(|(a, _), (b, _)| compare_versions(&a.version, &b.version).then_with(|| a.version.cmp(&b.version)));
-        if let Some((r, _)) = out.iter().find(|(r, stored)| r.row_hash() != *stored) {
-            return Err(Error::Edited { table, version: r.version.clone() });
-        }
-        Ok(out.into_iter().map(|(r, _)| r).collect())
+        out.sort_by(|a, b| {
+            compare_versions(&a.revision.version, &b.revision.version).then_with(|| a.revision.version.cmp(&b.revision.version))
+        });
+        Ok(out)
     }
 
     /// Add `rev`'s row; `executed_at` is the server's `now()` unless `rev` gives it. A version
@@ -501,8 +511,17 @@ fn qualified(schema: &str) -> String {
     format!("{}.{TABLE}", quote_ident(schema))
 }
 
-/// A selected row: the revision and its stored row hash.
-fn parse_row(table: &str, row: pgmig_conn::Row) -> Result<(Revision, String)> {
+/// A row as stored, and whether it was edited by hand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stored {
+    pub revision: Revision,
+    /// Its row hash does not match ([`Revision::row_hash`]), or its statement hashes do not read
+    /// back as pgmig writes them: something other than pgmig changed it.
+    pub edited: bool,
+}
+
+/// A selected row.
+fn parse_row(table: &str, row: pgmig_conn::Row) -> Result<Stored> {
     let mut cols = row.into_iter();
     let mut next = || cols.next().flatten();
     let version = next().unwrap_or_default();
@@ -533,7 +552,7 @@ fn parse_row(table: &str, row: pgmig_conn::Row) -> Result<(Revision, String)> {
     let partial_hashes: Vec<String> =
         if partial_text.is_empty() { Vec::new() } else { partial_text.split(',').map(str::to_owned).collect() };
     let rev = Revision {
-        version: version.clone(),
+        version,
         description,
         kind,
         applied,
@@ -548,10 +567,8 @@ fn parse_row(table: &str, row: pgmig_conn::Row) -> Result<(Revision, String)> {
     };
     // An element holding a comma (or an empty one) does not read back as it was stored: whatever
     // wrote it was not pgmig.
-    if rev.partial_hashes.len() as u64 != partial_count {
-        return Err(Error::Edited { table: table.to_owned(), version });
-    }
-    Ok((rev, row_hash))
+    let edited = rev.partial_hashes.len() as u64 != partial_count || rev.row_hash() != row_hash;
+    Ok(Stored { revision: rev, edited })
 }
 
 #[cfg(test)]

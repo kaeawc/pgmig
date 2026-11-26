@@ -13,7 +13,8 @@ Exit codes:
   0  success
   1  error (also: `schema validate` or `migrate validate` found errors)
   2  usage error (unknown flag, missing argument)
-  3  `--exit-code` was given and the plan is not empty
+  3  `--exit-code` was given and the plan is not empty (`migrate status`: the database is not up
+     to date: files pending, or problems)
 
 A state (--from, --to, SOURCE) is a database when it is a postgres:// URL or a key=value
 connection string, a migration directory when it is a directory holding pgmig.sum (checked
@@ -24,7 +25,8 @@ failure prints the error object ({\"code\", \"message\", \"sqlstate\", \"file\",
 \"apply\"}) on stdout and exits 1, or 2 when its code is \"usage\". Bad flags are reported by the
 argument parser as text on stderr (exit 2).
 
-Configuration: every flag except --dry-run, --auto-approve and --exit-code can be set in
+Configuration: every flag except --dry-run, --auto-approve, --exit-code, --force, --baseline,
+--allow-dirty and --no-lock can be set in
 pgmig.toml (or the file given to --config), under the flag's name: `url`, `shadow`, `from`, `to`
 (also the SOURCE of `schema inspect` and `schema validate`, and the desired state of `migrate
 diff`), `include`, `exclude`, `schema`,
@@ -102,6 +104,23 @@ enum MigrateCommand {
         #[command(flatten)]
         format: FormatArg,
     },
+    /// Adopt an existing database: write its schema (`schema inspect` of it, schema-qualified;
+    /// --include, --exclude and --schema apply, the revisions schema never) as the first migration
+    /// `<version>_<NAME>.sql` of an empty or missing directory, then update pgmig.sum. Then mark it
+    /// applied there with `migrate apply --baseline <version>`; fresh databases run it as usual.
+    Baseline {
+        /// The migration's description: lowercased, anything but a-z, 0-9 and _ becomes _.
+        name: String,
+        /// The database to read (config: `url`).
+        #[arg(long)]
+        url: Option<String>,
+        #[command(flatten)]
+        dir: DirArg,
+        #[command(flatten)]
+        scope: ScopeArgs,
+        #[command(flatten)]
+        format: FormatArg,
+    },
     /// Write an empty migration `<version>_<NAME>.sql` to fill in by hand, then update pgmig.sum.
     New {
         /// The migration's description: lowercased, anything but a-z, 0-9 and _ becomes _.
@@ -115,6 +134,9 @@ enum MigrateCommand {
     /// does not match pgmig.sum or the database's revisions table does not match the directory (an
     /// applied file edited or deleted, a row edited by hand, an older pending file under the
     /// linear order). Holds an advisory lock for the whole run, so concurrent runs wait.
+    ///
+    /// A database without migration history that already holds objects is refused unless
+    /// --baseline or --allow-dirty is given.
     Apply {
         /// Apply at most N pending files.
         n: Option<usize>,
@@ -148,7 +170,72 @@ enum MigrateCommand {
         /// SQL run right before each COMMIT.
         #[arg(long, value_name = "SQL")]
         after_sql: Option<String>,
+        /// On a database without history that holds objects: record every file up to and including
+        /// VERSION (exact version or file name) as applied, kind baseline, without running it, then
+        /// apply the files after it. Ignored on an empty database (every file runs, VERSION's
+        /// included) and when the database already has VERSION applied, so it is safe to always
+        /// pass; refused when the database has other history.
+        #[arg(long, value_name = "VERSION", conflicts_with = "allow_dirty")]
+        baseline: Option<String>,
+        /// Apply every file onto a database without history even though it already holds objects.
+        #[arg(long)]
+        allow_dirty: bool,
         /// List the pending files and change nothing.
+        #[arg(long)]
+        dry_run: bool,
+        #[command(flatten)]
+        format: FormatArg,
+    },
+    /// Show a database's migration history against the directory: the current version (newest
+    /// complete), each file's status, the pending files, the last error, and each problem that
+    /// makes `migrate apply` refuse or stop (a file failed or left in flight, an applied file
+    /// edited or missing, a row edited by hand) with how to recover. Only reads.
+    Status {
+        /// The database to read (config: `url`).
+        #[arg(long)]
+        url: Option<String>,
+        #[command(flatten)]
+        dir: DirArg,
+        #[command(flatten)]
+        format: FormatArg,
+        /// Exit with status 3 when the database is not up to date (files pending, or problems).
+        #[arg(long)]
+        exit_code: bool,
+    },
+    /// Fix up the revisions table by hand, running nothing: make the history exactly the files up
+    /// to and including VERSION. Files without a row are recorded as applied; rows not complete
+    /// (failed, stopped part way, a statement left in flight) are recorded as complete; rows edited
+    /// by hand are rewritten; rows after VERSION or without a file are deleted. Recording a row
+    /// that is not complete as complete (its remaining statements may not have run), deleting a
+    /// row of a complete migration, or recording an applied file that was edited since, needs
+    /// --force.
+    /// `0` clears the history. One transaction, under `migrate apply`'s advisory lock.
+    ///
+    /// After a statement left in flight: check whether it took effect, then finish the file by hand
+    /// and set its version with --force, or undo what it applied and set the version before it
+    /// (`migrate apply` then runs the file again).
+    Set {
+        /// The exact version or file name the history ends at; `0` for none.
+        version: String,
+        /// The database to change (config: `url`).
+        #[arg(long)]
+        url: Option<String>,
+        #[command(flatten)]
+        dir: DirArg,
+        /// Record rows that are not complete as complete, delete rows of complete migrations and
+        /// rehash edited applied files.
+        #[arg(long)]
+        force: bool,
+        /// The advisory lock's name (default `pgmig:<revisions schema>`).
+        #[arg(long, value_name = "NAME")]
+        lock_name: Option<String>,
+        /// How long to wait for the lock: `500ms`, `10s` (default), `2m`; `0` tries once.
+        #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+        lock_timeout: Option<u64>,
+        /// Do not take the advisory lock.
+        #[arg(long, conflicts_with_all = ["lock_name", "lock_timeout"])]
+        no_lock: bool,
+        /// Show what would change and change nothing.
         #[arg(long)]
         dry_run: bool,
         #[command(flatten)]
@@ -398,9 +485,25 @@ impl ScopeArgs {
         Ok(Options {
             filter: Filter::parse(&include, &exclude).map_err(ApiError::from)?,
             schema: self.schema.or_else(|| settings.schema.clone()),
-            revisions_schema: settings.migrations_revisions_schema.clone().unwrap_or_else(|| pgmig::revisions::DEFAULT_SCHEMA.to_owned()),
+            revisions_schema: revisions_schema(settings),
         })
     }
+}
+
+/// `[migrations] revisions_schema`, or the default.
+fn revisions_schema(s: &Settings) -> String {
+    s.migrations_revisions_schema.clone().unwrap_or_else(|| pgmig::revisions::DEFAULT_SCHEMA.to_owned())
+}
+
+/// The database a command connects to (--url, else `url` in the config file), and how to show it.
+fn target(url: Option<String>, loaded: &Loaded) -> anyhow::Result<(String, Target)> {
+    let source = match &url {
+        Some(_) => "--url".to_owned(),
+        None => loaded.url_source.clone().unwrap_or_else(|| "`url` in the config file".to_owned()),
+    };
+    let target = need(url, loaded.settings.url.clone(), "--url", "url")?;
+    let shown = Target { display: pgmig::config::redact(&target), source };
+    Ok((target, shown))
 }
 
 /// A value that must be given: the flag, else the config file's key; a usage error (exit 2) names both.
@@ -482,7 +585,10 @@ impl Cli {
                 MigrateCommand::Hash { format, .. }
                 | MigrateCommand::Diff { format, .. }
                 | MigrateCommand::New { format, .. }
+                | MigrateCommand::Baseline { format, .. }
                 | MigrateCommand::Apply { format, .. }
+                | MigrateCommand::Status { format, .. }
+                | MigrateCommand::Set { format, .. }
                 | MigrateCommand::Ls { format, .. }
                 | MigrateCommand::Show { format, .. }
                 | MigrateCommand::Edit { format, .. }
@@ -520,16 +626,13 @@ fn run(cli: Cli, loaded: &Loaded, format: Format) -> anyhow::Result<ExitCode> {
             no_lock,
             before_sql,
             after_sql,
+            baseline,
+            allow_dirty,
             dry_run,
             format: _,
         }) => {
             let s = settings;
-            let source = match &url {
-                Some(_) => "--url".to_owned(),
-                None => loaded.url_source.clone().unwrap_or_else(|| "`url` in the config file".to_owned()),
-            };
-            let target = need(url, s.url.clone(), "--url", "url")?;
-            let shown = Target { display: pgmig::config::redact(&target), source };
+            let (target, shown) = target(url, loaded)?;
             // Values in the config file were checked when it was read.
             let tx_mode = match tx_mode {
                 Some(TxModeArg::File) => pgmig::TxMode::File,
@@ -559,10 +662,41 @@ fn run(cli: Cli, loaded: &Loaded, format: Format) -> anyhow::Result<ExitCode> {
                     after_sql: after_sql.or_else(|| s.migrations_after_sql.clone()),
                     limit: n,
                     dry_run,
-                    revisions_schema: s.migrations_revisions_schema.clone().unwrap_or_else(|| pgmig::revisions::DEFAULT_SCHEMA.to_owned()),
+                    revisions_schema: revisions_schema(s),
+                    baseline,
+                    allow_dirty,
                 },
             };
             return migrate_apply(&req, &shown, format);
+        }
+        Command::Migrate(MigrateCommand::Status { url, dir, format: _, exit_code }) => {
+            let (target, shown) = target(url, loaded)?;
+            let req = api::MigrateStatusRequest {
+                target,
+                dir: need(dir.dir, settings.migrations_dir.clone().map(PathBuf::from), "--dir", "migrations.dir")?,
+                revisions_schema: revisions_schema(settings),
+            };
+            return migrate_status(&req, &shown, format, exit_code);
+        }
+        Command::Migrate(MigrateCommand::Set { version, url, dir, force, lock_name, lock_timeout, no_lock, dry_run, format: _ }) => {
+            let s = settings;
+            let (target, shown) = target(url, loaded)?;
+            let req = api::MigrateSetRequest {
+                target,
+                dir: need(dir.dir, s.migrations_dir.clone().map(PathBuf::from), "--dir", "migrations.dir")?,
+                version,
+                options: pgmig::SetOptions {
+                    force,
+                    dry_run,
+                    lock: !no_lock,
+                    lock_name: lock_name.or_else(|| s.migrations_lock_name.clone()),
+                    lock_timeout_ms: lock_timeout
+                        .or_else(|| s.migrations_lock_timeout.as_deref().and_then(pgmig::config::parse_duration_ms))
+                        .unwrap_or(pgmig::migrate_apply::DEFAULT_LOCK_TIMEOUT_MS),
+                    revisions_schema: revisions_schema(s),
+                },
+            };
+            return migrate_set(&req, &shown, format);
         }
         Command::Migrate(command) => return migrate(command, settings, format),
         Command::Config(ConfigCommand::Validate { .. }) => {
@@ -681,6 +815,23 @@ fn migrate(command: MigrateCommand, s: &Settings, format: Format) -> anyhow::Res
                 Format::Json => print_json(&res)?,
             }
         }
+        MigrateCommand::Baseline { name, url, dir: d, scope, format: _ } => {
+            let req = api::MigrateBaselineRequest {
+                dir: dir(d)?,
+                name,
+                target: need(url, s.url.clone(), "--url", "url")?,
+                options: scope.options(s)?,
+            };
+            let res = api::migrate_baseline(&req)?;
+            match format {
+                Format::Text => eprintln!(
+                    "wrote {}; on that database, record it as applied with `pgmig migrate apply --baseline {}`",
+                    res.file.display(),
+                    res.version
+                ),
+                Format::Json => print_json(&res)?,
+            }
+        }
         MigrateCommand::New { name, dir: d, format: _ } => {
             let res = api::migrate_new(&api::MigrateNewRequest { dir: dir(d)?, name })?;
             match format {
@@ -689,11 +840,7 @@ fn migrate(command: MigrateCommand, s: &Settings, format: Format) -> anyhow::Res
             }
         }
         MigrateCommand::Ls { dir: d, url, format: _ } => {
-            let req = api::MigrateLsRequest {
-                dir: dir(d)?,
-                target: url,
-                revisions_schema: s.migrations_revisions_schema.clone().unwrap_or_else(|| pgmig::revisions::DEFAULT_SCHEMA.to_owned()),
-            };
+            let req = api::MigrateLsRequest { dir: dir(d)?, target: url, revisions_schema: revisions_schema(s) };
             let res = api::migrate_ls(&req)?;
             match format {
                 Format::Text => {
@@ -765,7 +912,9 @@ fn migrate(command: MigrateCommand, s: &Settings, format: Format) -> anyhow::Res
             }
         }
         // Handled by `run`, which knows where `url` came from.
-        MigrateCommand::Apply { .. } => unreachable!("migrate apply is run by `run`"),
+        MigrateCommand::Apply { .. } | MigrateCommand::Status { .. } | MigrateCommand::Set { .. } => {
+            unreachable!("migrate apply, status and set are run by `run`")
+        }
         MigrateCommand::Validate { dir: d, shadow, format: _ } => {
             // The config file's `shadow` turns the replay on too.
             let shadow = shadow.or_else(|| s.shadow.clone());
@@ -808,6 +957,9 @@ fn migrate_apply(req: &api::MigrateApplyRequest, target: &Target, format: Format
         return Ok(ExitCode::SUCCESS);
     }
     let plural = |n: usize| if n == 1 { "" } else { "s" };
+    if report.baseline_skipped {
+        eprintln!("--baseline skipped: the database is empty (no history, no objects), so every file runs");
+    }
     for f in &report.files {
         match f.status {
             FileStatus::Skipped => {
@@ -817,6 +969,8 @@ fn migrate_apply(req: &api::MigrateApplyRequest, target: &Target, format: Format
                 let resumed = if f.resumed_after > 0 { format!(", resumed after {}", f.resumed_after) } else { String::new() };
                 println!("{} ({} statement{}{resumed}, {} ms)", f.file, f.statements, plural(f.statements), f.execution_ms);
             }
+            FileStatus::Baselined if report.dry_run => println!("{} (baseline: would be recorded as applied, not run)", f.file),
+            FileStatus::Baselined => println!("{} (baseline: recorded as applied, not run)", f.file),
             FileStatus::Pending if report.dry_run => println!("{}", f.file),
             FileStatus::Pending | FileStatus::AlreadyApplied => {}
         }
@@ -838,6 +992,87 @@ fn migrate_apply(req: &api::MigrateApplyRequest, target: &Target, format: Format
             report.statements,
             plural(report.statements)
         );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// What `migrate status --format json` and `migrate set --format json` print: the target and the
+/// result.
+#[derive(Serialize)]
+struct TargetOutput<'a, T: Serialize> {
+    target: &'a Target,
+    #[serde(flatten)]
+    result: T,
+}
+
+/// `migrate status`: the files with their status on stdout, then the problems and their hints.
+fn migrate_status(req: &api::MigrateStatusRequest, target: &Target, format: Format, exit_code: bool) -> anyhow::Result<ExitCode> {
+    let res = api::migrate_status(req)?;
+    let code = if exit_code && !res.is_up_to_date() { ExitCode::from(CHANGES) } else { ExitCode::SUCCESS };
+    if format == Format::Json {
+        print_json(&TargetOutput { target, result: res })?;
+        return Ok(code);
+    }
+    println!("Target: {} (from {})", target.display, target.source);
+    match (&res.revisions_table, &res.current) {
+        (None, _) => println!("no revisions table: nothing applied"),
+        (Some(_), None) => println!("current version: none"),
+        (Some(_), Some(v)) => println!("current version: {v}"),
+    }
+    for f in &res.files {
+        let kind = match f.kind.as_deref() {
+            Some(k) if k != "normal" => format!(" ({k})"),
+            _ => String::new(),
+        };
+        println!("{:<8} {}  {}{kind}", f.status.as_str(), f.version, f.description);
+    }
+    for m in &res.missing {
+        println!("{:<8} {}  {}", "missing", m.version, m.description);
+    }
+    let n = res.pending.len();
+    match n {
+        0 => println!("nothing pending"),
+        n => println!("{n} migration{} pending", if n == 1 { "" } else { "s" }),
+    }
+    if let Some(e) = &res.last_error {
+        println!("last error: {e}");
+    }
+    for i in &res.issues {
+        println!(
+            "problem: {}
+  {}",
+            i.message, i.hint
+        );
+    }
+    Ok(code)
+}
+
+/// `migrate set`: each row changed, on stdout.
+fn migrate_set(req: &api::MigrateSetRequest, target: &Target, format: Format) -> anyhow::Result<ExitCode> {
+    use pgmig::SetAction;
+    if format == Format::Text {
+        eprintln!("Target: {} (from {})", target.display, target.source);
+    }
+    let res = api::migrate_set(req)?;
+    if format == Format::Json {
+        print_json(&TargetOutput { target, result: res })?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    for c in &res.changes {
+        let what = match c.action {
+            SetAction::Insert => "recorded as applied",
+            SetAction::Resolve => "recorded as complete",
+            SetAction::Rehash => "recorded with the file as it is now",
+            SetAction::Repair => "rewritten (was edited by hand)",
+            SetAction::Delete => "deleted",
+        };
+        println!("{}: {what}", c.file.as_deref().unwrap_or(&c.version));
+    }
+    let end = res.version.as_deref().unwrap_or("none");
+    match (res.changes.is_empty(), res.dry_run) {
+        (true, _) => eprintln!("history already ends at {end}: nothing to change"),
+        (false, true) => eprintln!("dry run: nothing changed"),
+        (false, false) => eprintln!("history now ends at {end}"),
     }
     Ok(ExitCode::SUCCESS)
 }
