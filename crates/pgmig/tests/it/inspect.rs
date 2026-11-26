@@ -15,7 +15,7 @@ fn inspect_has_no_changes_to_a_new_database() {
     let spec = db.as_ref().map_or(ShadowSpec::Pgmem, |d| ShadowSpec::Postgres(d.conninfo.clone()));
     // Twice: the second run uses a shadow the first one wiped.
     for _ in 0..2 {
-        let plan = pgmig::schema_inspect(&Source::Sql(file.clone()), &spec).expect("inspect");
+        let plan = pgmig::schema_inspect(&Source::Sql(file.clone()), &spec, &pgmig::Options::default()).expect("inspect");
         assert_eq!(plan.to_sql(), "CREATE TABLE public.t (\n    id integer\n);\n");
     }
     let _ = std::fs::remove_file(&file);

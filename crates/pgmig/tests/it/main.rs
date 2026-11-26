@@ -2,6 +2,7 @@
 mod apply;
 mod casts;
 mod corpus;
+mod filters;
 mod import;
 mod inspect;
 mod load;

@@ -3,12 +3,14 @@
 use std::path::{Path, PathBuf};
 
 mod files;
+pub mod filter;
 
+pub use filter::{Filter, Pattern, PatternError, filter_model, scope_model};
 pub use pgmig_conn::Conn;
 pub use pgmig_diff::{Change, diff};
 pub use pgmig_inspect::inspect;
 pub use pgmig_model::Model;
-pub use pgmig_plan::{Plan, plan};
+pub use pgmig_plan::{Plan, PlanOptions, plan, plan_with};
 pub use pgmig_shadow::{PUBLIC_COMMENT as PUBLIC_SCHEMA_COMMENT_SQL, Shadow};
 
 #[derive(Debug, thiserror::Error)]
@@ -122,6 +124,40 @@ impl ShadowSpec {
     }
 }
 
+/// What pgmig manages, and how it prints names.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Options {
+    /// Which objects are managed (see [`filter`]).
+    pub filter: Filter,
+    /// Schema mode: manage only this schema's objects, not the schema itself, and print their names
+    /// unqualified in `schema inspect` and `schema diff`. `None` is database mode: every schema is
+    /// managed and names are qualified. Plans that are executed ([`schema_plan_apply`]) are always
+    /// qualified: an unqualified name means whatever the target's `search_path` makes it mean.
+    pub schema: Option<String>,
+}
+
+impl Options {
+    /// The part of `model` these options manage: [`filter_model`], then [`scope_model`] in schema
+    /// mode. Applied to both sides of a diff.
+    pub fn managed(&self, model: &Model) -> Model {
+        let m = filter_model(model, &self.filter);
+        match &self.schema {
+            Some(s) => scope_model(&m, s),
+            None => m,
+        }
+    }
+
+    /// How printed plans name objects under these options.
+    pub fn plan_options(&self) -> PlanOptions {
+        PlanOptions { unqualified_schema: self.schema.clone() }
+    }
+
+    /// What a new database holds, as these options see it.
+    fn empty_database(&self) -> Model {
+        self.managed(&Model::empty_database())
+    }
+}
+
 /// The model of a source: SQL is executed in a fresh shadow database, then inspected.
 pub fn load_model(source: &Source, shadow: &ShadowSpec) -> Result<Model> {
     open_model(source, shadow).map(|(model, _)| model)
@@ -177,12 +213,18 @@ pub fn schema_validate(source: &Source, shadow: &ShadowSpec) -> Result<()> {
     }
 }
 
-/// `schema diff`: the plan that turns `from` into `to`.
-pub fn schema_diff(from: &Source, to: &Source, shadow: &ShadowSpec) -> Result<Plan> {
+/// `schema diff`: the plan that turns `from` into `to`, for the objects `opts` manages.
+pub fn schema_diff(from: &Source, to: &Source, shadow: &ShadowSpec, opts: &Options) -> Result<Plan> {
+    diff_sources(from, to, shadow, opts, &opts.plan_options())
+}
+
+/// The plan that turns `from` into `to` for the objects `opts` manages, naming them as `names` says.
+fn diff_sources(from: &Source, to: &Source, shadow: &ShadowSpec, opts: &Options, names: &PlanOptions) -> Result<Plan> {
     // `from`'s shadow is wiped before `to`'s opens: a real Postgres shadow must start empty.
-    let a = load_model(from, shadow)?;
+    let a = opts.managed(&load_model(from, shadow)?);
     let (b, mut loaded) = open_model(to, shadow)?;
-    Ok(plan(&diff_with_casts(&a, &b, loaded.conn()))?)
+    let b = opts.managed(&b);
+    Ok(plan_with(&diff_with_casts(&a, &b, loaded.conn()), names)?)
 }
 
 /// `diff(a, b)`, with each type change that has no assignment cast converting `USING` an explicit
@@ -211,15 +253,19 @@ pub fn assignment_castable(conn: &mut Conn, from: &str, to: &str) -> bool {
     ok
 }
 
-/// `schema inspect`: SQL that recreates the source's schema in a new database.
-pub fn schema_inspect(source: &Source, shadow: &ShadowSpec) -> Result<Plan> {
-    let m = load_model(source, shadow)?;
-    Ok(plan(&diff(&Model::empty_database(), &m))?)
+/// `schema inspect`: SQL that recreates the objects `opts` manages in a new database.
+pub fn schema_inspect(source: &Source, shadow: &ShadowSpec, opts: &Options) -> Result<Plan> {
+    let m = opts.managed(&load_model(source, shadow)?);
+    Ok(plan_with(&diff(&opts.empty_database(), &m), &opts.plan_options())?)
 }
 
 /// `schema apply`, first half: the plan that turns the database at `target` into `desired`.
-pub fn schema_plan_apply(target: &str, desired: &Source, shadow: &ShadowSpec) -> Result<Plan> {
-    schema_diff(&Source::Database(target.to_owned()), desired, shadow)
+///
+/// The plan is executed, so its names are always schema-qualified, in schema mode too: there
+/// `DROP TABLE x` would drop whichever `x` the target's `search_path` finds first, which need not
+/// be the managed schema's. Schema mode still limits which objects are managed.
+pub fn schema_plan_apply(target: &str, desired: &Source, shadow: &ShadowSpec, opts: &Options) -> Result<Plan> {
+    diff_sources(&Source::Database(target.to_owned()), desired, shadow, opts, &PlanOptions::default())
 }
 
 /// What [`apply`] did.
