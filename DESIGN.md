@@ -133,8 +133,12 @@ pub enum ObjectId {
   catalog's `pg_depend` is reliable (real Postgres) it is the source; the inspector cross-checks it
   against references it can derive itself.
 - **Fingerprint** (`INS-4`): SHA-256 of the model's canonical serialization (objects sorted by
-  identity, fields in fixed order, filters applied, server-version-specific noise removed). Saved
-  plans, checkpoints and drift checks compare fingerprints.
+  identity, fields in fixed order, filters applied, server-version-specific noise removed), printed
+  as `h1:<base64>` by `schema fingerprint`. The serialization is hand-written and versioned
+  (`pgmig-fingerprint-v1`), not the model's JSON, and holds exactly what the diff compares: columns
+  and constraints by name (column order is ignored), and no server-chosen names (an identity's
+  sequence) or fields derived from others (`type_ref`, `default_sequences`, constraint flags and
+  references). Saved plans, checkpoints and drift checks compare fingerprints.
 
 ## Inspector
 

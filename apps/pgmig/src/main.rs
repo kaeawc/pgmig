@@ -28,7 +28,7 @@ argument parser as text on stderr (exit 2).
 Configuration: every flag except --dry-run, --auto-approve, --exit-code, --force, --baseline,
 --allow-dirty and --no-lock can be set in
 pgmig.toml (or the file given to --config), under the flag's name: `url`, `shadow`, `from`, `to`
-(also the SOURCE of `schema inspect` and `schema validate`, and the desired state of `migrate
+(also the SOURCE of `schema inspect`, `schema fingerprint` and `schema validate`, and the desired state of `migrate
 diff`), `include`, `exclude`, `schema`,
 `format`, and the `migrate apply` flags under `[migrations]`: `dir`, `tx_mode`, `exec_order`,
 `lock_name`, `lock_timeout`, `before_sql`, `after_sql`. `[migrations] revisions_schema` (default
@@ -397,6 +397,18 @@ enum SchemaCommand {
         #[command(flatten)]
         format: FormatArg,
     },
+    /// Print the fingerprint of a state's schema: `h1:<base64 SHA-256>` of its managed objects, the
+    /// same for a database and for SQL or migrations describing the same schema.
+    Fingerprint {
+        /// SQL file, directory of SQL files, migration directory, or database URL (config: `to`).
+        source: Option<String>,
+        #[command(flatten)]
+        shadow: ShadowArg,
+        #[command(flatten)]
+        scope: ScopeArgs,
+        #[command(flatten)]
+        format: FormatArg,
+    },
     /// Change a live database to match a desired state: show the plan, ask, execute.
     Apply {
         /// The database to change.
@@ -578,6 +590,7 @@ impl Cli {
             Command::Schema(
                 SchemaCommand::Diff { format, .. }
                 | SchemaCommand::Inspect { format, .. }
+                | SchemaCommand::Fingerprint { format, .. }
                 | SchemaCommand::Apply { format, .. }
                 | SchemaCommand::Validate { format, .. },
             )
@@ -774,6 +787,18 @@ fn run(cli: Cli, loaded: &Loaded, format: Format) -> anyhow::Result<ExitCode> {
             let res = api::schema_inspect(&req)?;
             match format {
                 Format::Text => print!("{}", res.plan.to_sql()),
+                Format::Json => print_json(&res)?,
+            }
+        }
+        SchemaCommand::Fingerprint { source, shadow, scope, format: _ } => {
+            let req = api::FingerprintRequest {
+                source: Source::parse(&need(source, s.to.clone(), "SOURCE", "to")?),
+                shadow: shadow.spec(s),
+                options: scope.options(s)?,
+            };
+            let res = api::schema_fingerprint(&req)?;
+            match format {
+                Format::Text => println!("{}", res.fingerprint),
                 Format::Json => print_json(&res)?,
             }
         }

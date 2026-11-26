@@ -16,6 +16,9 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+mod fingerprint;
+pub use fingerprint::{FORMAT as FINGERPRINT_FORMAT, canonical, fingerprint};
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Model {
     #[serde(with = "as_list")]

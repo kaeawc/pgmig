@@ -4,6 +4,7 @@ mod apply;
 mod casts;
 mod corpus;
 mod filters;
+mod fingerprint;
 mod import;
 mod inspect;
 mod load;

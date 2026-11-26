@@ -1,6 +1,6 @@
 [package]
 name = "pgmig-model"
-description = "pgmig's schema model: objects, identities and SQL identifier quoting. No I/O."
+description = "pgmig's schema model: objects, identities, SQL identifier quoting and the schema fingerprint. No I/O."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,7 +15,9 @@ readme = "README.md"
 doctest = false
 
 [dependencies]
+base64 = { workspace = true }
 serde = { workspace = true }
+sha2 = { workspace = true }
 
 [lints]
 workspace = true

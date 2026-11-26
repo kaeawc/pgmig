@@ -39,7 +39,7 @@ pub use pgmig_migrate::history;
 /// The revisions table in the target database.
 pub use pgmig_migrate::revisions;
 pub use pgmig_migrate::{Dir as MigrationDir, SUM_FILE, SumFile, SumLine, ValidateError as ChecksumError};
-pub use pgmig_model::Model;
+pub use pgmig_model::{Model, fingerprint};
 pub use pgmig_plan::{Plan, PlanOptions, plan, plan_with};
 pub use pgmig_shadow::{PUBLIC_COMMENT as PUBLIC_SCHEMA_COMMENT_SQL, Shadow};
 
@@ -636,6 +636,13 @@ pub fn assignment_castable(conn: &mut Conn, from: &str, to: &str) -> bool {
 /// `schema inspect`: SQL that recreates the objects `opts` manages in a new database.
 pub fn schema_inspect(source: &Source, shadow: &ShadowSpec, opts: &Options) -> Result<Plan> {
     inspect_source(source, shadow, opts).map(|(_, plan)| plan)
+}
+
+/// `schema fingerprint`: the fingerprint ([`pgmig_model::fingerprint`]) of the objects `opts`
+/// manages in `source`. A database and a shadow replay of the same schema give the same value.
+pub fn schema_fingerprint(source: &Source, shadow: &ShadowSpec, opts: &Options) -> Result<String> {
+    opts.validate()?;
+    Ok(pgmig_model::fingerprint(&opts.managed(&load_model(source, shadow)?)))
 }
 
 /// The model of the objects `opts` manages in `source`, and the plan that recreates them.

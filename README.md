@@ -25,6 +25,7 @@ Prebuilt binaries for Linux (glibc and static musl), macOS and Windows are attac
 cargo run -p pgmig-cli -- schema diff --from postgres://localhost/app --to schema.sql
 cargo run -p pgmig-cli -- schema diff --from old.sql --to new.sql
 cargo run -p pgmig-cli -- schema inspect postgres://localhost/app
+cargo run -p pgmig-cli -- schema fingerprint schema.sql   # h1:..., the same for the database it describes
 ```
 
 Flags can live in `pgmig.toml` under their own names, with `[env.<name>]` sections selected by
@@ -41,7 +42,7 @@ url = "postgres://localhost/app"
 `--shadow <url>` runs SQL files in an empty real Postgres database instead of pgmem (for
 extensions pgmem doesn't have).
 
-`--include` / `--exclude` (repeatable) limit what `diff`, `inspect` and `apply` manage, by
+`--include` / `--exclude` (repeatable) limit what `diff`, `inspect`, `fingerprint` and `apply` manage, by
 `[kind:]schema[.object[.column]]` globs (`*`, `?`; kind `schema`, `table`, `enum` or `sequence`):
 `--exclude 'public.tmp_*'` leaves those objects alone on both sides. A managed object may reference
 an unmanaged one (a foreign key to an excluded table); the plan assumes it exists. `--schema <name>`
