@@ -792,7 +792,7 @@ mod tests {
             [
                 "CREATE SCHEMA app",
                 "CREATE TABLE app.t (\n    id integer\n)",
-                "COMMENT ON COLUMN app.t.id IS 'a\\b\nc'",
+                "COMMENT ON COLUMN app.t.id IS E'a\\\\b\nc'",
                 "COMMENT ON TABLE app.t IS 'it''s'",
                 "COMMENT ON SCHEMA app IS NULL",
             ]

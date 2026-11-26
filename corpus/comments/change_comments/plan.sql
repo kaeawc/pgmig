@@ -15,5 +15,5 @@ COMMENT ON COLUMN keep.items.note IS NULL;
 COMMENT ON COLUMN keep.items.extra IS 'newly commented';
 COMMENT ON COLUMN keep.items.added IS 'a column''s comment on a new column';
 COMMENT ON TABLE keep.plain IS 'set on a table without one';
-COMMENT ON COLUMN keep.plain.id IS 'line one
-line two with a back\slash';
+COMMENT ON COLUMN keep.plain.id IS E'line one
+line two with a back\\slash';

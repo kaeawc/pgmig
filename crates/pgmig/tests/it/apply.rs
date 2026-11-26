@@ -116,3 +116,22 @@ fn empty_plan_applies_nothing() {
     assert!(plan.is_empty(), "{}", plan.to_sql());
     assert_eq!(apply(&db.conninfo, &plan).expect("apply"), pgmig::ApplyReport::default());
 }
+
+#[test]
+fn backslash_literals_apply_with_standard_conforming_strings_off() {
+    let db = target("CREATE TABLE t (id int);");
+    let name = db.connect().query("SELECT current_database()").expect("database name")[0][0].clone().expect("name");
+    let set = db.connect().batch(&format!("ALTER DATABASE {name} SET standard_conforming_strings = off"));
+    if let Err(e) = set {
+        assert!(postgres_dsn().is_none(), "ALTER DATABASE ... SET failed on Postgres: {e}");
+        eprintln!("skipped on pgmem: ALTER DATABASE ... SET is a syntax error (kaeawc/pgmem#227): {e}");
+        return;
+    }
+    let desired = Desired::new("CREATE TABLE t (id int); COMMENT ON TABLE t IS E'a\\\\b \\'q\\' c:\\\\temp';");
+    let (shadow, _shadow_db) = shadow_spec();
+    let plan = schema_plan_apply(&db.conninfo, &desired.source(), &shadow, &Options::default()).expect("plan");
+    apply(&db.conninfo, &plan).expect("apply");
+
+    let rows = db.connect().query("SELECT obj_description('t'::regclass, 'pg_class')").expect("comment");
+    assert_eq!(rows, vec![vec![Some("a\\b 'q' c:\\temp".to_owned())]]);
+}
