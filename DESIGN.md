@@ -208,7 +208,12 @@ migrations/
   pgmig.sum
 ```
 
-Version = the leading timestamp; description = the rest of the name.
+Version = the leading timestamp; description = the rest of the name. `migrate diff <name>` and
+`migrate new <name>` write the next file: its version is the UTC time (`YYYYMMDDHHMMSS`), or the
+newest file's plus one when the clock does not give a greater one, and the name is sanitized to
+`[a-z0-9_]`. Both refuse a directory that does not match its sum file, and rehash it after writing.
+A directory holding `pgmig.sum` is also a state wherever one is accepted (`--from`, `--to`,
+`SOURCE`): it is checked against the sum file and replayed in version order.
 
 ### Sum file
 

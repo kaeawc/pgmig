@@ -15,6 +15,10 @@ Exit codes:
   2  usage error (unknown flag, missing argument)
   3  `--exit-code` was given and the plan is not empty
 
+A state (--from, --to, SOURCE) is a database when it is a postgres:// URL or a key=value
+connection string, a migration directory when it is a directory holding pgmig.sum (checked
+against it, then replayed in version order), and otherwise a SQL file or directory of SQL files.
+
 With `--format json`, a command prints one JSON document on stdout, and nothing on stderr. A
 failure prints the error object ({\"code\", \"message\", \"sqlstate\", \"file\", \"line\", \"col\",
 \"apply\"}) on stdout and exits 1, or 2 when its code is \"usage\". Bad flags are reported by the
@@ -22,7 +26,8 @@ argument parser as text on stderr (exit 2).
 
 Configuration: every flag except --dry-run, --auto-approve and --exit-code can be set in
 pgmig.toml (or the file given to --config), under the flag's name: `url`, `shadow`, `from`, `to`
-(also the SOURCE of `schema inspect` and `schema validate`), `include`, `exclude`, `schema`,
+(also the SOURCE of `schema inspect` and `schema validate`, and the desired state of `migrate
+diff`), `include`, `exclude`, `schema`,
 `format`, and `dir` as `[migrations] dir`. `[env.NAME]` sections, selected with --env NAME,
 override the top level. A flag wins over both. `${KEY}` in a value is replaced by --var KEY=VALUE,
 or else by the environment variable KEY; `$${` is a literal `${`.";
@@ -75,6 +80,35 @@ enum MigrateCommand {
         #[command(flatten)]
         format: FormatArg,
     },
+    /// Write the next migration: replay the directory in the shadow database, diff it against the
+    /// desired state, and write the plan to `<version>_<NAME>.sql` (version: the UTC time
+    /// YYYYMMDDHHMMSS, after every existing file), then update pgmig.sum. With no changes nothing
+    /// is written. The directory must match its sum file.
+    Diff {
+        /// The migration's description: lowercased, anything but a-z, 0-9 and _ becomes _.
+        name: String,
+        #[command(flatten)]
+        dir: DirArg,
+        /// The desired state: SQL file, directory of SQL files, migration directory or database
+        /// URL (config: `to`).
+        #[arg(long)]
+        to: Option<String>,
+        #[command(flatten)]
+        shadow: ShadowArg,
+        #[command(flatten)]
+        scope: ScopeArgs,
+        #[command(flatten)]
+        format: FormatArg,
+    },
+    /// Write an empty migration `<version>_<NAME>.sql` to fill in by hand, then update pgmig.sum.
+    New {
+        /// The migration's description: lowercased, anything but a-z, 0-9 and _ becomes _.
+        name: String,
+        #[command(flatten)]
+        dir: DirArg,
+        #[command(flatten)]
+        format: FormatArg,
+    },
     /// Check the files against the sum file, and with --shadow replay them in order; prints
     /// nothing on success.
     Validate {
@@ -100,10 +134,10 @@ struct DirArg {
 enum SchemaCommand {
     /// Print the SQL that turns one state into another.
     Diff {
-        /// SQL file, directory of SQL files, or database URL.
+        /// SQL file, directory of SQL files, migration directory, or database URL.
         #[arg(long)]
         from: Option<String>,
-        /// SQL file, directory of SQL files, or database URL.
+        /// SQL file, directory of SQL files, migration directory, or database URL.
         #[arg(long)]
         to: Option<String>,
         #[command(flatten)]
@@ -118,7 +152,7 @@ enum SchemaCommand {
     },
     /// Print SQL that recreates a state's schema in a new database.
     Inspect {
-        /// SQL file, directory of SQL files, or database URL (config: `to`).
+        /// SQL file, directory of SQL files, migration directory, or database URL (config: `to`).
         source: Option<String>,
         #[command(flatten)]
         shadow: ShadowArg,
@@ -132,7 +166,7 @@ enum SchemaCommand {
         /// The database to change.
         #[arg(long)]
         url: Option<String>,
-        /// SQL file, directory of SQL files, or database URL.
+        /// SQL file, directory of SQL files, migration directory, or database URL.
         #[arg(long)]
         to: Option<String>,
         #[command(flatten)]
@@ -153,7 +187,7 @@ enum SchemaCommand {
     },
     /// Load SQL files into the shadow database and report errors; prints nothing on success.
     Validate {
-        /// SQL file or directory of SQL files (config: `to`).
+        /// SQL file, directory of SQL files, or migration directory (config: `to`).
         source: Option<String>,
         #[command(flatten)]
         shadow: ShadowArg,
@@ -294,7 +328,12 @@ impl Cli {
                 | SchemaCommand::Apply { format, .. }
                 | SchemaCommand::Validate { format, .. },
             )
-            | Command::Migrate(MigrateCommand::Hash { format, .. } | MigrateCommand::Validate { format, .. })
+            | Command::Migrate(
+                MigrateCommand::Hash { format, .. }
+                | MigrateCommand::Diff { format, .. }
+                | MigrateCommand::New { format, .. }
+                | MigrateCommand::Validate { format, .. },
+            )
             | Command::Config(ConfigCommand::Validate { format }) => format.format,
         }
     }
@@ -408,6 +447,33 @@ fn migrate(command: MigrateCommand, s: &Settings, format: Format) -> anyhow::Res
                     eprintln!("wrote {} ({n} file{})", res.sum_file.display(), if n == 1 { "" } else { "s" });
                 }
                 Format::Text => eprintln!("{} is up to date", res.sum_file.display()),
+                Format::Json => print_json(&res)?,
+            }
+        }
+        MigrateCommand::Diff { name, dir: d, to, shadow, scope, format: _ } => {
+            let req = api::MigrateDiffRequest {
+                dir: dir(d)?,
+                name,
+                to: Source::parse(&need(to, s.to.clone(), "--to", "to")?),
+                shadow: shadow.spec(s),
+                options: scope.options(s)?,
+            };
+            let res = api::migrate_diff(&req)?;
+            match format {
+                Format::Text => match &res.file {
+                    Some(file) => {
+                        let n = res.plan.statements.len();
+                        eprintln!("wrote {} ({n} statement{})", file.display(), if n == 1 { "" } else { "s" });
+                    }
+                    None => eprintln!("no changes"),
+                },
+                Format::Json => print_json(&res)?,
+            }
+        }
+        MigrateCommand::New { name, dir: d, format: _ } => {
+            let res = api::migrate_new(&api::MigrateNewRequest { dir: dir(d)?, name })?;
+            match format {
+                Format::Text => eprintln!("wrote {}", res.file.display()),
                 Format::Json => print_json(&res)?,
             }
         }

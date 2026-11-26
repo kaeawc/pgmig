@@ -8,6 +8,7 @@ mod import;
 mod inspect;
 mod load;
 mod migrate;
+mod migrate_diff;
 mod quoting;
 mod search_path;
 mod support;

@@ -8,6 +8,9 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
 
 ### Added
 
+- `pgmig migrate diff <name>` writes the next migration from the desired state (nothing when there
+  are no changes) and `pgmig migrate new <name>` writes an empty one; both rehash `pgmig.sum`. A
+  directory holding `pgmig.sum` is read as a migration directory wherever a state is accepted.
 - `pgmig.toml`: every command's options can come from a config file with top-level defaults and
   `[env.<name>]` sections (`--env`, `--config`), `${VAR}` interpolation and `--var NAME=VALUE`;
   flags win over the selected environment, which wins over the top level. `pgmig config validate`

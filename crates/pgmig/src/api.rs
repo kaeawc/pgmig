@@ -176,6 +176,52 @@ impl MigrateValidateResponse {
     }
 }
 
+/// `migrate diff`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MigrateDiffRequest {
+    /// The migration directory; created when a file is written to a directory that does not exist.
+    pub dir: PathBuf,
+    /// The new migration's description, sanitized to `[a-z0-9_]`.
+    pub name: String,
+    /// The desired state.
+    pub to: Source,
+    #[serde(default)]
+    pub shadow: ShadowSpec,
+    #[serde(default)]
+    pub options: Options,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrateDiffResponse {
+    /// The migration written; null when there were no changes and nothing was written.
+    pub file: Option<PathBuf>,
+    /// Its version; null when nothing was written.
+    pub version: Option<String>,
+    /// The plan from the replayed directory to the desired state (schema-qualified).
+    pub plan: Plan,
+    pub changes: Vec<Change>,
+    /// `plan` rendered as a SQL script ([`Plan::to_sql`]): the new file's contents.
+    pub sql: String,
+}
+
+/// `migrate new`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MigrateNewRequest {
+    /// The migration directory; created when it does not exist.
+    pub dir: PathBuf,
+    /// The new migration's description, sanitized to `[a-z0-9_]`.
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrateNewResponse {
+    /// The empty migration written.
+    pub file: PathBuf,
+    pub version: String,
+}
+
 /// `config validate`. `Debug` shows the `vars` names only: their values may be secrets.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -392,6 +438,7 @@ impl From<&Error> for ApiError {
             Error::ImportMissing { path, pos, .. } => err(ErrorCode::ImportMissing).at(path, Some(*pos)),
             Error::ImportEmpty { path, pos, .. } => err(ErrorCode::ImportEmpty).at(path, Some(*pos)),
             Error::ImportCycle { .. } => err(ErrorCode::ImportCycle),
+            Error::MigrationDescription { .. } => err(ErrorCode::Usage),
             Error::MigrationImport { path, pos } => err(ErrorCode::MigrationImport).at(path, Some(*pos)),
             Error::Migrate(m) => match m {
                 pgmig_migrate::Error::Io { path, .. } => err(ErrorCode::Io).at(path, None),
@@ -510,7 +557,13 @@ fn is_diagnostic(e: &Error) -> bool {
         | Error::MigrationImport { .. }
         | Error::Migrate(_)
         | Error::Checksum(_) => true,
-        Error::NotSql | Error::Conn(_) | Error::Shadow(_) | Error::Inspect(_) | Error::Plan(_) | Error::Apply { .. } => false,
+        Error::NotSql
+        | Error::MigrationDescription { .. }
+        | Error::Conn(_)
+        | Error::Shadow(_)
+        | Error::Inspect(_)
+        | Error::Plan(_)
+        | Error::Apply { .. } => false,
     }
 }
 
@@ -550,6 +603,19 @@ pub fn migrate_validate(req: &MigrateValidateRequest) -> Result<MigrateValidateR
         Err(e) if is_diagnostic(&e) => Ok(MigrateValidateResponse { diagnostics: vec![ApiError::from(&e)], replayed: false }),
         Err(e) => Err(e.into()),
     }
+}
+
+/// [`crate::migrate_diff`].
+pub fn migrate_diff(req: &MigrateDiffRequest) -> Result<MigrateDiffResponse, ApiError> {
+    let res = crate::migrate_diff(&req.dir, &req.name, &req.to, &req.shadow, &req.options)?;
+    let (file, version) = res.written.map(|w| (w.path, w.version)).unzip();
+    Ok(MigrateDiffResponse { file, version, sql: res.plan.to_sql(), plan: res.plan, changes: res.changes })
+}
+
+/// [`crate::migrate_new`].
+pub fn migrate_new(req: &MigrateNewRequest) -> Result<MigrateNewResponse, ApiError> {
+    let new = crate::migrate_new(&req.dir, &req.name)?;
+    Ok(MigrateNewResponse { file: new.path, version: new.version })
 }
 
 /// [`crate::config::validate`]: problems with the file are diagnostics; an `Err` means it could
@@ -605,6 +671,20 @@ mod tests {
         round_trip(&MigrateHashRequest { dir: "migrations".into() });
         round_trip(&MigrateValidateRequest { dir: "migrations".into(), shadow: None });
         round_trip(&MigrateValidateRequest { dir: "migrations".into(), shadow: Some(pg_spec()) });
+        let migrations = Source::Migrations("migrations".into());
+        let json = round_trip(&MigrateDiffRequest {
+            dir: "migrations".into(),
+            name: "add_users".into(),
+            to: migrations.clone(),
+            shadow: pg_spec(),
+            options: options(),
+        });
+        assert!(json.contains(r#""to":{"kind":"migrations","data":"migrations"}"#), "{json}");
+        round_trip(&MigrateNewRequest { dir: "migrations".into(), name: "x".into() });
+        let req: MigrateDiffRequest =
+            serde_json::from_str(r#"{"dir":"m","name":"x","to":{"kind":"sql","data":"s.sql"}}"#).expect("request");
+        assert_eq!((req.shadow, req.options), (ShadowSpec::Pgmem, Options::default()));
+        assert!(serde_json::from_str::<MigrateNewRequest>(r#"{"dir":"m","name":"x","x":1}"#).is_err());
     }
 
     fn pg_spec() -> ShadowSpec {
@@ -643,6 +723,14 @@ mod tests {
         round_trip(&InspectResponse { plan: plan(), sql: plan().to_sql(), model: Model::empty_database() });
         round_trip(&PlanApplyResponse { plan: plan(), sql: plan().to_sql(), changes });
         round_trip(&ApplyReport { batches: 2, statements: 5 });
+        round_trip(&MigrateDiffResponse {
+            file: Some("m/1_a.sql".into()),
+            version: Some("1".into()),
+            plan: plan(),
+            sql: plan().to_sql(),
+            changes: vec![],
+        });
+        round_trip(&MigrateNewResponse { file: "m/1_a.sql".into(), version: "1".into() });
         let load = ApiError {
             code: ErrorCode::Load,
             message: "b.sql:3:1: type \"nosuchtype\" does not exist (SQLSTATE 42704)".into(),
