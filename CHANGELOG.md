@@ -8,6 +8,9 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
 
 ### Added
 
+- `--edit` on `schema apply` and `migrate diff` opens the planned SQL in `$VISUAL`/`$EDITOR`; what
+  you save is what runs or is written. An emptied plan applies or writes nothing, a failing editor
+  aborts, and the temp file is always removed. Needs a terminal; refused with `--format json`.
 - Diff policy: `--skip <kind>` (repeatable, on `schema diff`, `schema apply` and `migrate diff`) or
   `[diff] skip` in the config never plans that kind of change (`drop_table`, `drop_column`, ...).
   Changes that need a skipped one are skipped too, and every skipped change is reported: on stderr,

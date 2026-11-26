@@ -161,21 +161,13 @@ pub struct MigrateEdit {
 /// rehash it. The directory must match its sum file first. When the editor fails nothing is
 /// rehashed, so `migrate validate` reports any change it left.
 pub fn migrate_edit(dir: &Path, migration: &str, editor: &[String]) -> Result<MigrateEdit> {
-    let Some((program, args)) = editor.split_first() else {
+    if editor.is_empty() {
         return Err(Error::Options("no editor: set VISUAL or EDITOR".into()));
-    };
+    }
     let d = open_validated(dir)?;
     let f = d.find(migration)?.clone();
     let file = d.path.join(&f.name);
-    let command = editor.join(" ");
-    let status = std::process::Command::new(program)
-        .args(args)
-        .arg(&file)
-        .status()
-        .map_err(|e| Error::Editor { command: command.clone(), reason: e.to_string() })?;
-    if !status.success() {
-        return Err(Error::Editor { command, reason: format!("it exited with {status}; {} was not rehashed", file.display()) });
-    }
+    crate::edit::launch(editor, &file, &format!("{} was not rehashed", file.display()))?;
     let (now, _) = pgmig_migrate::maintain::rehash_file(&d, &f.name)?;
     Ok(MigrateEdit { file, version: f.version, changed: now.bytes != f.bytes, sum_file: d.sum_path() })
 }

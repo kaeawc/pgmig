@@ -245,7 +245,7 @@ fn migrate_diff_leaves_skipped_changes_out_of_the_file() {
     assert!(res.written.is_none() && res.plan.is_empty());
     assert_eq!(shown(&res.skipped), ["drop_table public.old (policy)"]);
     // The response carries them too.
-    let req = api::MigrateDiffRequest { dir, name: "again".into(), to, shadow, options: opts };
+    let req = api::MigrateDiffRequest { dir, name: "again".into(), to, shadow, options: opts, editor: None };
     let json = serde_json::to_value(api::migrate_diff(&req).expect("api")).expect("json");
     assert_eq!(json["skipped"][0]["kind"], "drop_table");
     assert_eq!(json["file"], serde_json::Value::Null);

@@ -72,6 +72,16 @@ drop_table app.t is skipped)`), and since the difference stays, every later diff
 The JSON responses of `schema diff`, `schema apply` and `migrate diff` carry `skipped` (empty
 without a policy); `changes` and the plan leave those changes out.
 
+`--edit` (on `schema apply` and `migrate diff`) opens the planned SQL in `$VISUAL`, else `$EDITOR`,
+else `vi` (split on whitespace, run without a shell) on a private temp file, removed afterwards.
+What you save is what runs or is written, with no new diff: drop statements, add your own, or keep
+one `-- pgmig:commit` line as the plan's commit point. `schema apply` then shows the edited plan and
+asks as usual; with no statements left it applies nothing. `migrate diff` writes the saved text
+as-is once it splits and its directives are well placed; with no statements left it writes
+nothing. An editor that exits non-zero aborts both. `--edit` needs a terminal and is refused with
+`--format json` (usage error, exit `2`). The edited text is not checked against `--skip`: a statement
+the skip policy left out runs if you add it back.
+
 `--format json` (on `inspect`, `diff`, `validate` and `apply`) prints the command's response as one
 pretty-printed JSON document on stdout and nothing on stderr; a failure prints the error object
 (`code`, `message`, `sqlstate`, `file`, `line`, `col`, `apply`) on stdout instead. Bad flags are

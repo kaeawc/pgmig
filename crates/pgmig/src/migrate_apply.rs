@@ -440,6 +440,13 @@ fn prepare<'a>(dir: &MigrationDir, f: &'a pgmig_migrate::File) -> Result<Prepare
     let text = std::str::from_utf8(&f.bytes)
         .map_err(|e| Error::Io { path: path.clone(), source: std::io::Error::new(std::io::ErrorKind::InvalidData, e) })?;
     let sql = pgmig_sql::split(text).map_err(|source| Error::Split { path: path.clone(), source })?;
+    let (no_tx, commits) = check_directives(&path, &sql)?;
+    Ok(Prepared { file: f, path, sql, no_tx, commits })
+}
+
+/// The `-- pgmig:txmode` and `-- pgmig:commit` directives of the file at `path`: whether it runs
+/// without a transaction, and its commit points ([`commit_points`]).
+pub(crate) fn check_directives(path: &Path, sql: &pgmig_sql::File) -> Result<(bool, Vec<(usize, pgmig_sql::Pos)>)> {
     let first = sql.statements.first().map(|s| s.pos);
     let mut no_tx = false;
     let on_statements = sql.statements.iter().enumerate().flat_map(|(i, s)| s.directives.iter().map(move |d| (i > 0, d)));
@@ -453,17 +460,17 @@ fn prepare<'a>(dir: &MigrationDir, f: &'a pgmig_migrate::File) -> Result<Prepare
             no_tx = true;
             continue;
         };
-        return Err(Error::Directive { path, pos: d.pos, message: message.to_owned() });
+        return Err(Error::Directive { path: path.to_owned(), pos: d.pos, message: message.to_owned() });
     }
     let commits =
-        commit_points(&sql).map_err(|(pos, message)| Error::Directive { path: path.clone(), pos, message: message.to_owned() })?;
-    Ok(Prepared { file: f, path, sql, no_tx, commits })
+        commit_points(sql).map_err(|(pos, message)| Error::Directive { path: path.to_owned(), pos, message: message.to_owned() })?;
+    Ok((no_tx, commits))
 }
 
 /// The `-- pgmig:commit` directives of `sql`: the statement each comes before. One inside a
 /// statement, or with arguments, is refused; one before the first or after the last statement
 /// commits nothing and is left out.
-fn commit_points(sql: &pgmig_sql::File) -> std::result::Result<Vec<(usize, pgmig_sql::Pos)>, (pgmig_sql::Pos, &'static str)> {
+pub(crate) fn commit_points(sql: &pgmig_sql::File) -> std::result::Result<Vec<(usize, pgmig_sql::Pos)>, (pgmig_sql::Pos, &'static str)> {
     let mut out = Vec::new();
     let on_statements = sql.statements.iter().enumerate().flat_map(|(i, s)| s.directives.iter().map(move |d| (i, d, d.pos > s.pos)));
     let on_file =
