@@ -36,7 +36,7 @@ fn shadow_spec() -> (ShadowSpec, Option<TestDb>) {
 }
 
 fn excluding(patterns: &[&str]) -> Options {
-    Options { filter: Filter::parse::<&str, _>(&[], patterns).expect("patterns"), schema: None }
+    Options { filter: Filter::parse::<&str, _>(&[], patterns).expect("patterns"), schema: None, ..Options::default() }
 }
 
 fn diff(from: &str, to: &str, opts: &Options) -> Vec<String> {
@@ -52,7 +52,8 @@ fn excluded_tables_are_hidden_from_both_sides() {
     assert_eq!(diff(from, to, &Options::default()).len(), 2, "unfiltered, tmp_b is created and tmp_a dropped");
     assert!(diff(from, to, &excluding(&["public.tmp_*"])).is_empty());
     // Includes: only `users` is managed, so the tmp tables are left alone too.
-    let only_users = Options { filter: Filter::parse(&["table:public.users"], &[] as &[&str]).expect("patterns"), schema: None };
+    let only_users =
+        Options { filter: Filter::parse(&["table:public.users"], &[] as &[&str]).expect("patterns"), schema: None, ..Options::default() };
     assert!(diff(from, to, &only_users).is_empty());
 }
 
@@ -162,7 +163,8 @@ fn a_serial_sequence_follows_its_excluded_column() {
 
 #[test]
 fn an_included_serial_table_brings_its_sequence() {
-    let opts = Options { filter: Filter::parse(&["table:public.users"], &[] as &[&str]).expect("patterns"), schema: None };
+    let opts =
+        Options { filter: Filter::parse(&["table:public.users"], &[] as &[&str]).expect("patterns"), schema: None, ..Options::default() };
     let plan = diff("", "CREATE TABLE users (id serial); CREATE SEQUENCE other;", &opts);
     assert_eq!(plan.len(), 3, "{plan:?}");
     assert!(plan[0].starts_with("CREATE SEQUENCE public.users_id_seq"), "{plan:?}");

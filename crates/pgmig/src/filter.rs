@@ -198,6 +198,16 @@ pub fn filter_model(model: &Model, filter: &Filter) -> Model {
     m
 }
 
+/// `model` without schema `schema` and everything in it (an exact name, not a pattern).
+pub fn without_schema(model: &Model, schema: &str) -> Model {
+    let mut m = model.clone();
+    m.schemas.remove(schema);
+    m.tables.retain(|n, _| n.schema != schema);
+    m.enums.retain(|n, _| n.schema != schema);
+    m.sequences.retain(|n, _| n.schema != schema);
+    m
+}
+
 /// `model` reduced to the objects in `schema`, without the schema itself: what pgmig manages when
 /// scoped to one schema.
 pub fn scope_model(model: &Model, schema: &str) -> Model {

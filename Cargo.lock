@@ -686,6 +686,8 @@ name = "pgmig-migrate"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "pgmig-conn",
+ "pgmig-model",
  "sha2",
  "thiserror",
 ]

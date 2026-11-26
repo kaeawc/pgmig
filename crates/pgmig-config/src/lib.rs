@@ -14,6 +14,7 @@
 //! | `schema` | `--schema` (manage only this schema's objects) | string |
 //! | `format` | `--format` | `"text"` or `"json"` |
 //! | `migrations.dir` | `--dir` | string |
+//! | `migrations.revisions_schema` | (none) the schema of the revisions table, never managed | string |
 //!
 //! Top-level keys apply everywhere; an `[env.<name>]` section overrides them key by key (an array
 //! replaces the one below it, it does not extend it). [`Config::resolve`] applies the precedence
@@ -51,6 +52,8 @@ pub struct Settings {
     /// `"text"` or `"json"` (checked when parsed).
     pub format: Option<String>,
     pub migrations_dir: Option<String>,
+    /// `[migrations] revisions_schema`: where the revisions table lives (pgmig's default is `pgmig`).
+    pub migrations_revisions_schema: Option<String>,
 }
 
 impl fmt::Debug for Settings {
@@ -66,6 +69,7 @@ impl fmt::Debug for Settings {
             .field("schema", &self.schema)
             .field("format", &self.format)
             .field("migrations_dir", &self.migrations_dir)
+            .field("migrations_revisions_schema", &self.migrations_revisions_schema)
             .finish()
     }
 }
@@ -312,14 +316,20 @@ fn settings(table: &toml::Table, prefix: &str, problems: &mut Vec<Problem>) -> S
                     for (k, v) in m {
                         let path = join(&path, k);
                         match (k.as_str(), v) {
-                            ("dir", toml::Value::String(v)) => {
+                            (key @ ("dir" | "revisions_schema"), toml::Value::String(v)) => {
                                 if let Err(p) = interpolate(v, &path, &|_| Some(String::new())) {
                                     problems.push(p);
                                 }
-                                s.migrations_dir = Some(v.clone());
+                                if key == "dir" {
+                                    s.migrations_dir = Some(v.clone());
+                                } else if v.is_empty() {
+                                    problems.push(Problem::key(&path, "expected a schema name, not an empty string"));
+                                } else {
+                                    s.migrations_revisions_schema = Some(v.clone());
+                                }
                             }
-                            ("dir", _) => problems.push(Problem::key(&path, "expected a string")),
-                            _ => problems.push(Problem::key(&path, "unknown key (expected `dir`)")),
+                            ("dir" | "revisions_schema", _) => problems.push(Problem::key(&path, "expected a string")),
+                            _ => problems.push(Problem::key(&path, "unknown key (expected `dir` or `revisions_schema`)")),
                         }
                     }
                 }
@@ -447,6 +457,8 @@ impl Config {
         let schema = one(&section.schema, &self.top.schema, "schema");
         let format = one(&section.format, &self.top.format, "format");
         let migrations_dir = one(&section.migrations_dir, &self.top.migrations_dir, "migrations.dir");
+        let migrations_revisions_schema =
+            one(&section.migrations_revisions_schema, &self.top.migrations_revisions_schema, "migrations.revisions_schema");
         let mut many = |env: &Option<Vec<String>>, top: &Option<Vec<String>>, key: &str| -> Option<Vec<String>> {
             let (values, path) = match (env, top) {
                 (Some(v), _) => (v, join(&prefix, key)),
@@ -474,7 +486,7 @@ impl Config {
                 problems: vec![Problem::key(&key, "expected \"text\" or \"json\"")],
             });
         }
-        Ok(Settings { url, shadow, from, to, include, exclude, schema, format, migrations_dir })
+        Ok(Settings { url, shadow, from, to, include, exclude, schema, format, migrations_dir, migrations_revisions_schema })
     }
 }
 
@@ -631,6 +643,7 @@ include = ["app", "audit"]
 
 [env.ci.migrations]
 dir = "ci/migrations"
+revisions_schema = "ci_${CI_JOB}"
 "#;
 
     #[test]
@@ -644,7 +657,7 @@ include = ["i"]
 exclude = ["e"]
 schema = "app"
 format = "text"
-migrations = { dir = "m" }
+migrations = { dir = "m", revisions_schema = "ops" }
 "#,
         );
         let s = c.resolve(None, &Vars::only(BTreeMap::new())).expect("resolve");
@@ -658,6 +671,7 @@ migrations = { dir = "m" }
             schema: Some("app".into()),
             format: Some("text".into()),
             migrations_dir: Some("m".into()),
+            migrations_revisions_schema: Some("ops".into()),
         };
         assert_eq!(s, want);
         assert!(c.envs.is_empty());
@@ -679,8 +693,10 @@ migrations = { dir = "m" }
         assert_eq!((local.shadow.as_deref(), local.to.as_deref(), local.format.as_deref()), (Some("pgmem"), Some("schema/"), Some("json")));
         assert_eq!(local.migrations_dir.as_deref(), Some("migrations"));
 
-        let ci = c.resolve(Some("ci"), &vars(&[])).expect("ci");
+        assert_eq!((top.migrations_revisions_schema.as_deref(), local.migrations_revisions_schema.as_deref()), (None, None));
+        let ci = c.resolve(Some("ci"), &vars(&[("CI_JOB", "7")])).expect("ci");
         assert_eq!((ci.url.as_deref(), ci.migrations_dir.as_deref()), (Some("host=top"), Some("ci/migrations")));
+        assert_eq!(ci.migrations_revisions_schema.as_deref(), Some("ci_7"));
     }
 
     #[test]
@@ -708,7 +724,7 @@ skip = true
         assert!(got[0].starts_with("env.\"my env\".diff: unknown key (expected one of `url`"), "{got:?}");
         assert!(got[1].starts_with("env.prod.env: unknown key"), "{got:?}");
         assert!(!got[1].contains("`env`)"), "env is a top-level key only: {got:?}");
-        assert_eq!(got[2], "migrations.dri: unknown key (expected `dir`)");
+        assert_eq!(got[2], "migrations.dri: unknown key (expected `dir` or `revisions_schema`)");
         assert!(got[3].starts_with("urll: unknown key") && got[3].contains("`env`"), "{got:?}");
     }
 
@@ -727,6 +743,13 @@ skip = true
             ]
         );
         assert_eq!(problems("[env]\nlocal = 1\n"), ["env.local: expected a table ([env.<name>])"]);
+        assert_eq!(
+            problems("[migrations]\nrevisions_schema = 1\n[env.a.migrations]\nrevisions_schema = \"\"\n"),
+            [
+                "env.a.migrations.revisions_schema: expected a schema name, not an empty string",
+                "migrations.revisions_schema: expected a string"
+            ]
+        );
     }
 
     #[test]

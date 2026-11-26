@@ -15,12 +15,14 @@ pub mod api;
 mod files;
 pub mod filter;
 
-pub use filter::{Filter, Pattern, PatternError, filter_model, scope_model};
+pub use filter::{Filter, Pattern, PatternError, filter_model, scope_model, without_schema};
 /// `pgmig.toml`: project configuration.
 pub use pgmig_config as config;
 pub use pgmig_conn::Conn;
 pub use pgmig_diff::{Change, diff};
 pub use pgmig_inspect::inspect;
+/// The revisions table in the target database.
+pub use pgmig_migrate::revisions;
 pub use pgmig_migrate::{Dir as MigrationDir, SUM_FILE, SumFile, SumLine, ValidateError as ChecksumError};
 pub use pgmig_model::Model;
 pub use pgmig_plan::{Plan, PlanOptions, plan, plan_with};
@@ -52,6 +54,9 @@ pub enum Error {
     /// A `migrate diff` or `migrate new` name with no ASCII letters or digits.
     #[error("migration name {name:?} has no letters or digits; names are made of a-z, 0-9 and _")]
     MigrationDescription { name: String },
+    /// Options that cannot be used together or at all.
+    #[error("{0}")]
+    Options(String),
     #[error("import cycle: {cycle}")]
     ImportCycle { cycle: String },
     /// The migration directory cannot be read: a malformed file name, two files with one version.
@@ -156,9 +161,10 @@ impl ShadowSpec {
     }
 }
 
-/// What pgmig manages, and how it prints names. Serialized as `{"filter": {...}, "schema": ...}`;
-/// both may be left out.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// What pgmig manages, and how it prints names. Serialized as
+/// `{"filter": {...}, "schema": ..., "revisions_schema": ...}`; each may be left out, and
+/// `revisions_schema` is left out when it is the default.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Options {
     /// Which objects are managed (see [`filter`]).
@@ -169,13 +175,53 @@ pub struct Options {
     /// managed and names are qualified. Plans that are executed ([`schema_plan_apply`]) are always
     /// qualified: an unqualified name means whatever the target's `search_path` makes it mean.
     pub schema: Option<String>,
+    /// The schema holding the revisions table ([`revisions`], default `pgmig`). It and everything
+    /// in it are never managed, whatever the filter says, as if always `--exclude
+    /// schema:<revisions_schema>` (matched exactly, not as a glob): otherwise `schema apply`
+    /// would drop the table that records the applied migrations.
+    #[serde(skip_serializing_if = "is_default_revisions_schema", deserialize_with = "revisions_schema_name")]
+    pub revisions_schema: String,
+}
+
+impl Default for Options {
+    fn default() -> Options {
+        Options { filter: Filter::default(), schema: None, revisions_schema: revisions::DEFAULT_SCHEMA.to_owned() }
+    }
+}
+
+fn revisions_schema_name<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<String, D::Error> {
+    let s = String::deserialize(d)?;
+    if s.is_empty() {
+        return Err(serde::de::Error::custom("revisions_schema: expected a schema name, not an empty string"));
+    }
+    Ok(s)
+}
+
+fn is_default_revisions_schema(s: &str) -> bool {
+    s == revisions::DEFAULT_SCHEMA
 }
 
 impl Options {
-    /// The part of `model` these options manage: [`filter_model`], then [`scope_model`] in schema
-    /// mode. Applied to both sides of a diff.
+    /// Refuse options that cannot work: an empty `revisions_schema`, or schema mode on the
+    /// revisions schema itself (which is never managed, so nothing would be).
+    pub fn validate(&self) -> Result<()> {
+        if self.revisions_schema.is_empty() {
+            return Err(Error::Options("revisions_schema must be a schema name, not an empty string".into()));
+        }
+        if self.schema.as_deref() == Some(self.revisions_schema.as_str()) {
+            let s = &self.revisions_schema;
+            return Err(Error::Options(format!(
+                "schema `{s}` is the revisions schema, which holds pgmig's revisions table and is never managed; \
+                 pick another schema or move the revisions table with `revisions_schema` under [migrations]"
+            )));
+        }
+        Ok(())
+    }
+
+    /// The part of `model` these options manage: the model without the revisions schema, then
+    /// [`filter_model`], then [`scope_model`] in schema mode. Applied to both sides of a diff.
     pub fn managed(&self, model: &Model) -> Model {
-        let m = filter_model(model, &self.filter);
+        let m = filter_model(&without_schema(model, &self.revisions_schema), &self.filter);
         match &self.schema {
             Some(s) => scope_model(&m, s),
             None => m,
@@ -308,6 +354,7 @@ pub fn migrate_diff(dir: &Path, name: &str, to: &Source, shadow: &ShadowSpec, op
 }
 
 fn migrate_diff_at(dir: &Path, name: &str, to: &Source, shadow: &ShadowSpec, opts: &Options, now: SystemTime) -> Result<MigrateDiff> {
+    opts.validate()?;
     let description = description(name)?;
     // A directory that does not exist yet is an empty one; it is created when a file is written.
     let existing = if dir.exists() { Some(open_checked(dir)?) } else { None };
@@ -412,6 +459,7 @@ pub fn schema_diff(from: &Source, to: &Source, shadow: &ShadowSpec, opts: &Optio
 /// The changes that turn `from` into `to` for the objects `opts` manages, and their plan, naming
 /// them as `names` says.
 fn diff_sources(from: &Source, to: &Source, shadow: &ShadowSpec, opts: &Options, names: &PlanOptions) -> Result<(Vec<Change>, Plan)> {
+    opts.validate()?;
     // `from`'s shadow is wiped before `to`'s opens: a real Postgres shadow must start empty.
     let a = opts.managed(&load_model(from, shadow)?);
     let (b, mut loaded) = open_model(to, shadow)?;
@@ -454,6 +502,7 @@ pub fn schema_inspect(source: &Source, shadow: &ShadowSpec, opts: &Options) -> R
 
 /// The model of the objects `opts` manages in `source`, and the plan that recreates them.
 fn inspect_source(source: &Source, shadow: &ShadowSpec, opts: &Options) -> Result<(Model, Plan)> {
+    opts.validate()?;
     let m = opts.managed(&load_model(source, shadow)?);
     let plan = plan_with(&diff(&opts.empty_database(), &m), &opts.plan_options())?;
     Ok((m, plan))
@@ -470,6 +519,7 @@ pub fn schema_plan_apply(target: &str, desired: &Source, shadow: &ShadowSpec, op
 
 /// [`schema_plan_apply`], with the changes the plan makes.
 fn plan_apply_changes(target: &str, desired: &Source, shadow: &ShadowSpec, opts: &Options) -> Result<(Vec<Change>, Plan)> {
+    opts.validate()?;
     diff_sources(&Source::Database(target.to_owned()), desired, shadow, opts, &PlanOptions::default())
 }
 

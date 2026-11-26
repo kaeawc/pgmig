@@ -10,6 +10,7 @@ mod load;
 mod migrate;
 mod migrate_diff;
 mod quoting;
+mod revisions;
 mod search_path;
 mod support;
 mod validate;

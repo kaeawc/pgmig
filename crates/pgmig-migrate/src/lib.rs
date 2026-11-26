@@ -36,6 +36,12 @@
 //! checkout that rewrites line endings (`core.autocrlf`) changes the hashes, so mark migration
 //! files `-text` or `eol=lf` in `.gitattributes` when that applies. The sum file itself is parsed
 //! with or without `\r` before each newline.
+//!
+//! # Revisions table
+//!
+//! [`revisions`]: the table in the target database recording what has been applied.
+
+pub mod revisions;
 
 use std::cmp::Ordering;
 use std::fmt;
