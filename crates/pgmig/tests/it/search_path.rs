@@ -50,7 +50,9 @@ fn a_target_connection_with_another_search_path_plans_nothing() {
     let target = TestDb::new();
     let conninfo = format!("{} options=-csearch_path=other,public", target.conninfo);
     let mut conn = pgmig::Conn::connect(&conninfo).expect("connect");
-    assert_eq!(conn.query("SHOW search_path").expect("show")[0][0].as_deref(), Some("other, public"));
+    // Postgres echoes the startup option as given, without normalizing the spacing.
+    let shown = conn.query("SHOW search_path").expect("show")[0][0].clone().unwrap_or_default();
+    assert_eq!(shown.replace(' ', ""), "other,public");
     conn.batch(SCHEMA).expect("load target");
 
     let shadow_db = TestDb::new();
@@ -67,7 +69,9 @@ fn inspect_prints_names_qualified_and_leaves_the_session_alone() {
     let mut conn = connect_with_search_path(&target);
     conn.batch(SCHEMA).expect("load");
     let model = pgmig::inspect(&mut conn).expect("inspect");
-    assert_eq!(conn.query("SHOW search_path").expect("show")[0][0].as_deref(), Some("other, public"));
+    // Postgres echoes the startup option as given, without normalizing the spacing.
+    let shown = conn.query("SHOW search_path").expect("show")[0][0].clone().unwrap_or_default();
+    assert_eq!(shown.replace(' ', ""), "other,public");
 
     let t = &model.tables[&pgmig_model::QualName::new("public", "t")];
     let fk = t.constraints.iter().find(|c| c.name == "t_b_fkey").expect("t_b_fkey");
