@@ -1,0 +1,1 @@
+ALTER TABLE public.t ALTER COLUMN n TYPE bigint;

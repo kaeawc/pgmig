@@ -124,13 +124,31 @@ impl ShadowSpec {
 
 /// The model of a source: SQL is executed in a fresh shadow database, then inspected.
 pub fn load_model(source: &Source, shadow: &ShadowSpec) -> Result<Model> {
-    match source {
-        Source::Database(dsn) => Ok(inspect(&mut Conn::connect(dsn)?)?),
-        Source::Sql(path) => {
-            let mut sh = load_sql(path, shadow)?;
-            Ok(inspect(sh.conn())?)
+    open_model(source, shadow).map(|(model, _)| model)
+}
+
+/// A connection holding a source's schema: its shadow database, or the database itself.
+enum Loaded {
+    Shadow(Shadow),
+    Database(Conn),
+}
+
+impl Loaded {
+    fn conn(&mut self) -> &mut Conn {
+        match self {
+            Loaded::Shadow(sh) => sh.conn(),
+            Loaded::Database(conn) => conn,
         }
     }
+}
+
+/// [`load_model`], keeping the connection open.
+fn open_model(source: &Source, shadow: &ShadowSpec) -> Result<(Model, Loaded)> {
+    let mut loaded = match source {
+        Source::Database(dsn) => Loaded::Database(Conn::connect(dsn)?),
+        Source::Sql(path) => Loaded::Shadow(load_sql(path, shadow)?),
+    };
+    Ok((inspect(loaded.conn())?, loaded))
 }
 
 /// Execute the SQL files at `path` in a fresh shadow database, one statement at a time so an
@@ -161,9 +179,36 @@ pub fn schema_validate(source: &Source, shadow: &ShadowSpec) -> Result<()> {
 
 /// `schema diff`: the plan that turns `from` into `to`.
 pub fn schema_diff(from: &Source, to: &Source, shadow: &ShadowSpec) -> Result<Plan> {
+    // `from`'s shadow is wiped before `to`'s opens: a real Postgres shadow must start empty.
     let a = load_model(from, shadow)?;
-    let b = load_model(to, shadow)?;
-    Ok(plan(&diff(&a, &b))?)
+    let (b, mut loaded) = open_model(to, shadow)?;
+    Ok(plan(&diff_with_casts(&a, &b, loaded.conn()))?)
+}
+
+/// `diff(a, b)`, with each type change that has no assignment cast converting `USING` an explicit
+/// cast (see [`pgmig_diff::add_casts`]). `conn` holds `b`'s schema, where the new types exist.
+pub fn diff_with_casts(a: &Model, b: &Model, conn: &mut Conn) -> Vec<Change> {
+    pgmig_diff::add_casts(diff(a, b), a, b, &mut |from, to| assignment_castable(conn, from, to))
+}
+
+/// Whether Postgres converts a column of type `from` to `to` without `USING`: asked of the server
+/// by making that change to an empty temporary table in a transaction that is rolled back. The
+/// server applies its own rules (assignment casts in `pg_cast`, binary coercion, I/O conversion to
+/// string types, arrays and domains), so pgmig keeps no table of them.
+///
+/// A failing `ALTER` answers `false`, and so does an old type `conn` does not have (42704: a column
+/// whose type is dropped), where only an explicit cast can work. When the probe cannot start for
+/// any other reason (no `TEMP` privilege, a read-only transaction), the answer is `true`: the plan
+/// then has no `USING`, and an impossible change fails loudly when applied instead of an explicit
+/// cast silently truncating values (`varchar(40)` to `varchar(10)`).
+pub fn assignment_castable(conn: &mut Conn, from: &str, to: &str) -> bool {
+    let ok = match conn.batch(&format!("BEGIN; CREATE TEMPORARY TABLE pgmig_cast_probe (c {from})")) {
+        Ok(()) => conn.batch(&format!("ALTER TABLE pg_temp.pgmig_cast_probe ALTER COLUMN c TYPE {to}")).is_ok(),
+        Err(e) => e.code.as_deref() != Some("42704"),
+    };
+    // Also ends the transaction a failed statement left open.
+    let _ = conn.batch("ROLLBACK");
+    ok
 }
 
 /// `schema inspect`: SQL that recreates the source's schema in a new database.

@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use pgmig::{diff, inspect, plan};
+use pgmig::{diff, diff_with_casts, inspect, plan};
 
 use crate::support::{TestDb, backend_name, postgres_dsn, shadow};
 
@@ -57,7 +57,7 @@ fn run_case(dir: &Path) -> Result<(), String> {
     sh.load(&read_opt(&dir.join("to.sql"))).map_err(|e| format!("loading to.sql into the shadow: {e}"))?;
     let b = inspect(sh.conn()).map_err(|e| format!("inspecting the shadow: {e}"))?;
 
-    let planned = plan(&diff(&a, &b)).map_err(|e| format!("planning: {e}"))?;
+    let planned = plan(&diff_with_casts(&a, &b, sh.conn())).map_err(|e| format!("planning: {e}"))?;
     let sql = planned.to_sql();
     let plan_file = dir.join("plan.sql");
     if std::env::var_os("PGMIG_BLESS").is_some() {

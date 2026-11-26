@@ -1,0 +1,1 @@
+CREATE TABLE t (n int DEFAULT 0);

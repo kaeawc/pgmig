@@ -48,10 +48,19 @@
 //! lists them, except foreign keys to other dropped tables that reference it back (directly or
 //! through others), which are dropped first ([`Change::DropConstraint`]) so the drops don't
 //! depend on each other in a cycle.
+//!
+//! # Type changes
+//!
+//! [`diff`] knows types only by their printed names, so it cannot tell whether Postgres converts
+//! a column's values to the new type on its own (an assignment cast, as `integer` to `bigint`) or
+//! needs `USING` (as `text` to `integer`). [`Change::AlterColumnType`] comes out of [`diff`] with
+//! no `using`; [`add_casts`] takes the answer from the caller, who asks a server, and fills it in.
+//! A type change that needs `USING` also drops the column's old default first and sets the new
+//! one after (Postgres would have to convert the default too, and refuses when it cannot).
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use pgmig_model::{Column, Constraint, ConstraintKind, Enum, Identity, Model, OwnedBy, QualName, Sequence, Table};
+use pgmig_model::{Column, Constraint, ConstraintKind, Enum, Identity, Model, OwnedBy, QualName, Sequence, Table, quote_ident};
 
 /// An object that can carry a comment. New kinds (constraints, indexes) add a variant here, a
 /// matching `Object` in the planner, and a comparison in [`diff`].
@@ -103,13 +112,15 @@ pub enum Change {
         sequences: Vec<QualName>,
         owned_sequences: Vec<QualName>,
     },
-    /// `type_ref` is the new type's, `old_type_ref` the replaced one's.
+    /// `type_ref` is the new type's, `old_type_ref` the replaced one's. `using` is the `USING`
+    /// expression, when the old type has no assignment cast to the new one (see [`add_casts`]).
     AlterColumnType {
         table: QualName,
         column: String,
         type_name: String,
         type_ref: Option<QualName>,
         old_type_ref: Option<QualName>,
+        using: Option<String>,
     },
     SetNotNull {
         table: QualName,
@@ -218,6 +229,49 @@ pub enum Change {
         target: CommentTarget,
         comment: Option<String>,
     },
+}
+
+/// Fills in `using` on the [`Change::AlterColumnType`]s of `diff(a, b)` whose old type has no
+/// assignment cast to the new one. `assignable(from, to)` answers that for two printed type names
+/// (`from` is `a`'s, `to` is `b`'s); the caller asks a server, and answers `false` when it cannot
+/// tell, since `USING` is valid for any change an explicit cast can make.
+///
+/// Such a change converts with `USING column::type`, and the column's default is dropped before
+/// it and set after (adding the [`Change::DropDefault`] and [`Change::SetDefault`] the diff left
+/// out because the default did not change).
+pub fn add_casts(mut changes: Vec<Change>, a: &Model, b: &Model, assignable: &mut dyn FnMut(&str, &str) -> bool) -> Vec<Change> {
+    let column = |m: &Model, table: &QualName, name: &str| m.tables.get(table).and_then(|t| t.column(name)).cloned();
+    let mut extra = Vec::new();
+    for change in &mut changes {
+        let Change::AlterColumnType { table, column: name, type_name, using, .. } = change else { continue };
+        let (Some(old), Some(new)) = (column(a, table, name), column(b, table, name)) else { continue };
+        if assignable(&old.type_name, type_name) {
+            continue;
+        }
+        *using = Some(format!("{}::{type_name}", quote_ident(name)));
+        if old.default.is_some() {
+            extra.push((table.clone(), new, old.default_sequences));
+        }
+    }
+    for (table, new, old_sequences) in extra {
+        let here = |t: &QualName, c: &str| *t == table && c == new.name;
+        if !changes.iter().any(|c| matches!(c, Change::DropDefault { table: t, column: c, .. } if here(t, c))) {
+            changes.push(Change::DropDefault { table: table.clone(), column: new.name.clone(), sequences: old_sequences.clone() });
+        }
+        if let Some(default) = &new.default
+            && !changes.iter().any(|c| matches!(c, Change::SetDefault { table: t, column: c, .. } if here(t, c)))
+        {
+            changes.push(Change::SetDefault {
+                table: table.clone(),
+                column: new.name.clone(),
+                default: default.clone(),
+                sequences: new.default_sequences.clone(),
+                // Released by the drop above.
+                old_sequences: Vec::new(),
+            });
+        }
+    }
+    changes
 }
 
 pub fn diff(a: &Model, b: &Model) -> Vec<Change> {
@@ -539,6 +593,7 @@ fn diff_table(a: &Table, b: &Table, owned: &dyn Fn(&str) -> Vec<QualName>, chang
                 type_name: col.type_name.clone(),
                 type_ref: col.type_ref.clone(),
                 old_type_ref: old.type_ref.clone(),
+                using: None,
             });
         }
         match (&old.default, &col.default) {
@@ -621,6 +676,49 @@ mod tests {
     }
 
     #[test]
+    fn type_changes_without_an_assignment_cast_convert_using_one_and_move_the_default() {
+        let with_default = |name: &str, type_name: &str, default: &str| Column { default: Some(default.into()), ..col(name, type_name) };
+        let a = model(vec![with_default("n", "text", "'1'::text"), with_default("m", "text", "f()"), col("k", "bigint")]);
+        let b = model(vec![with_default("n", "integer", "1"), with_default("m", "integer", "f()"), col("k", "integer")]);
+        let mut asked = Vec::new();
+        let changes = add_casts(diff(&a, &b), &a, &b, &mut |from, to| {
+            asked.push(format!("{from} -> {to}"));
+            from == "bigint"
+        });
+        assert_eq!(asked, ["text -> integer", "text -> integer", "bigint -> integer"]);
+        let t = QualName::new("public", "t");
+        let alter = |column: &str, using: Option<&str>| Change::AlterColumnType {
+            table: t.clone(),
+            column: column.into(),
+            type_name: "integer".into(),
+            type_ref: None,
+            old_type_ref: None,
+            using: using.map(Into::into),
+        };
+        let set = |column: &str, default: &str| Change::SetDefault {
+            table: t.clone(),
+            column: column.into(),
+            default: default.into(),
+            sequences: vec![],
+            old_sequences: vec![],
+        };
+        let drop = |column: &str| Change::DropDefault { table: t.clone(), column: column.into(), sequences: vec![] };
+        assert_eq!(
+            changes,
+            [
+                alter("n", Some("n::integer")),
+                set("n", "1"),
+                alter("m", Some("m::integer")),
+                alter("k", None),
+                drop("n"),
+                // Unchanged, so not in the diff; set again after the type change.
+                drop("m"),
+                set("m", "f()"),
+            ]
+        );
+    }
+
+    #[test]
     fn identical_models_have_no_changes() {
         let m = model(vec![col("id", "integer")]);
         assert!(diff(&m, &m).is_empty());
@@ -648,7 +746,8 @@ mod tests {
                     column: "id".into(),
                     type_name: "bigint".into(),
                     type_ref: None,
-                    old_type_ref: None
+                    old_type_ref: None,
+                    using: None
                 },
                 Change::SetNotNull { table: t.clone(), column: "id".into() },
                 Change::AddColumn { table: t.clone(), column: col("new", "text") },
@@ -1080,6 +1179,7 @@ mod tests {
             type_name: "text".into(),
             type_ref: None,
             old_type_ref: None,
+            using: None,
         };
         let fk_changes =
             [Change::DropConstraint { table: t("t"), constraint: f.clone() }, Change::AddConstraint { table: t("t"), constraint: f }];
