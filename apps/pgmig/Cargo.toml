@@ -24,6 +24,9 @@ pgmig = { workspace = true }
 [lints]
 workspace = true
 
+[dev-dependencies]
+pgmem = { workspace = true }
+
 # `cargo binstall pgmig-cli`: the archives attached to each GitHub release by .github/workflows/release.yml.
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/pgmig-v{ version }-{ target }.tar.gz"

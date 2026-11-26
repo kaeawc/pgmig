@@ -8,6 +8,10 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
 
 ### Added
 
+- `pgmig schema apply --url <target> --to <desired>`: plan, show, confirm and execute. Each batch
+  runs in a transaction; a failure rolls it back and names the statement and how many earlier
+  batches stayed applied. `--dry-run` prints the plan; without a terminal it needs
+  `--auto-approve`.
 - Enum types: create, drop, add values at a position, and rename a value (planned only when one
   label changes in place; the statement carries a comment saying stored values change). Removing
   or reordering values is reported as unsupported. `ADD VALUE` is planned first, and the plan marks
