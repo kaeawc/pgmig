@@ -56,7 +56,7 @@ fn run_case(dir: &Path) -> Result<(), String> {
     sh.load(&read_opt(&dir.join("to.sql"))).map_err(|e| format!("loading to.sql into the shadow: {e}"))?;
     let b = inspect(sh.conn()).map_err(|e| format!("inspecting the shadow: {e}"))?;
 
-    let sql = plan(&diff(&a, &b)).to_sql();
+    let sql = plan(&diff(&a, &b)).map_err(|e| format!("planning: {e}"))?.to_sql();
     let plan_file = dir.join("plan.sql");
     if std::env::var_os("PGMIG_BLESS").is_some() {
         fs::write(&plan_file, &sql).map_err(|e| format!("writing plan.sql: {e}"))?;

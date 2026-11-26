@@ -23,6 +23,8 @@ pub enum Error {
     Shadow(#[from] pgmig_shadow::Error),
     #[error(transparent)]
     Inspect(#[from] pgmig_inspect::Error),
+    #[error(transparent)]
+    Plan(#[from] pgmig_plan::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -88,13 +90,13 @@ pub fn load_model(source: &Source, shadow: &ShadowSpec) -> Result<Model> {
 pub fn schema_diff(from: &Source, to: &Source, shadow: &ShadowSpec) -> Result<Plan> {
     let a = load_model(from, shadow)?;
     let b = load_model(to, shadow)?;
-    Ok(plan(&diff(&a, &b)))
+    Ok(plan(&diff(&a, &b))?)
 }
 
 /// `schema inspect`: SQL that recreates the source's schema in a new database.
 pub fn schema_inspect(source: &Source, shadow: &ShadowSpec) -> Result<Plan> {
     let m = load_model(source, shadow)?;
-    Ok(plan(&diff(&Model::empty_database(), &m)))
+    Ok(plan(&diff(&Model::empty_database(), &m))?)
 }
 
 fn sql_files(path: &Path) -> Result<Vec<PathBuf>> {

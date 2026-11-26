@@ -7,14 +7,43 @@ pub enum Change {
     CreateSchema(String),
     DropSchema(String),
     CreateTable(Table),
-    DropTable(QualName),
-    AddColumn { table: QualName, column: Column },
-    DropColumn { table: QualName, column: String },
-    AlterColumnType { table: QualName, column: String, type_name: String },
-    SetNotNull { table: QualName, column: String },
-    DropNotNull { table: QualName, column: String },
-    SetDefault { table: QualName, column: String, default: String },
-    DropDefault { table: QualName, column: String },
+    /// The table as it was, so the planner sees what its columns referenced.
+    DropTable(Table),
+    AddColumn {
+        table: QualName,
+        column: Column,
+    },
+    /// `type_ref` is the dropped column's.
+    DropColumn {
+        table: QualName,
+        column: String,
+        type_ref: Option<QualName>,
+    },
+    /// `type_ref` is the new type's, `old_type_ref` the replaced one's.
+    AlterColumnType {
+        table: QualName,
+        column: String,
+        type_name: String,
+        type_ref: Option<QualName>,
+        old_type_ref: Option<QualName>,
+    },
+    SetNotNull {
+        table: QualName,
+        column: String,
+    },
+    DropNotNull {
+        table: QualName,
+        column: String,
+    },
+    SetDefault {
+        table: QualName,
+        column: String,
+        default: String,
+    },
+    DropDefault {
+        table: QualName,
+        column: String,
+    },
 }
 
 pub fn diff(a: &Model, b: &Model) -> Vec<Change> {
@@ -33,8 +62,8 @@ pub fn diff(a: &Model, b: &Model) -> Vec<Change> {
             Some(old) => diff_table(old, table, &mut changes),
         }
     }
-    for name in a.tables.keys().filter(|n| !b.tables.contains_key(*n)) {
-        changes.push(Change::DropTable(name.clone()));
+    for table in a.tables.values().filter(|t| !b.tables.contains_key(&t.name)) {
+        changes.push(Change::DropTable(table.clone()));
     }
 
     changes
@@ -49,7 +78,13 @@ fn diff_table(a: &Table, b: &Table, changes: &mut Vec<Change>) {
         };
         let column = || col.name.clone();
         if old.type_name != col.type_name {
-            changes.push(Change::AlterColumnType { table: table.clone(), column: column(), type_name: col.type_name.clone() });
+            changes.push(Change::AlterColumnType {
+                table: table.clone(),
+                column: column(),
+                type_name: col.type_name.clone(),
+                type_ref: col.type_ref.clone(),
+                old_type_ref: old.type_ref.clone(),
+            });
         }
         match (&old.default, &col.default) {
             (_, Some(new)) if old.default.as_ref() != Some(new) => {
@@ -65,7 +100,7 @@ fn diff_table(a: &Table, b: &Table, changes: &mut Vec<Change>) {
         }
     }
     for old in a.columns.iter().filter(|c| b.column(&c.name).is_none()) {
-        changes.push(Change::DropColumn { table: table.clone(), column: old.name.clone() });
+        changes.push(Change::DropColumn { table: table.clone(), column: old.name.clone(), type_ref: old.type_ref.clone() });
     }
 }
 
@@ -74,7 +109,7 @@ mod tests {
     use super::*;
 
     fn col(name: &str, type_name: &str) -> Column {
-        Column { name: name.into(), type_name: type_name.into(), not_null: false, default: None }
+        Column { name: name.into(), type_name: type_name.into(), type_ref: None, not_null: false, default: None }
     }
 
     fn model(columns: Vec<Column>) -> Model {
@@ -107,10 +142,16 @@ mod tests {
         assert_eq!(
             diff(&a, &b),
             vec![
-                Change::AlterColumnType { table: t.clone(), column: "id".into(), type_name: "bigint".into() },
+                Change::AlterColumnType {
+                    table: t.clone(),
+                    column: "id".into(),
+                    type_name: "bigint".into(),
+                    type_ref: None,
+                    old_type_ref: None
+                },
                 Change::SetNotNull { table: t.clone(), column: "id".into() },
                 Change::AddColumn { table: t.clone(), column: col("new", "text") },
-                Change::DropColumn { table: t, column: "gone".into() },
+                Change::DropColumn { table: t, column: "gone".into(), type_ref: None },
             ]
         );
     }

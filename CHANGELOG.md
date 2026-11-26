@@ -6,6 +6,15 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
 
 ## [Unreleased]
 
+### Changed
+
+- Plans are ordered by a dependency graph: each statement runs after what it references, and drops
+  run before what they reference. A table whose column uses another table's row type is now
+  created after that table and dropped before it.
+- Breaking library changes: `pgmig_plan::plan` returns `Result<Plan, Error>` (an error names a
+  dependency cycle); `Change::DropTable` carries the dropped `Table`; `DropColumn` and
+  `AlterColumnType` carry the referenced types; `Column` has a new `type_ref` field.
+
 ## [0.1.0] - 2026-11-26
 
 ### Added
