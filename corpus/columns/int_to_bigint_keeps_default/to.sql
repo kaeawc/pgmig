@@ -1,0 +1,1 @@
+CREATE TABLE t (n bigint DEFAULT 0);

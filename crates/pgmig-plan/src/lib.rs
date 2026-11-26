@@ -502,8 +502,9 @@ fn statement(change: &Change) -> String {
         Change::UnsupportedEnumChange { name, .. } => format!("-- unsupported change to enum {name}"),
         Change::AddColumn { table, column } => format!("ALTER TABLE {table} ADD COLUMN {}", column_def(column)),
         Change::DropColumn { table, column, .. } => format!("ALTER TABLE {table} DROP COLUMN {}", quote_ident(column)),
-        Change::AlterColumnType { table, column, type_name, .. } => {
-            format!("ALTER TABLE {table} ALTER COLUMN {} TYPE {type_name}", quote_ident(column))
+        Change::AlterColumnType { table, column, type_name, using, .. } => {
+            let using = using.as_ref().map(|u| format!(" USING {u}")).unwrap_or_default();
+            format!("ALTER TABLE {table} ALTER COLUMN {} TYPE {type_name}{using}", quote_ident(column))
         }
         Change::SetNotNull { table, column } => format!("ALTER TABLE {table} ALTER COLUMN {} SET NOT NULL", quote_ident(column)),
         Change::DropNotNull { table, column } => format!("ALTER TABLE {table} ALTER COLUMN {} DROP NOT NULL", quote_ident(column)),
@@ -639,6 +640,7 @@ mod tests {
                 type_name: "znew".into(),
                 type_ref: row_type("public", "znew"),
                 old_type_ref: row_type("public", "aold"),
+                using: None,
             },
             Change::AddColumn { table: t, column: col("added", row_type("public", "znew")) },
             Change::CreateTable(new),
@@ -651,6 +653,31 @@ mod tests {
                 "ALTER TABLE public.t ALTER COLUMN c TYPE znew",
                 "ALTER TABLE public.t DROP COLUMN gone",
                 "DROP TABLE public.aold",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_type_change_with_using_runs_between_dropping_and_setting_the_default() {
+        let t = QualName::new("public", "t");
+        let changes = [
+            Change::SetDefault { table: t.clone(), column: "n".into(), default: "1".into(), sequences: vec![], old_sequences: vec![] },
+            Change::AlterColumnType {
+                table: t.clone(),
+                column: "n".into(),
+                type_name: "integer".into(),
+                type_ref: None,
+                old_type_ref: None,
+                using: Some("n::integer".into()),
+            },
+            Change::DropDefault { table: t, column: "n".into(), sequences: vec![] },
+        ];
+        assert_eq!(
+            sql(&changes),
+            [
+                "ALTER TABLE public.t ALTER COLUMN n DROP DEFAULT",
+                "ALTER TABLE public.t ALTER COLUMN n TYPE integer USING n::integer",
+                "ALTER TABLE public.t ALTER COLUMN n SET DEFAULT 1",
             ]
         );
     }
@@ -1138,6 +1165,7 @@ mod tests {
                 type_name: "bigint".into(),
                 type_ref: None,
                 old_type_ref: None,
+                using: None,
             },
             Change::DropConstraint { table: t.clone(), constraint: pkey("t") },
             Change::AddColumn { table: t.clone(), column: col("x", None) },
@@ -1168,9 +1196,10 @@ mod tests {
             type_name: "text".into(),
             type_ref: None,
             old_type_ref: None,
+            using: None,
         };
         let changes = [
-            Change::AlterColumnType { table: p.clone(), column: "id".into(), type_name: "text".into(), type_ref: None, old_type_ref: None },
+            alter(&p, "id"),
             alter(&t, "pid"),
             Change::DropConstraint { table: t.clone(), constraint: fkey("t", "pid", "p") },
             Change::AddConstraint { table: t.clone(), constraint: fkey("t", "pid", "p") },

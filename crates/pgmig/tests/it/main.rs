@@ -1,5 +1,6 @@
 // One integration-test binary for the crate: one module per area.
 mod apply;
+mod casts;
 mod corpus;
 mod import;
 mod inspect;
