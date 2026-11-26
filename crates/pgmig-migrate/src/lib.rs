@@ -39,8 +39,10 @@
 //!
 //! # Revisions table
 //!
-//! [`revisions`]: the table in the target database recording what has been applied.
+//! [`revisions`]: the table in the target database recording what has been applied;
+//! [`history`]: what it leaves to apply.
 
+pub mod history;
 pub mod revisions;
 
 use std::cmp::Ordering;
@@ -95,6 +97,14 @@ impl File {
     pub fn new(name: &str, bytes: impl Into<Vec<u8>>) -> std::result::Result<File, NameError> {
         let (version, description) = parse_name(name)?;
         Ok(File { name: name.to_owned(), version: version.to_owned(), description: description.to_owned(), bytes: bytes.into() })
+    }
+
+    /// The file's own hash (base64): SHA-256 over its name, a zero byte and its bytes, without the
+    /// chain of the sum file. The revisions table records it, so a file inserted before applied
+    /// ones (non-linear order) leaves their recorded hashes valid. For the first file it equals
+    /// its sum-file line.
+    pub fn hash(&self) -> String {
+        BASE64.encode(chain(None, &self.name, &self.bytes))
     }
 }
 

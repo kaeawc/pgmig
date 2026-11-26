@@ -15,6 +15,12 @@
 //! | `format` | `--format` | `"text"` or `"json"` |
 //! | `migrations.dir` | `--dir` | string |
 //! | `migrations.revisions_schema` | (none) the schema of the revisions table, never managed | string |
+//! | `migrations.tx_mode` | `--tx-mode` | `"file"`, `"all"` or `"none"` |
+//! | `migrations.exec_order` | `--exec-order` | `"linear"`, `"linear-skip"` or `"non-linear"` |
+//! | `migrations.lock_name` | `--lock-name` | string |
+//! | `migrations.lock_timeout` | `--lock-timeout` | duration: `"500ms"`, `"10s"`, `"2m"`, `"0"` ([`parse_duration_ms`]) |
+//! | `migrations.before_sql` | `--before-sql` | string |
+//! | `migrations.after_sql` | `--after-sql` | string |
 //!
 //! Top-level keys apply everywhere; an `[env.<name>]` section overrides them key by key (an array
 //! replaces the one below it, it does not extend it). [`Config::resolve`] applies the precedence
@@ -54,6 +60,15 @@ pub struct Settings {
     pub migrations_dir: Option<String>,
     /// `[migrations] revisions_schema`: where the revisions table lives (pgmig's default is `pgmig`).
     pub migrations_revisions_schema: Option<String>,
+    /// `[migrations] tx_mode` (checked when parsed).
+    pub migrations_tx_mode: Option<String>,
+    /// `[migrations] exec_order` (checked when parsed).
+    pub migrations_exec_order: Option<String>,
+    pub migrations_lock_name: Option<String>,
+    /// `[migrations] lock_timeout`, as written (checked when parsed; see [`parse_duration_ms`]).
+    pub migrations_lock_timeout: Option<String>,
+    pub migrations_before_sql: Option<String>,
+    pub migrations_after_sql: Option<String>,
 }
 
 impl fmt::Debug for Settings {
@@ -70,6 +85,12 @@ impl fmt::Debug for Settings {
             .field("format", &self.format)
             .field("migrations_dir", &self.migrations_dir)
             .field("migrations_revisions_schema", &self.migrations_revisions_schema)
+            .field("migrations_tx_mode", &self.migrations_tx_mode)
+            .field("migrations_exec_order", &self.migrations_exec_order)
+            .field("migrations_lock_name", &self.migrations_lock_name)
+            .field("migrations_lock_timeout", &self.migrations_lock_timeout)
+            .field("migrations_before_sql", &self.migrations_before_sql)
+            .field("migrations_after_sql", &self.migrations_after_sql)
             .finish()
     }
 }
@@ -315,21 +336,22 @@ fn settings(table: &toml::Table, prefix: &str, problems: &mut Vec<Problem>) -> S
                 toml::Value::Table(m) => {
                     for (k, v) in m {
                         let path = join(&path, k);
-                        match (k.as_str(), v) {
-                            (key @ ("dir" | "revisions_schema"), toml::Value::String(v)) => {
-                                if let Err(p) = interpolate(v, &path, &|_| Some(String::new())) {
-                                    problems.push(p);
-                                }
-                                if key == "dir" {
-                                    s.migrations_dir = Some(v.clone());
-                                } else if v.is_empty() {
-                                    problems.push(Problem::key(&path, "expected a schema name, not an empty string"));
-                                } else {
-                                    s.migrations_revisions_schema = Some(v.clone());
-                                }
-                            }
-                            ("dir" | "revisions_schema", _) => problems.push(Problem::key(&path, "expected a string")),
-                            _ => problems.push(Problem::key(&path, "unknown key (expected `dir` or `revisions_schema`)")),
+                        let Some(slot) = migrations_slot(&mut s, k) else {
+                            let keys = MIGRATIONS_KEYS.iter().map(|k| format!("`{k}`")).collect::<Vec<_>>().join(", ");
+                            problems.push(Problem::key(&path, format!("unknown key (expected one of {keys})")));
+                            continue;
+                        };
+                        let toml::Value::String(v) = v else {
+                            problems.push(Problem::key(&path, "expected a string"));
+                            continue;
+                        };
+                        if let Err(p) = interpolate(v, &path, &|_| Some(String::new())) {
+                            problems.push(p);
+                        }
+                        // A value with a placeholder is checked once interpolated.
+                        match check_migrations_value(k, v).filter(|_| !v.contains('$')) {
+                            Some(message) => problems.push(Problem::key(&path, message)),
+                            None => *slot = Some(v.clone()),
                         }
                     }
                 }
@@ -340,6 +362,55 @@ fn settings(table: &toml::Table, prefix: &str, problems: &mut Vec<Problem>) -> S
         }
     }
     s
+}
+
+/// The keys of `[migrations]`.
+const MIGRATIONS_KEYS: &[&str] =
+    &["dir", "revisions_schema", "tx_mode", "exec_order", "lock_name", "lock_timeout", "before_sql", "after_sql"];
+
+fn migrations_slot<'a>(s: &'a mut Settings, key: &str) -> Option<&'a mut Option<String>> {
+    Some(match key {
+        "dir" => &mut s.migrations_dir,
+        "revisions_schema" => &mut s.migrations_revisions_schema,
+        "tx_mode" => &mut s.migrations_tx_mode,
+        "exec_order" => &mut s.migrations_exec_order,
+        "lock_name" => &mut s.migrations_lock_name,
+        "lock_timeout" => &mut s.migrations_lock_timeout,
+        "before_sql" => &mut s.migrations_before_sql,
+        "after_sql" => &mut s.migrations_after_sql,
+        _ => return None,
+    })
+}
+
+/// What is wrong with the value of `[migrations] <key>`, if anything.
+fn check_migrations_value(key: &str, v: &str) -> Option<&'static str> {
+    match key {
+        "revisions_schema" if v.is_empty() => Some("expected a schema name, not an empty string"),
+        "lock_name" if v.is_empty() => Some("expected a lock name, not an empty string"),
+        "tx_mode" if !matches!(v, "file" | "all" | "none") => Some("expected \"file\", \"all\" or \"none\""),
+        "exec_order" if !matches!(v, "linear" | "linear-skip" | "non-linear") => {
+            Some("expected \"linear\", \"linear-skip\" or \"non-linear\"")
+        }
+        "lock_timeout" if parse_duration_ms(v).is_none() => Some("expected a duration such as \"500ms\", \"10s\" or \"2m\""),
+        _ => None,
+    }
+}
+
+/// A duration in milliseconds: digits followed by `ms`, `s` or `m`, or `0`.
+pub fn parse_duration_ms(s: &str) -> Option<u64> {
+    if s == "0" {
+        return Some(0);
+    }
+    let digits = s.bytes().take_while(u8::is_ascii_digit).count();
+    let (n, unit) = s.split_at(digits);
+    let n: u64 = n.parse().ok()?;
+    let scale = match unit {
+        "ms" => 1,
+        "s" => 1000,
+        "m" => 60_000,
+        _ => return None,
+    };
+    n.checked_mul(scale)
 }
 
 fn unknown_key_message(top: bool) -> String {
@@ -459,6 +530,12 @@ impl Config {
         let migrations_dir = one(&section.migrations_dir, &self.top.migrations_dir, "migrations.dir");
         let migrations_revisions_schema =
             one(&section.migrations_revisions_schema, &self.top.migrations_revisions_schema, "migrations.revisions_schema");
+        let migrations_tx_mode = one(&section.migrations_tx_mode, &self.top.migrations_tx_mode, "migrations.tx_mode");
+        let migrations_exec_order = one(&section.migrations_exec_order, &self.top.migrations_exec_order, "migrations.exec_order");
+        let migrations_lock_name = one(&section.migrations_lock_name, &self.top.migrations_lock_name, "migrations.lock_name");
+        let migrations_lock_timeout = one(&section.migrations_lock_timeout, &self.top.migrations_lock_timeout, "migrations.lock_timeout");
+        let migrations_before_sql = one(&section.migrations_before_sql, &self.top.migrations_before_sql, "migrations.before_sql");
+        let migrations_after_sql = one(&section.migrations_after_sql, &self.top.migrations_after_sql, "migrations.after_sql");
         let mut many = |env: &Option<Vec<String>>, top: &Option<Vec<String>>, key: &str| -> Option<Vec<String>> {
             let (values, path) = match (env, top) {
                 (Some(v), _) => (v, join(&prefix, key)),
@@ -486,7 +563,42 @@ impl Config {
                 problems: vec![Problem::key(&key, "expected \"text\" or \"json\"")],
             });
         }
-        Ok(Settings { url, shadow, from, to, include, exclude, schema, format, migrations_dir, migrations_revisions_schema })
+        // Values that held a placeholder are checked now.
+        let checked = [
+            ("revisions_schema", &migrations_revisions_schema, &section.migrations_revisions_schema),
+            ("tx_mode", &migrations_tx_mode, &section.migrations_tx_mode),
+            ("exec_order", &migrations_exec_order, &section.migrations_exec_order),
+            ("lock_name", &migrations_lock_name, &section.migrations_lock_name),
+            ("lock_timeout", &migrations_lock_timeout, &section.migrations_lock_timeout),
+        ];
+        let mut problems = Vec::new();
+        for (key, value, in_env) in checked {
+            if let Some(message) = value.as_deref().and_then(|v| check_migrations_value(key, v)) {
+                let path = if in_env.is_some() { join(&join(&prefix, "migrations"), key) } else { format!("migrations.{key}") };
+                problems.push(Problem::key(&path, message));
+            }
+        }
+        if !problems.is_empty() {
+            return Err(ConfigError::Invalid { path: self.path.clone(), problems });
+        }
+        Ok(Settings {
+            url,
+            shadow,
+            from,
+            to,
+            include,
+            exclude,
+            schema,
+            format,
+            migrations_dir,
+            migrations_revisions_schema,
+            migrations_tx_mode,
+            migrations_exec_order,
+            migrations_lock_name,
+            migrations_lock_timeout,
+            migrations_before_sql,
+            migrations_after_sql,
+        })
     }
 }
 
@@ -657,7 +769,7 @@ include = ["i"]
 exclude = ["e"]
 schema = "app"
 format = "text"
-migrations = { dir = "m", revisions_schema = "ops" }
+migrations = { dir = "m", revisions_schema = "ops", tx_mode = "none", exec_order = "linear-skip", lock_name = "l", lock_timeout = "5s", before_sql = "SET LOCAL lock_timeout = '1s'", after_sql = "SELECT 1" }
 "#,
         );
         let s = c.resolve(None, &Vars::only(BTreeMap::new())).expect("resolve");
@@ -672,6 +784,12 @@ migrations = { dir = "m", revisions_schema = "ops" }
             format: Some("text".into()),
             migrations_dir: Some("m".into()),
             migrations_revisions_schema: Some("ops".into()),
+            migrations_tx_mode: Some("none".into()),
+            migrations_exec_order: Some("linear-skip".into()),
+            migrations_lock_name: Some("l".into()),
+            migrations_lock_timeout: Some("5s".into()),
+            migrations_before_sql: Some("SET LOCAL lock_timeout = '1s'".into()),
+            migrations_after_sql: Some("SELECT 1".into()),
         };
         assert_eq!(s, want);
         assert!(c.envs.is_empty());
@@ -724,7 +842,10 @@ skip = true
         assert!(got[0].starts_with("env.\"my env\".diff: unknown key (expected one of `url`"), "{got:?}");
         assert!(got[1].starts_with("env.prod.env: unknown key"), "{got:?}");
         assert!(!got[1].contains("`env`)"), "env is a top-level key only: {got:?}");
-        assert_eq!(got[2], "migrations.dri: unknown key (expected `dir` or `revisions_schema`)");
+        assert_eq!(
+            got[2],
+            "migrations.dri: unknown key (expected one of `dir`, `revisions_schema`, `tx_mode`, `exec_order`, `lock_name`, `lock_timeout`, `before_sql`, `after_sql`)"
+        );
         assert!(got[3].starts_with("urll: unknown key") && got[3].contains("`env`"), "{got:?}");
     }
 
@@ -750,6 +871,41 @@ skip = true
                 "migrations.revisions_schema: expected a string"
             ]
         );
+    }
+
+    #[test]
+    fn migrations_values_are_checked() {
+        assert_eq!(
+            problems(
+                "[migrations]\ntx_mode = \"some\"\nexec_order = \"random\"\nlock_timeout = \"10\"\nlock_name = \"\"\nbefore_sql = 1\n"
+            ),
+            [
+                "migrations.before_sql: expected a string",
+                "migrations.exec_order: expected \"linear\", \"linear-skip\" or \"non-linear\"",
+                "migrations.lock_name: expected a lock name, not an empty string",
+                "migrations.lock_timeout: expected a duration such as \"500ms\", \"10s\" or \"2m\"",
+                "migrations.tx_mode: expected \"file\", \"all\" or \"none\"",
+            ]
+        );
+        // A placeholder is checked once interpolated.
+        let c = parse("[env.a.migrations]\ntx_mode = \"${MODE}\"\n");
+        assert_eq!(c.resolve(Some("a"), &vars(&[("MODE", "all")])).expect("resolve").migrations_tx_mode.as_deref(), Some("all"));
+        assert_eq!(
+            resolve_err(&c, Some("a"), &vars(&[("MODE", "both")])),
+            ["env.a.migrations.tx_mode: expected \"file\", \"all\" or \"none\""]
+        );
+        for (text, ms) in [
+            ("0", Some(0)),
+            ("250ms", Some(250)),
+            ("10s", Some(10_000)),
+            ("2m", Some(120_000)),
+            ("10", None),
+            ("s", None),
+            ("-1s", None),
+            ("1h", None),
+        ] {
+            assert_eq!(parse_duration_ms(text), ms, "{text}");
+        }
     }
 
     #[test]

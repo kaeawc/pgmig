@@ -12,9 +12,10 @@
 //! `ALTER TYPE ... ADD VALUE` may run in a transaction, but the new value cannot be used (as a
 //! column default, say) until that transaction commits. So the plan puts every `ADD VALUE` first
 //! and, when other statements follow, marks a commit point after them ([`Plan::commit_after`]):
-//! [`Plan::batches`] are the scripts to run in separate transactions, and [`Plan::to_sql`] shows
-//! the point as a comment. pgmig does not check which later statements use a new value; any
-//! statement after an `ADD VALUE` waits for the commit.
+//! [`Plan::batches`] are the scripts to run in separate transactions, and [`Plan::to_sql`] writes
+//! the point as a comment and the `-- pgmig:commit` directive ([`COMMIT_MARKER`]), which
+//! `migrate apply` commits at when it runs a file `migrate diff` wrote. pgmig does not check which
+//! later statements use a new value; any statement after an `ADD VALUE` waits for the commit.
 //!
 //! # Sequences
 //!
@@ -65,10 +66,10 @@ impl Plan {
         self.statements.is_empty()
     }
 
-    /// The plan as a SQL script: one statement per entry, each ending in `;`, with a comment line
-    /// at the commit point.
+    /// The plan as a SQL script: one statement per entry, each ending in `;`, with
+    /// [`COMMIT_MARKER`] at the commit point.
     pub fn to_sql(&self) -> String {
-        self.batches().join(COMMIT_COMMENT)
+        self.batches().join(COMMIT_MARKER)
     }
 
     /// The plan as scripts that must each be committed before the next one runs.
@@ -83,8 +84,9 @@ impl Plan {
     }
 }
 
-/// Marks [`Plan::commit_after`] in [`Plan::to_sql`].
-pub const COMMIT_COMMENT: &str = "-- commit: new enum values cannot be used in the transaction that adds them\n";
+/// Marks [`Plan::commit_after`] in [`Plan::to_sql`]: a comment for the reader, then the
+/// `-- pgmig:commit` directive. `migrate apply` keys on the directive, never on the comment.
+pub const COMMIT_MARKER: &str = "-- New enum values cannot be used in the transaction that adds them.\n-- pgmig:commit\n";
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
@@ -858,7 +860,7 @@ mod tests {
         assert_eq!(p.commit_after, Some(2));
         assert_eq!(p.batches().len(), 2);
         assert!(p.batches()[1].starts_with("CREATE SCHEMA other;\n"), "{:?}", p.batches());
-        assert_eq!(p.to_sql(), p.batches().join(COMMIT_COMMENT));
+        assert_eq!(p.to_sql(), p.batches().join(COMMIT_MARKER));
 
         let only_adds = plan(&changes[1..2]).expect("plan");
         assert_eq!(only_adds.commit_after, None);

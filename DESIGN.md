@@ -246,7 +246,7 @@ row per migration file:
 | `execution_ms` | `bigint not null` | |
 | `error` | `text` | last error, if any |
 | `error_stmt` | `text` | statement that failed |
-| `hash` | `text not null` | file hash from the sum file |
+| `hash` | `text not null` | the file's own hash (SHA-256 of its name, a zero byte and its bytes; not chained, so a non-linear insert leaves applied rows valid) |
 | `partial_hashes` | `text[] not null` | hash of each applied statement, for resuming |
 | `pgmig_version` | `text not null` | |
 | `row_hash` | `text not null` | SHA-256 over the row, to catch hand edits |
@@ -276,7 +276,12 @@ it back). Otherwise `schema apply` against a migrated database would drop the ta
 3. For each pending file: run session hooks, then its statements in the file's transaction mode,
    updating the revisions row as it goes. In non-transactional mode each statement's hash is
    recorded as it succeeds, so a retry resumes after the last one and refuses if those statements
-   changed (`MIG-11`).
+   changed (`MIG-11`); each statement is marked in flight before it runs, and a retry refuses to
+   guess whether a statement left in flight took effect. A `-- pgmig:commit` directive (written by
+   `migrate diff` after new enum values) commits the file's transaction there and begins another;
+   `--tx-mode all` refuses such a file. Hooks run around each transaction, at session level for a
+   file without one. The lock is a session lock: connect directly or through a session-mode
+   pooler.
 4. Emit a structured report (`MIG-22`).
 
 ### Down migrations
