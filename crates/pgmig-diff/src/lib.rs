@@ -23,10 +23,35 @@
 //! sequence, both compared as they are stored. Identity columns compare `GENERATED ALWAYS` / `BY
 //! DEFAULT` and their sequence's options ([`Change::AddIdentity`], [`Change::AlterIdentity`],
 //! [`Change::DropIdentity`]).
+//!
+//! # Constraints
+//!
+//! Constraints are compared by kind and printed definition (`pg_get_constraintdef`) and matched
+//! by name within their table. A changed constraint is dropped and added again, with three
+//! exceptions:
+//!
+//! - a foreign key whose definition differs only in `DEFERRABLE` / `INITIALLY DEFERRED` is
+//!   altered in place ([`Change::AlterConstraint`]);
+//! - when a table loses exactly one constraint and gains exactly one, of the same kind and with the
+//!   same definition, the constraint is renamed ([`Change::RenameConstraint`]). Any other mix of
+//!   names is a drop and an add;
+//! - a foreign key that stays the same but references a primary key, unique or exclusion
+//!   constraint that is dropped (or dropped and added again) is dropped first and added again
+//!   after: Postgres refuses to drop a constraint a foreign key uses;
+//! - a foreign key that stays the same but has a column, or a referenced column, that changes type
+//!   is dropped before the type change and added again after: Postgres cannot rebuild it.
+//!
+//! A new table carries its primary key, unique, check and exclusion constraints in
+//! [`Change::CreateTable`]; its foreign keys (which may reference tables not created yet, or each
+//! other) and its `NOT VALID` constraints (which `CREATE TABLE` would validate) follow as
+//! [`Change::AddConstraint`]. A dropped table's constraints go with it: [`Change::DropTable`]
+//! lists them, except foreign keys to other dropped tables that reference it back (directly or
+//! through others), which are dropped first ([`Change::DropConstraint`]) so the drops don't
+//! depend on each other in a cycle.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use pgmig_model::{Column, Enum, Identity, Model, OwnedBy, QualName, Sequence, Table};
+use pgmig_model::{Column, Constraint, ConstraintKind, Enum, Identity, Model, OwnedBy, QualName, Sequence, Table};
 
 /// An object that can carry a comment. New kinds (constraints, indexes) add a variant here, a
 /// matching `Object` in the planner, and a comparison in [`diff`].
@@ -38,6 +63,8 @@ pub enum CommentTarget {
     /// A type that is not a table's row type (an enum).
     Type(QualName),
     Sequence(QualName),
+    /// A table constraint by its table and name.
+    Constraint(QualName, String),
 }
 
 /// Where [`Change::AddEnumValue`] puts the new value.
@@ -53,8 +80,10 @@ pub enum EnumPosition {
 pub enum Change {
     CreateSchema(String),
     DropSchema(String),
+    /// The table with the constraints created with it (see the module doc).
     CreateTable(Table),
-    /// `table` is the table as it was, so the planner sees what its columns referenced.
+    /// `table` is the table as it was, so the planner sees what its columns referenced, with the
+    /// constraints dropped with it (not those dropped first by a [`Change::DropConstraint`]).
     /// `owned_sequences` are the sequences Postgres drops with it: those `OWNED BY` its columns
     /// that are not kept, and its identity columns' sequences.
     DropTable {
@@ -162,6 +191,27 @@ pub enum Change {
         from: Vec<String>,
         to: Vec<String>,
     },
+    /// `ALTER TABLE ... ADD CONSTRAINT`.
+    AddConstraint {
+        table: QualName,
+        constraint: Constraint,
+    },
+    /// `ALTER TABLE ... DROP CONSTRAINT`; `constraint` is the constraint as it was.
+    DropConstraint {
+        table: QualName,
+        constraint: Constraint,
+    },
+    /// `ALTER TABLE ... RENAME CONSTRAINT`; `to` is the renamed constraint.
+    RenameConstraint {
+        table: QualName,
+        from: String,
+        to: Constraint,
+    },
+    /// `ALTER TABLE ... ALTER CONSTRAINT` to the deferrability of `to` (a foreign key).
+    AlterConstraint {
+        table: QualName,
+        to: Constraint,
+    },
     /// `COMMENT ON ... IS <comment>`; `None` removes the comment. Never emitted for an object
     /// that is being dropped.
     SetComment {
@@ -231,10 +281,13 @@ pub fn diff(a: &Model, b: &Model) -> Vec<Change> {
         implicit.iter().filter(|((t, c), _)| t == table && column.is_none_or(|col| col == c)).flat_map(|(_, n)| n.clone()).collect()
     };
 
+    let dropped_first = foreign_keys_dropped_before_their_tables(a, b);
     for (name, table) in &b.tables {
         match a.tables.get(name) {
             None => {
-                changes.push(Change::CreateTable(table.clone()));
+                let mut created = table.clone();
+                created.constraints.retain(created_with_table);
+                changes.push(Change::CreateTable(created));
                 set_comment(CommentTarget::Table(name.clone()), None, table.comment.as_ref(), &mut changes);
                 for col in &table.columns {
                     set_comment(CommentTarget::Column(name.clone(), col.name.clone()), None, col.comment.as_ref(), &mut changes);
@@ -244,10 +297,169 @@ pub fn diff(a: &Model, b: &Model) -> Vec<Change> {
         }
     }
     for table in a.tables.values().filter(|t| !b.tables.contains_key(&t.name)) {
-        changes.push(Change::DropTable { table: table.clone(), owned_sequences: owned(&table.name, None) });
+        for fk in table.constraints.iter().filter(|c| dropped_first.contains(&(table.name.clone(), c.name.clone()))) {
+            changes.push(Change::DropConstraint { table: table.name.clone(), constraint: fk.clone() });
+        }
+        let mut dropped = table.clone();
+        dropped.constraints.retain(|c| !dropped_first.contains(&(table.name.clone(), c.name.clone())));
+        changes.push(Change::DropTable { table: dropped, owned_sequences: owned(&table.name, None) });
     }
 
+    diff_constraints(a, b, &mut changes);
     changes
+}
+
+/// Whether a new table's constraint is written in its `CREATE TABLE` (see the module doc).
+fn created_with_table(c: &Constraint) -> bool {
+    c.kind != ConstraintKind::ForeignKey && c.validated
+}
+
+/// The foreign keys `(table, name)` of tables `b` drops that reference another dropped table
+/// which references the first one back, directly or through other dropped tables.
+fn foreign_keys_dropped_before_their_tables(a: &Model, b: &Model) -> BTreeSet<(QualName, String)> {
+    let dropped: Vec<&Table> = a.tables.values().filter(|t| !b.tables.contains_key(&t.name)).collect();
+    let is_dropped = |n: &QualName| dropped.iter().any(|t| &t.name == n);
+    let refs = |t: &Table| -> Vec<QualName> {
+        t.constraints.iter().filter_map(|c| c.references.as_ref()).map(|r| r.table.clone()).filter(|r| is_dropped(r)).collect()
+    };
+    let reaches = |from: &QualName, to: &QualName| {
+        let mut seen = BTreeSet::new();
+        let mut stack = vec![from.clone()];
+        while let Some(at) = stack.pop() {
+            if &at == to {
+                return true;
+            }
+            if seen.insert(at.clone())
+                && let Some(t) = a.tables.get(&at)
+            {
+                stack.extend(refs(t));
+            }
+        }
+        false
+    };
+    let mut out = BTreeSet::new();
+    for t in &dropped {
+        for c in &t.constraints {
+            if let Some(r) = &c.references
+                && r.table != t.name
+                && is_dropped(&r.table)
+                && reaches(&r.table, &t.name)
+            {
+                out.insert((t.name.clone(), c.name.clone()));
+            }
+        }
+    }
+    out
+}
+
+/// What becomes of one constraint of a table both models have.
+enum Step<'a> {
+    Keep(&'a Constraint, &'a Constraint),
+    Alter(&'a Constraint, &'a Constraint),
+    Replace(&'a Constraint, &'a Constraint),
+    Rename(&'a Constraint, &'a Constraint),
+    Drop(&'a Constraint),
+    Add(&'a Constraint),
+}
+
+fn constraint_steps<'a>(a: &'a Table, b: &'a Table) -> Vec<Step<'a>> {
+    let mut steps = Vec::new();
+    let mut added = Vec::new();
+    for c in &b.constraints {
+        match a.constraint(&c.name) {
+            Some(o) if o.kind == c.kind && o.definition == c.definition => steps.push(Step::Keep(o, c)),
+            Some(o)
+                if o.kind == ConstraintKind::ForeignKey
+                    && c.kind == ConstraintKind::ForeignKey
+                    && o.definition_without_deferrability() == c.definition_without_deferrability() =>
+            {
+                steps.push(Step::Alter(o, c))
+            }
+            Some(o) => steps.push(Step::Replace(o, c)),
+            None => added.push(c),
+        }
+    }
+    let gone: Vec<&Constraint> = a.constraints.iter().filter(|o| b.constraint(&o.name).is_none()).collect();
+    match (&gone[..], &added[..]) {
+        ([o], [c]) if o.kind == c.kind && o.definition == c.definition => steps.push(Step::Rename(o, c)),
+        _ => {
+            steps.extend(gone.into_iter().map(Step::Drop));
+            steps.extend(added.into_iter().map(Step::Add));
+        }
+    }
+    steps
+}
+
+/// Constraint changes: the constraints of new tables not created with them, and those of tables
+/// both models have (see the module doc).
+fn diff_constraints(a: &Model, b: &Model, changes: &mut Vec<Change>) {
+    let target = |t: &QualName, c: &Constraint| CommentTarget::Constraint(t.clone(), c.name.clone());
+    let kept: Vec<(&Table, &Table)> = b.tables.values().filter_map(|t| Some((a.tables.get(&t.name)?, t))).collect();
+    let steps: Vec<(&QualName, Vec<Step>)> = kept.iter().map(|(old, new)| (&new.name, constraint_steps(old, new))).collect();
+    // Constraints of `a` that stop existing under their name: a foreign key using one must go too.
+    let mut removed = BTreeSet::new();
+    for (table, steps) in &steps {
+        for step in steps {
+            if let Step::Replace(o, _) | Step::Drop(o) = step {
+                removed.insert(((*table).clone(), o.name.clone()));
+            }
+        }
+    }
+    let uses_removed = |o: &Constraint| {
+        o.references.as_ref().is_some_and(|r| r.constraint.as_ref().is_some_and(|c| removed.contains(&(r.table.clone(), c.clone()))))
+    };
+    // Columns whose type changes: Postgres cannot rebuild a foreign key over one (42804), so the
+    // key is dropped before the type change and added after it.
+    let retyped = |table: &QualName, column: &str| {
+        let (Some(old), Some(new)) = (a.tables.get(table), b.tables.get(table)) else { return false };
+        matches!((old.column(column), new.column(column)), (Some(o), Some(n)) if o.type_name != n.type_name)
+    };
+    let uses_retyped = |table: &QualName, o: &Constraint| {
+        o.kind == ConstraintKind::ForeignKey
+            && (o.columns.iter().any(|c| retyped(table, c))
+                || o.references.as_ref().is_some_and(|r| r.columns.iter().any(|c| retyped(&r.table, c))))
+    };
+
+    for (name, table) in &b.tables {
+        if a.tables.contains_key(name) {
+            continue;
+        }
+        for c in &table.constraints {
+            if !created_with_table(c) {
+                changes.push(Change::AddConstraint { table: name.clone(), constraint: c.clone() });
+            }
+            set_comment(target(name, c), None, c.comment.as_ref(), changes);
+        }
+    }
+    for (table, steps) in steps {
+        for step in steps {
+            let step = match step {
+                Step::Keep(o, c) | Step::Alter(o, c) if uses_removed(o) || uses_retyped(table, o) => Step::Replace(o, c),
+                other => other,
+            };
+            match step {
+                Step::Keep(o, c) => set_comment(target(table, c), o.comment.as_ref(), c.comment.as_ref(), changes),
+                Step::Alter(o, c) => {
+                    changes.push(Change::AlterConstraint { table: table.clone(), to: c.clone() });
+                    set_comment(target(table, c), o.comment.as_ref(), c.comment.as_ref(), changes);
+                }
+                Step::Rename(o, c) => {
+                    changes.push(Change::RenameConstraint { table: table.clone(), from: o.name.clone(), to: c.clone() });
+                    set_comment(target(table, c), o.comment.as_ref(), c.comment.as_ref(), changes);
+                }
+                Step::Replace(o, c) => {
+                    changes.push(Change::DropConstraint { table: table.clone(), constraint: o.clone() });
+                    changes.push(Change::AddConstraint { table: table.clone(), constraint: c.clone() });
+                    set_comment(target(table, c), None, c.comment.as_ref(), changes);
+                }
+                Step::Drop(o) => changes.push(Change::DropConstraint { table: table.clone(), constraint: o.clone() }),
+                Step::Add(c) => {
+                    changes.push(Change::AddConstraint { table: table.clone(), constraint: c.clone() });
+                    set_comment(target(table, c), None, c.comment.as_ref(), changes);
+                }
+            }
+        }
+    }
 }
 
 /// The sequences Postgres drops implicitly with each column of `a` that `b` drops (directly or
@@ -404,7 +616,7 @@ mod tests {
     fn model(columns: Vec<Column>) -> Model {
         let mut m = Model::empty_database();
         let name = QualName::new("public", "t");
-        m.tables.insert(name.clone(), Table { name, columns, comment: None });
+        m.tables.insert(name.clone(), Table { name, columns, comment: None, constraints: vec![] });
         m
     }
 
@@ -451,7 +663,7 @@ mod tests {
         let mut c = col("id", "integer");
         c.comment = comment.map(Into::into);
         let name = QualName::new("public", "t");
-        m.tables.insert(name.clone(), Table { name, columns: vec![c], comment: comment.map(Into::into) });
+        m.tables.insert(name.clone(), Table { name, columns: vec![c], comment: comment.map(Into::into), constraints: vec![] });
         m
     }
 
@@ -744,5 +956,223 @@ mod tests {
                 old_sequences: vec![]
             }]
         );
+    }
+
+    fn check(name: &str, definition: &str) -> Constraint {
+        Constraint {
+            name: name.into(),
+            kind: ConstraintKind::Check,
+            definition: definition.into(),
+            deferrable: false,
+            deferred: false,
+            validated: true,
+            columns: vec!["id".into()],
+            references: None,
+            comment: None,
+        }
+    }
+
+    fn fk(name: &str, to: &str, uses: &str, suffix: &str) -> Constraint {
+        Constraint {
+            kind: ConstraintKind::ForeignKey,
+            definition: format!("FOREIGN KEY (id) REFERENCES {to}(id){suffix}"),
+            deferrable: suffix.contains("DEFERRABLE"),
+            deferred: suffix.contains("INITIALLY DEFERRED"),
+            references: Some(pgmig_model::References {
+                table: QualName::new("public", to),
+                columns: vec!["id".into()],
+                constraint: Some(uses.into()),
+            }),
+            ..check(name, "")
+        }
+    }
+
+    fn unique(name: &str, definition: &str) -> Constraint {
+        Constraint { kind: ConstraintKind::Unique, ..check(name, definition) }
+    }
+
+    /// Tables with an `id` column and the given constraints.
+    fn tables(tables: &[(&str, Vec<Constraint>)]) -> Model {
+        let mut m = Model::empty_database();
+        for (name, constraints) in tables {
+            let name = QualName::new("public", *name);
+            m.tables
+                .insert(name.clone(), Table { name, columns: vec![col("id", "integer")], comment: None, constraints: constraints.clone() });
+        }
+        m
+    }
+
+    fn t(name: &str) -> QualName {
+        QualName::new("public", name)
+    }
+
+    #[test]
+    fn one_constraint_swapped_for_an_identical_one_is_a_rename() {
+        let a = tables(&[("t", vec![check("old", "CHECK ((id > 0))")])]);
+        let mut renamed = check("new", "CHECK ((id > 0))");
+        renamed.comment = Some("c".into());
+        let b = tables(&[("t", vec![renamed.clone()])]);
+        assert_eq!(
+            diff(&a, &b),
+            vec![
+                Change::RenameConstraint { table: t("t"), from: "old".into(), to: renamed },
+                set(CommentTarget::Constraint(t("t"), "new".into()), Some("c")),
+            ]
+        );
+        // A different definition, or more than one name changing, is a drop and an add.
+        let other = tables(&[("t", vec![check("new", "CHECK ((id > 1))")])]);
+        assert_eq!(
+            diff(&a, &other),
+            vec![
+                Change::DropConstraint { table: t("t"), constraint: check("old", "CHECK ((id > 0))") },
+                Change::AddConstraint { table: t("t"), constraint: check("new", "CHECK ((id > 1))") },
+            ]
+        );
+        let two = tables(&[("t", vec![check("x", "CHECK ((id > 0))"), check("y", "CHECK ((id < 9))")])]);
+        let two_renamed = tables(&[("t", vec![check("x2", "CHECK ((id > 0))"), check("y2", "CHECK ((id < 9))")])]);
+        let changes = diff(&two, &two_renamed);
+        assert_eq!(changes.iter().filter(|c| matches!(c, Change::DropConstraint { .. })).count(), 2, "{changes:?}");
+        assert_eq!(changes.iter().filter(|c| matches!(c, Change::AddConstraint { .. })).count(), 2, "{changes:?}");
+    }
+
+    #[test]
+    fn a_changed_definition_is_dropped_and_added_with_its_comment() {
+        let mut old = check("c", "CHECK ((id > 0))");
+        old.comment = Some("same".into());
+        let mut new = check("c", "CHECK ((id > 1))");
+        new.comment = Some("same".into());
+        assert_eq!(
+            diff(&tables(&[("t", vec![old.clone()])]), &tables(&[("t", vec![new.clone()])])),
+            vec![
+                Change::DropConstraint { table: t("t"), constraint: old },
+                Change::AddConstraint { table: t("t"), constraint: new },
+                set(CommentTarget::Constraint(t("t"), "c".into()), Some("same")),
+            ]
+        );
+    }
+
+    #[test]
+    fn only_deferrability_changing_alters_a_foreign_key_in_place() {
+        let p = ("p", vec![unique("p_id_key", "UNIQUE (id)")]);
+        let a = tables(&[p.clone(), ("t", vec![fk("f", "p", "p_id_key", ""), fk("g", "p", "p_id_key", " DEFERRABLE")])]);
+        let to_f = fk("f", "p", "p_id_key", " DEFERRABLE INITIALLY DEFERRED");
+        let to_g = fk("g", "p", "p_id_key", " ON DELETE CASCADE DEFERRABLE");
+        let b = tables(&[p, ("t", vec![to_f.clone(), to_g.clone()])]);
+        assert_eq!(
+            diff(&a, &b),
+            vec![
+                Change::AlterConstraint { table: t("t"), to: to_f },
+                Change::DropConstraint { table: t("t"), constraint: fk("g", "p", "p_id_key", " DEFERRABLE") },
+                Change::AddConstraint { table: t("t"), constraint: to_g },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_foreign_key_over_a_retyped_column_is_dropped_and_added_again() {
+        let f = fk("f", "p", "p_pkey", "");
+        let pk = Constraint { kind: ConstraintKind::PrimaryKey, ..check("p_pkey", "PRIMARY KEY (id)") };
+        let a = tables(&[("p", vec![pk.clone()]), ("t", vec![f.clone()])]);
+        let retype = |m: &mut Model, table: &str| m.tables.get_mut(&t(table)).expect("table").columns[0].type_name = "text".into();
+        let alter = |table: &str| Change::AlterColumnType {
+            table: t(table),
+            column: "id".into(),
+            type_name: "text".into(),
+            type_ref: None,
+            old_type_ref: None,
+        };
+        let fk_changes =
+            [Change::DropConstraint { table: t("t"), constraint: f.clone() }, Change::AddConstraint { table: t("t"), constraint: f }];
+        // The referenced column, the referencing column, and both: the key is replaced each time,
+        // the primary key stays.
+        for tables_retyped in [vec!["p"], vec!["t"], vec!["p", "t"]] {
+            let mut b = a.clone();
+            for table in &tables_retyped {
+                retype(&mut b, table);
+            }
+            let mut expected: Vec<Change> = tables_retyped.iter().map(|table| alter(table)).collect();
+            expected.extend(fk_changes.clone());
+            assert_eq!(diff(&a, &b), expected, "{tables_retyped:?}");
+        }
+    }
+
+    #[test]
+    fn a_foreign_key_using_a_replaced_constraint_is_added_again() {
+        let f = fk("f", "p", "p_id_key", "");
+        let a = tables(&[("p", vec![unique("p_id_key", "UNIQUE (id)")]), ("t", vec![f.clone()])]);
+        let b = tables(&[("p", vec![unique("p_id_key", "UNIQUE NULLS NOT DISTINCT (id)")]), ("t", vec![f.clone()])]);
+        assert_eq!(
+            diff(&a, &b),
+            vec![
+                Change::DropConstraint { table: t("p"), constraint: unique("p_id_key", "UNIQUE (id)") },
+                Change::AddConstraint { table: t("p"), constraint: unique("p_id_key", "UNIQUE NULLS NOT DISTINCT (id)") },
+                Change::DropConstraint { table: t("t"), constraint: f.clone() },
+                Change::AddConstraint { table: t("t"), constraint: f },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_new_table_creates_its_keys_and_checks_and_adds_foreign_keys_after() {
+        let pk = Constraint { kind: ConstraintKind::PrimaryKey, ..check("t_pkey", "PRIMARY KEY (id)") };
+        let unvalidated = Constraint { validated: false, ..check("later", "CHECK ((id > 0)) NOT VALID") };
+        let mut f = fk("t_id_fkey", "t", "t_pkey", "");
+        f.comment = Some("self".into());
+        let b = tables(&[("t", vec![pk.clone(), unvalidated.clone(), f.clone()])]);
+        let changes = diff(&Model::empty_database(), &b);
+        let Some(Change::CreateTable(created)) = changes.first() else { panic!("{changes:?}") };
+        assert_eq!(created.constraints, vec![pk]);
+        assert_eq!(
+            changes[1..],
+            [
+                Change::AddConstraint { table: t("t"), constraint: unvalidated },
+                Change::AddConstraint { table: t("t"), constraint: f },
+                set(CommentTarget::Constraint(t("t"), "t_id_fkey".into()), Some("self")),
+            ]
+        );
+    }
+
+    #[test]
+    fn dropped_tables_drop_their_constraints_except_foreign_keys_in_a_cycle() {
+        let pk = |table: &str| Constraint { kind: ConstraintKind::PrimaryKey, ..check(&format!("{table}_pkey"), "PRIMARY KEY (id)") };
+        let a = tables(&[
+            ("parent", vec![pk("parent")]),
+            ("child", vec![fk("child_fkey", "parent", "parent_pkey", "")]),
+            ("m1", vec![pk("m1"), fk("m1_fkey", "m2", "m2_pkey", "")]),
+            ("m2", vec![pk("m2"), fk("m2_fkey", "m1", "m1_pkey", "")]),
+            ("tree", vec![pk("tree"), fk("tree_fkey", "tree", "tree_pkey", "")]),
+        ]);
+        let changes = diff(&a, &Model::empty_database());
+        let explicit: Vec<&str> = changes
+            .iter()
+            .filter_map(|c| match c {
+                Change::DropConstraint { constraint, .. } => Some(constraint.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(explicit, ["m1_fkey", "m2_fkey"]);
+        let with_table = |name: &str| {
+            changes.iter().find_map(|c| match c {
+                Change::DropTable { table, .. } if table.name.name == name => {
+                    Some(table.constraints.iter().map(|c| c.name.clone()).collect::<Vec<_>>())
+                }
+                _ => None,
+            })
+        };
+        assert_eq!(with_table("child"), Some(vec!["child_fkey".to_owned()]));
+        assert_eq!(with_table("m1"), Some(vec!["m1_pkey".to_owned()]));
+        assert_eq!(with_table("tree"), Some(vec!["tree_pkey".to_owned(), "tree_fkey".to_owned()]));
+    }
+
+    #[test]
+    fn constraint_comments_are_diffed_and_unchanged_constraints_are_left_alone() {
+        let with = |comment: Option<&str>| {
+            let mut c = check("c", "CHECK ((id > 0))");
+            c.comment = comment.map(Into::into);
+            tables(&[("t", vec![c])])
+        };
+        assert!(diff(&with(None), &with(None)).is_empty());
+        assert_eq!(diff(&with(Some("a")), &with(None)), vec![set(CommentTarget::Constraint(t("t"), "c".into()), None)]);
+        assert_eq!(diff(&with(None), &with(Some("b"))), vec![set(CommentTarget::Constraint(t("t"), "c".into()), Some("b"))]);
     }
 }

@@ -26,6 +26,14 @@
 //! `nextval` default, then `ALTER SEQUENCE ... OWNED BY`. Plans never `RESTART` a sequence: a
 //! sequence whose current value falls outside new bounds fails to apply.
 //!
+//! # Constraints
+//!
+//! A new table's primary key, unique, check and exclusion constraints are written in its `CREATE
+//! TABLE`; foreign keys are always `ALTER TABLE ... ADD CONSTRAINT` steps after the tables they
+//! join (and the constraint whose index they use), so tables that reference each other plan
+//! without a cycle. A foreign key is dropped before the table or constraint it references; a
+//! constraint is dropped before the columns it uses change or go, and added after they are set.
+//!
 //! Changes Postgres cannot make in place (removing or reordering enum values) fail the plan with
 //! [`Error::Unsupported`].
 
@@ -33,7 +41,7 @@ pub mod graph;
 
 use graph::{Deps, Node, Object};
 use pgmig_diff::{Change, CommentTarget, EnumPosition};
-use pgmig_model::{Column, Generated, Identity, OwnedBy, QualName, SequenceOptions, quote_ident, quote_literal};
+use pgmig_model::{Column, Constraint, Generated, Identity, OwnedBy, QualName, SequenceOptions, quote_ident, quote_literal};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Plan {
@@ -120,14 +128,19 @@ fn phase(change: &Change) -> u8 {
         Change::RenameEnumValue { .. } | Change::AlterSequence { .. } => 2,
         Change::CreateTable(_) => 3,
         Change::AddColumn { .. } => 4,
-        // A column cannot have a default and an identity at once.
-        Change::DropIdentity { .. } | Change::DropDefault { .. } => 5,
+        // A column cannot have a default and an identity at once. A constraint goes before the
+        // columns it uses change (a primary key column cannot drop NOT NULL).
+        Change::DropIdentity { .. } | Change::DropDefault { .. } | Change::DropConstraint { .. } => 5,
         Change::AlterColumnType { .. } => 6,
         Change::SetDefault { .. } => 7,
         Change::DropNotNull { .. } | Change::SetNotNull { .. } => 8,
         // After the type, the dropped default and NOT NULL that adding an identity needs.
         Change::AddIdentity { .. } | Change::AlterIdentity { .. } => 9,
-        Change::SetSequenceOwner { .. } => 10,
+        // After the columns they use have settled.
+        Change::SetSequenceOwner { .. }
+        | Change::AddConstraint { .. }
+        | Change::RenameConstraint { .. }
+        | Change::AlterConstraint { .. } => 10,
         Change::DropColumn { .. } => 11,
         Change::DropTable { .. } => 12,
         Change::DropSequence(_) => 13,
@@ -150,6 +163,7 @@ fn deps(change: &Change) -> Deps {
             requires.extend(sequences(t.columns.iter().flat_map(|c| &c.default_sequences)));
             let mut creates = vec![Object::Table(t.name.clone()), Object::Type(t.name.clone())];
             creates.extend(t.columns.iter().filter_map(|c| Some(identity_sequence(&t.name, &c.name, c.identity.as_ref()?))));
+            creates.extend(t.constraints.iter().map(|c| constraint(&t.name, &c.name)));
             Deps { creates, requires, ..Deps::default() }
         }
         Change::DropTable { table: t, owned_sequences } => {
@@ -159,6 +173,9 @@ fn deps(change: &Change) -> Deps {
             // With the table go the sequences its columns own and its identity sequences.
             let mut drops = vec![Object::Table(t.name.clone()), Object::Type(t.name.clone())];
             drops.extend(sequences(owned_sequences));
+            // With the table go its constraints, and its foreign keys stop using what they reference.
+            drops.extend(t.constraints.iter().map(|c| constraint(&t.name, &c.name)));
+            releases.extend(t.constraints.iter().flat_map(referenced).filter(|o| !is_of_table(o, &t.name)));
             Deps { drops, releases, ..Deps::default() }
         }
         Change::CreateSequence(s) => Deps {
@@ -229,7 +246,37 @@ fn deps(change: &Change) -> Deps {
             let mut requires = vec![in_table(table)];
             requires.extend(types([type_ref]));
             let releases = if type_ref == old_type_ref { Vec::new() } else { types([old_type_ref]) };
-            Deps { alters: vec![column(table, c)], requires, releases, ..Deps::default() }
+            Deps { alters: vec![column(table, c), Object::ColumnType(table.clone(), c.clone())], requires, releases, ..Deps::default() }
+        }
+        Change::AddConstraint { table, constraint: c } => {
+            let columns: Vec<Object> = c.columns.iter().map(|col| column(table, col)).collect();
+            Deps {
+                creates: vec![constraint(table, &c.name)],
+                // Added once its columns, and those a foreign key references, have their final type
+                // and nullability.
+                alters: [columns.clone(), referenced_column_types(c)].concat(),
+                requires: [vec![in_table(table)], columns, referenced(c)].concat(),
+                ..Deps::default()
+            }
+        }
+        Change::DropConstraint { table, constraint: c } => {
+            let columns: Vec<Object> = c.columns.iter().map(|col| column(table, col)).collect();
+            Deps {
+                drops: vec![constraint(table, &c.name)],
+                // Dropped before the columns it uses, or a foreign key references, change type.
+                alters: [columns.clone(), referenced_column_types(c)].concat(),
+                releases: [vec![in_table(table)], columns, referenced(c)].concat(),
+                ..Deps::default()
+            }
+        }
+        Change::RenameConstraint { table, from, to } => Deps {
+            drops: vec![constraint(table, from)],
+            creates: vec![constraint(table, &to.name)],
+            requires: vec![in_table(table)],
+            ..Deps::default()
+        },
+        Change::AlterConstraint { table, to } => {
+            Deps { alters: vec![constraint(table, &to.name)], requires: vec![in_table(table)], ..Deps::default() }
         }
         Change::SetComment { target, .. } => {
             // A comment only waits for the object (and a column's table) to exist.
@@ -239,6 +286,7 @@ fn deps(change: &Change) -> Deps {
                 CommentTarget::Column(t, c) => vec![in_table(t), column(t, c)],
                 CommentTarget::Type(t) => vec![Object::Type(t.clone())],
                 CommentTarget::Sequence(s) => vec![Object::Sequence(s.clone())],
+                CommentTarget::Constraint(t, c) => vec![in_table(t), constraint(t, c)],
             };
             Deps { requires, ..Deps::default() }
         }
@@ -254,6 +302,35 @@ fn deps(change: &Change) -> Deps {
         Change::SetNotNull { table, column: c } | Change::DropNotNull { table, column: c } => {
             Deps { alters: vec![column(table, c)], requires: vec![in_table(table)], ..Deps::default() }
         }
+    }
+}
+
+fn constraint(table: &QualName, name: &str) -> Object {
+    Object::Constraint(table.clone(), name.to_owned())
+}
+
+/// What a foreign key references: the table, its columns and the constraint whose index it uses.
+/// Empty for other constraints.
+fn referenced(c: &Constraint) -> Vec<Object> {
+    let Some(r) = &c.references else { return Vec::new() };
+    let mut out = vec![Object::Table(r.table.clone())];
+    out.extend(r.columns.iter().map(|col| Object::Column(r.table.clone(), col.clone())));
+    out.extend(r.constraint.iter().map(|name| constraint(&r.table, name)));
+    out
+}
+
+/// The types of the columns a foreign key references: it is dropped before they change and added
+/// after (see [`Object::ColumnType`]).
+fn referenced_column_types(c: &Constraint) -> Vec<Object> {
+    let Some(r) = &c.references else { return Vec::new() };
+    r.columns.iter().map(|col| Object::ColumnType(r.table.clone(), col.clone())).collect()
+}
+
+/// Whether `o` is `table` or one of its columns or constraints.
+fn is_of_table(o: &Object, table: &QualName) -> bool {
+    match o {
+        Object::Table(t) | Object::Column(t, _) | Object::Constraint(t, _) => t == table,
+        _ => false,
     }
 }
 
@@ -349,7 +426,8 @@ fn statement(change: &Change) -> String {
         Change::CreateSchema(name) => format!("CREATE SCHEMA {}", quote_ident(name)),
         Change::DropSchema(name) => format!("DROP SCHEMA {}", quote_ident(name)),
         Change::CreateTable(t) => {
-            let cols: Vec<String> = t.columns.iter().map(|c| format!("    {}", column_def(c))).collect();
+            let mut cols: Vec<String> = t.columns.iter().map(|c| format!("    {}", column_def(c))).collect();
+            cols.extend(t.constraints.iter().map(|c| format!("    {}", constraint_def(c))));
             if cols.is_empty() {
                 format!("CREATE TABLE {} ()", t.name)
             } else {
@@ -433,6 +511,21 @@ fn statement(change: &Change) -> String {
             format!("ALTER TABLE {table} ALTER COLUMN {} SET DEFAULT {default}", quote_ident(column))
         }
         Change::DropDefault { table, column, .. } => format!("ALTER TABLE {table} ALTER COLUMN {} DROP DEFAULT", quote_ident(column)),
+        Change::AddConstraint { table, constraint } => format!("ALTER TABLE {table} ADD {}", constraint_def(constraint)),
+        Change::DropConstraint { table, constraint } => {
+            format!("ALTER TABLE {table} DROP CONSTRAINT {}", quote_ident(&constraint.name))
+        }
+        Change::RenameConstraint { table, from, to } => {
+            format!("ALTER TABLE {table} RENAME CONSTRAINT {} TO {}", quote_ident(from), quote_ident(&to.name))
+        }
+        Change::AlterConstraint { table, to } => {
+            let timing = match (to.deferrable, to.deferred) {
+                (false, _) => "NOT DEFERRABLE",
+                (true, false) => "DEFERRABLE INITIALLY IMMEDIATE",
+                (true, true) => "DEFERRABLE INITIALLY DEFERRED",
+            };
+            format!("ALTER TABLE {table} ALTER CONSTRAINT {} {timing}", quote_ident(&to.name))
+        }
         Change::SetComment { target, comment } => {
             let object = match target {
                 CommentTarget::Schema(s) => format!("SCHEMA {}", quote_ident(s)),
@@ -440,10 +533,16 @@ fn statement(change: &Change) -> String {
                 CommentTarget::Column(t, c) => format!("COLUMN {t}.{}", quote_ident(c)),
                 CommentTarget::Type(t) => format!("TYPE {t}"),
                 CommentTarget::Sequence(s) => format!("SEQUENCE {s}"),
+                CommentTarget::Constraint(t, c) => format!("CONSTRAINT {} ON {t}", quote_ident(c)),
             };
             format!("COMMENT ON {object} IS {}", comment.as_deref().map_or("NULL".to_owned(), quote_literal))
         }
     }
+}
+
+/// `CONSTRAINT <name> <definition>`, as written in `CREATE TABLE` and `ADD`.
+fn constraint_def(c: &Constraint) -> String {
+    format!("CONSTRAINT {} {}", quote_ident(&c.name), c.definition)
 }
 
 fn column_def(c: &Column) -> String {
@@ -482,7 +581,7 @@ mod tests {
     }
 
     fn table(schema: &str, name: &str, columns: Vec<Column>) -> Table {
-        Table { name: QualName::new(schema, name), columns, comment: None }
+        Table { name: QualName::new(schema, name), columns, comment: None, constraints: vec![] }
     }
 
     fn row_type(schema: &str, name: &str) -> Option<QualName> {
@@ -932,5 +1031,180 @@ mod tests {
             Change::DropSequence(sequence("t_id_seq1", "integer", opts("integer", 1))),
         ];
         assert_eq!(sql(&changes)[0], "DROP SEQUENCE public.t_id_seq1");
+    }
+
+    fn constraint(name: &str, kind: pgmig_model::ConstraintKind, definition: &str, columns: &[&str]) -> Constraint {
+        Constraint {
+            name: name.into(),
+            kind,
+            definition: definition.into(),
+            deferrable: false,
+            deferred: false,
+            validated: true,
+            columns: columns.iter().map(|c| c.to_string()).collect(),
+            references: None,
+            comment: None,
+        }
+    }
+
+    fn pkey(table: &str) -> Constraint {
+        constraint(&format!("{table}_pkey"), pgmig_model::ConstraintKind::PrimaryKey, "PRIMARY KEY (id)", &["id"])
+    }
+
+    /// `<from>_<column>_fkey`: `from.<column>` references `to.id` through `to_pkey`.
+    fn fkey(from: &str, column: &str, to: &str) -> Constraint {
+        let mut c = constraint(
+            &format!("{from}_{column}_fkey"),
+            pgmig_model::ConstraintKind::ForeignKey,
+            &format!("FOREIGN KEY ({column}) REFERENCES {to}(id)"),
+            &[column],
+        );
+        c.references = Some(pgmig_model::References {
+            table: QualName::new("public", to),
+            columns: vec!["id".into()],
+            constraint: Some(format!("{to}_pkey")),
+        });
+        c
+    }
+
+    fn keyed(name: &str, other: &str, constraints: Vec<Constraint>) -> Table {
+        let mut t = table("public", name, vec![Column { not_null: true, ..col("id", None) }, col(other, None)]);
+        t.constraints = constraints;
+        t
+    }
+
+    #[test]
+    fn tables_referencing_each_other_are_created_first_and_their_foreign_keys_added_after() {
+        let changes = [
+            Change::CreateTable(keyed("a", "b_id", vec![pkey("a")])),
+            Change::CreateTable(keyed("b", "a_id", vec![pkey("b")])),
+            Change::AddConstraint { table: QualName::new("public", "a"), constraint: fkey("a", "b_id", "b") },
+            Change::AddConstraint { table: QualName::new("public", "b"), constraint: fkey("b", "a_id", "a") },
+        ];
+        assert_eq!(
+            sql(&changes),
+            [
+                "CREATE TABLE public.a (\n    id integer NOT NULL,\n    b_id integer,\n    CONSTRAINT a_pkey PRIMARY KEY (id)\n)",
+                "CREATE TABLE public.b (\n    id integer NOT NULL,\n    a_id integer,\n    CONSTRAINT b_pkey PRIMARY KEY (id)\n)",
+                "ALTER TABLE public.a ADD CONSTRAINT a_b_id_fkey FOREIGN KEY (b_id) REFERENCES b(id)",
+                "ALTER TABLE public.b ADD CONSTRAINT b_a_id_fkey FOREIGN KEY (a_id) REFERENCES a(id)",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_foreign_key_waits_for_the_key_it_uses_and_goes_before_it() {
+        let p = QualName::new("public", "p");
+        let t = QualName::new("public", "t");
+        // In diff order the foreign key comes first both ways.
+        let added = sql(&[
+            Change::AddConstraint { table: t.clone(), constraint: fkey("t", "pid", "p") },
+            Change::AddConstraint { table: p.clone(), constraint: pkey("p") },
+        ]);
+        assert_eq!(
+            added,
+            [
+                "ALTER TABLE public.p ADD CONSTRAINT p_pkey PRIMARY KEY (id)",
+                "ALTER TABLE public.t ADD CONSTRAINT t_pid_fkey FOREIGN KEY (pid) REFERENCES p(id)"
+            ]
+        );
+        let dropped = sql(&[
+            Change::DropConstraint { table: p.clone(), constraint: pkey("p") },
+            Change::DropConstraint { table: t.clone(), constraint: fkey("t", "pid", "p") },
+        ]);
+        assert_eq!(dropped, ["ALTER TABLE public.t DROP CONSTRAINT t_pid_fkey", "ALTER TABLE public.p DROP CONSTRAINT p_pkey"]);
+        // A dropped table goes after the foreign keys into it, whether they are dropped on their
+        // own or with their table.
+        let parent = keyed("p", "x", vec![pkey("p")]);
+        let child = keyed("t", "pid", vec![fkey("t", "pid", "p")]);
+        assert_eq!(
+            sql(&[drop_table(parent.clone()), Change::DropConstraint { table: t.clone(), constraint: fkey("t", "pid", "p") }]),
+            ["ALTER TABLE public.t DROP CONSTRAINT t_pid_fkey", "DROP TABLE public.p"]
+        );
+        assert_eq!(sql(&[drop_table(parent), drop_table(child)]), ["DROP TABLE public.t", "DROP TABLE public.p"]);
+        // A table referencing itself has no cycle.
+        assert_eq!(sql(&[drop_table(keyed("p", "up", vec![pkey("p"), fkey("p", "up", "p")]))]), ["DROP TABLE public.p"]);
+    }
+
+    #[test]
+    fn a_key_is_dropped_before_its_column_changes_and_added_after() {
+        let t = QualName::new("public", "t");
+        let changes = [
+            Change::DropNotNull { table: t.clone(), column: "id".into() },
+            Change::AddConstraint { table: t.clone(), constraint: pkey("t") },
+            Change::AlterColumnType {
+                table: t.clone(),
+                column: "id".into(),
+                type_name: "bigint".into(),
+                type_ref: None,
+                old_type_ref: None,
+            },
+            Change::DropConstraint { table: t.clone(), constraint: pkey("t") },
+            Change::AddColumn { table: t.clone(), column: col("x", None) },
+            Change::AddConstraint {
+                table: t.clone(),
+                constraint: constraint("x_pos", pgmig_model::ConstraintKind::Check, "CHECK ((x > 0))", &["x"]),
+            },
+        ];
+        assert_eq!(
+            sql(&changes),
+            [
+                "ALTER TABLE public.t ADD COLUMN x integer",
+                "ALTER TABLE public.t DROP CONSTRAINT t_pkey",
+                "ALTER TABLE public.t ALTER COLUMN id TYPE bigint",
+                "ALTER TABLE public.t ALTER COLUMN id DROP NOT NULL",
+                "ALTER TABLE public.t ADD CONSTRAINT t_pkey PRIMARY KEY (id)",
+                "ALTER TABLE public.t ADD CONSTRAINT x_pos CHECK ((x > 0))",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_foreign_key_is_dropped_before_the_referenced_column_changes_type_and_added_after() {
+        let (p, t) = (QualName::new("public", "p"), QualName::new("public", "t"));
+        let alter = |table: &QualName, column: &str| Change::AlterColumnType {
+            table: table.clone(),
+            column: column.into(),
+            type_name: "text".into(),
+            type_ref: None,
+            old_type_ref: None,
+        };
+        let changes = [
+            Change::AlterColumnType { table: p.clone(), column: "id".into(), type_name: "text".into(), type_ref: None, old_type_ref: None },
+            alter(&t, "pid"),
+            Change::DropConstraint { table: t.clone(), constraint: fkey("t", "pid", "p") },
+            Change::AddConstraint { table: t.clone(), constraint: fkey("t", "pid", "p") },
+        ];
+        assert_eq!(
+            sql(&changes),
+            [
+                "ALTER TABLE public.t DROP CONSTRAINT t_pid_fkey",
+                "ALTER TABLE public.p ALTER COLUMN id TYPE text",
+                "ALTER TABLE public.t ALTER COLUMN pid TYPE text",
+                "ALTER TABLE public.t ADD CONSTRAINT t_pid_fkey FOREIGN KEY (pid) REFERENCES p(id)",
+            ]
+        );
+    }
+
+    #[test]
+    fn renames_deferrability_and_comments_on_constraints() {
+        let t = QualName::new("App", "t");
+        let mut deferred = fkey("t", "pid", "p");
+        deferred.name = "Odd".into();
+        let alter = |deferrable, initially| {
+            let to = Constraint { deferrable, deferred: initially, ..deferred.clone() };
+            sql(&[Change::AlterConstraint { table: t.clone(), to }])
+        };
+        assert_eq!(alter(true, true), ["ALTER TABLE \"App\".t ALTER CONSTRAINT \"Odd\" DEFERRABLE INITIALLY DEFERRED"]);
+        assert_eq!(alter(true, false), ["ALTER TABLE \"App\".t ALTER CONSTRAINT \"Odd\" DEFERRABLE INITIALLY IMMEDIATE"]);
+        assert_eq!(alter(false, false), ["ALTER TABLE \"App\".t ALTER CONSTRAINT \"Odd\" NOT DEFERRABLE"]);
+        let renamed = sql(&[
+            Change::SetComment { target: CommentTarget::Constraint(t.clone(), "Odd".into()), comment: Some("it's".into()) },
+            Change::RenameConstraint { table: t.clone(), from: "old".into(), to: deferred.clone() },
+        ]);
+        assert_eq!(
+            renamed,
+            ["ALTER TABLE \"App\".t RENAME CONSTRAINT old TO \"Odd\"", "COMMENT ON CONSTRAINT \"Odd\" ON \"App\".t IS 'it''s'"]
+        );
     }
 }
