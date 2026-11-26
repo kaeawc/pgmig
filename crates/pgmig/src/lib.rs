@@ -2,6 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
+mod files;
+
 pub use pgmig_conn::Conn;
 pub use pgmig_diff::{Change, diff};
 pub use pgmig_inspect::inspect;
@@ -22,6 +24,16 @@ pub enum Error {
     /// A statement failed in the shadow database; `pos` is where the server located the error.
     #[error("{path}:{pos}: {source}")]
     Load { path: PathBuf, pos: pgmig_sql::Pos, source: pgmig_conn::Error },
+    #[error("{path}:{pos}: pgmig:import needs a path")]
+    ImportArgs { path: PathBuf, pos: pgmig_sql::Pos },
+    #[error("{path}:{pos}: pgmig:import must come before the first statement")]
+    ImportPlacement { path: PathBuf, pos: pgmig_sql::Pos },
+    #[error("{path}:{pos}: cannot import {target}: no such file or directory")]
+    ImportMissing { path: PathBuf, pos: pgmig_sql::Pos, target: String },
+    #[error("{path}:{pos}: cannot import {target}: no .sql files")]
+    ImportEmpty { path: PathBuf, pos: pgmig_sql::Pos, target: String },
+    #[error("import cycle: {cycle}")]
+    ImportCycle { cycle: String },
     #[error(transparent)]
     Conn(#[from] pgmig_conn::Error),
     #[error(transparent)]
@@ -35,7 +47,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// A schema state: SQL files describing it, or a live database.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
-    /// A `.sql` file, or a directory of them loaded in lexical order.
+    /// A `.sql` file, or a directory of them loaded in lexical order, after the files they
+    /// `-- pgmig:import`.
     Sql(PathBuf),
     /// A connection string (URL or key/value).
     Database(String),
@@ -89,10 +102,9 @@ pub fn load_model(source: &Source, shadow: &ShadowSpec) -> Result<Model> {
 /// error points at its statement.
 fn load_sql(path: &Path, shadow: &ShadowSpec) -> Result<Shadow> {
     let mut sh = shadow.open()?;
-    for file in sql_files(path)? {
-        let text = std::fs::read_to_string(&file).map_err(|source| Error::Io { path: file.clone(), source })?;
-        let parsed = pgmig_sql::split(&text).map_err(|source| Error::Split { path: file.clone(), source })?;
-        for stmt in &parsed.statements {
+    for loaded in files::load_files(path)? {
+        let file = loaded.path;
+        for stmt in &loaded.file.statements {
             sh.conn().batch(&stmt.sql).map_err(|source| Error::Load {
                 path: file.clone(),
                 pos: source.position.map_or(stmt.pos, |n| stmt.locate(n)),
@@ -123,25 +135,6 @@ pub fn schema_diff(from: &Source, to: &Source, shadow: &ShadowSpec) -> Result<Pl
 pub fn schema_inspect(source: &Source, shadow: &ShadowSpec) -> Result<Plan> {
     let m = load_model(source, shadow)?;
     Ok(plan(&diff(&Model::empty_database(), &m)))
-}
-
-fn sql_files(path: &Path) -> Result<Vec<PathBuf>> {
-    let io = |source| Error::Io { path: path.to_owned(), source };
-    if !path.is_dir() {
-        return Ok(vec![path.to_owned()]);
-    }
-    let mut files = Vec::new();
-    for entry in std::fs::read_dir(path).map_err(io)? {
-        let p = entry.map_err(io)?.path();
-        if p.extension().is_some_and(|e| e == "sql") {
-            files.push(p);
-        }
-    }
-    if files.is_empty() {
-        return Err(Error::NoSql { path: path.to_owned() });
-    }
-    files.sort();
-    Ok(files)
 }
 
 #[cfg(test)]
