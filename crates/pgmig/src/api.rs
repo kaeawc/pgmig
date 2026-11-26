@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ApplyOptions, ApplyReport, Change, ChecksumError, Error, Guard, MigrateApplyReport, MigrateEdit, MigrateLs, MigrateRebase, MigrateRm,
-    MigrateShow, MigrationOutcome, Model, Options, Plan, ShadowSpec, Source, SumFile, filter::PatternError,
+    MigrateSet, MigrateShow, MigrateStatus, MigrationOutcome, Model, Options, Plan, SetOptions, ShadowSpec, Source, SumFile,
+    filter::PatternError,
 };
 
 /// `schema diff`.
@@ -311,6 +312,54 @@ pub struct MigrateRebaseRequest {
 
 pub type MigrateRebaseResponse = MigrateRebase;
 
+/// `migrate baseline`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MigrateBaselineRequest {
+    /// The migration directory: missing, or without migrations.
+    pub dir: PathBuf,
+    /// The baseline's description, sanitized to `[a-z0-9_]`.
+    pub name: String,
+    /// The live database whose schema the file recreates.
+    pub target: String,
+    #[serde(default)]
+    pub options: Options,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrateBaselineResponse {
+    /// The file written.
+    pub file: PathBuf,
+    pub version: String,
+}
+
+/// `migrate status`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MigrateStatusRequest {
+    /// The database whose revisions table is read (never written).
+    pub target: String,
+    pub dir: PathBuf,
+    #[serde(default = "default_revisions_schema")]
+    pub revisions_schema: String,
+}
+
+pub type MigrateStatusResponse = MigrateStatus;
+
+/// `migrate set`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MigrateSetRequest {
+    pub target: String,
+    pub dir: PathBuf,
+    /// The exact version or file name the history ends at; `0` clears it.
+    pub version: String,
+    #[serde(default)]
+    pub options: SetOptions,
+}
+
+pub type MigrateSetResponse = MigrateSet;
+
 /// `config validate`. `Debug` shows the `vars` names only: their values may be secrets.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -436,6 +485,11 @@ pub enum ErrorCode {
     MigrationApplied,
     /// The editor of `migrate edit` could not be run or failed.
     Editor,
+    /// `migrate apply` onto a database without history that already holds objects, without
+    /// `--baseline` or `--allow-dirty`.
+    DirtyDatabase,
+    /// `migrate set` would drop or overwrite a complete migration's history without `force`.
+    NeedsForce,
 }
 
 impl ErrorCode {
@@ -483,6 +537,8 @@ impl ErrorCode {
             ErrorCode::MigrationAmbiguous => "migration_ambiguous",
             ErrorCode::MigrationApplied => "migration_applied",
             ErrorCode::Editor => "editor",
+            ErrorCode::DirtyDatabase => "dirty_database",
+            ErrorCode::NeedsForce => "needs_force",
         }
     }
 }
@@ -607,6 +663,8 @@ impl From<&Error> for ApiError {
             },
             Error::MigrationApplied { path, .. } => err(ErrorCode::MigrationApplied).at(path, None),
             Error::Editor { .. } => err(ErrorCode::Editor),
+            Error::DirtyDatabase { .. } => err(ErrorCode::DirtyDatabase),
+            Error::NeedsForce { .. } => err(ErrorCode::NeedsForce),
             Error::Checksum(c) => {
                 let code = match c {
                     ChecksumError::MissingSum { .. } => ErrorCode::SumMissing,
@@ -788,7 +846,9 @@ fn is_diagnostic(e: &Error) -> bool {
         | Error::MigrationStep { .. }
         | Error::MigrationRecord { .. }
         | Error::MigrationApplied { .. }
-        | Error::Editor { .. } => false,
+        | Error::Editor { .. }
+        | Error::DirtyDatabase { .. }
+        | Error::NeedsForce { .. } => false,
     }
 }
 
@@ -871,6 +931,22 @@ pub fn migrate_rm(req: &MigrateRmRequest) -> Result<MigrateRmResponse, ApiError>
 /// [`crate::migrate_rebase`].
 pub fn migrate_rebase(req: &MigrateRebaseRequest) -> Result<MigrateRebaseResponse, ApiError> {
     Ok(crate::migrate_rebase(&req.dir, &req.migrations, &req.guard)?)
+}
+
+/// [`crate::migrate_baseline`].
+pub fn migrate_baseline(req: &MigrateBaselineRequest) -> Result<MigrateBaselineResponse, ApiError> {
+    let new = crate::migrate_baseline(&req.dir, &req.name, &req.target, &req.options)?;
+    Ok(MigrateBaselineResponse { file: new.path, version: new.version })
+}
+
+/// [`crate::migrate_status`].
+pub fn migrate_status(req: &MigrateStatusRequest) -> Result<MigrateStatusResponse, ApiError> {
+    Ok(crate::migrate_status(&req.target, &req.dir, &req.revisions_schema)?)
+}
+
+/// [`crate::migrate_set`].
+pub fn migrate_set(req: &MigrateSetRequest) -> Result<MigrateSetResponse, ApiError> {
+    Ok(crate::migrate_set(&req.target, &req.dir, &req.version, &req.options)?)
 }
 
 /// [`crate::config::validate`]: problems with the file are diagnostics; an `Err` means it could
@@ -1081,6 +1157,8 @@ mod tests {
             MigrationAmbiguous,
             MigrationApplied,
             Editor,
+            DirtyDatabase,
+            NeedsForce,
         ] {
             assert_eq!(serde_json::to_string(&code).expect("serialize"), format!("\"{}\"", code.as_str()));
         }
@@ -1176,6 +1254,19 @@ mod tests {
         assert!(serde_json::from_str::<MigrateRmRequest>(r#"{"dir":"m","migration":"1","force":true}"#).is_err());
         assert!(serde_json::from_str::<MigrateRmRequest>(r#"{"dir":"m","migration":"1","guard":{"forced":true}}"#).is_err());
         assert!(serde_json::from_str::<MigrateLsRequest>(r#"{"dir":"m","url":"x"}"#).is_err());
+        let req: MigrateStatusRequest = serde_json::from_str(r#"{"target":"host=a","dir":"m"}"#).expect("request");
+        assert_eq!(req.revisions_schema, "pgmig");
+        let req: MigrateSetRequest =
+            serde_json::from_str(r#"{"target":"host=a","dir":"m","version":"2","options":{"force":true}}"#).expect("request");
+        assert_eq!(req.options, SetOptions { force: true, ..SetOptions::default() });
+        round_trip(&req);
+        assert!(serde_json::from_str::<MigrateSetRequest>(r#"{"target":"h","dir":"m","version":"2","force":true}"#).is_err());
+        let req: MigrateBaselineRequest = serde_json::from_str(r#"{"dir":"m","name":"base","target":"host=a"}"#).expect("request");
+        assert_eq!(req.options, Options::default());
+        round_trip(&req);
+        let req: MigrateApplyRequest =
+            serde_json::from_str(r#"{"target":"h","dir":"m","options":{"baseline":"1","allow_dirty":true}}"#).expect("request");
+        assert_eq!((req.options.baseline.as_deref(), req.options.allow_dirty), (Some("1"), true));
         let e = ApiError::from(&Error::Migrate(pgmig_migrate::Error::NotFound { dir: "m".into(), key: "9".into() }));
         assert_eq!(e.code, ErrorCode::MigrationNotFound);
         let e =

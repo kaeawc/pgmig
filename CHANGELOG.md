@@ -8,6 +8,12 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
 
 ### Added
 
+- Adopting existing databases: `pgmig migrate baseline <name>` writes the live schema as the first
+  migration; `migrate apply --baseline <version>` records files up to it as applied on a populated
+  database with no history (and runs everything on an empty one), and refuses other populated
+  databases unless `--allow-dirty`. `pgmig migrate status` shows the current version, pending files
+  and problems with recovery hints; `pgmig migrate set <version>` repairs the history (`--force` for
+  failed, partial or later complete rows).
 - `pgmig migrate ls`, `show`, `edit`, `rm` and `rebase`: list files (with applied status given
   `--url`), print, edit in `$VISUAL`/`$EDITOR`, remove, or move out-of-order files to the end with new
   versions after a merge, each keeping `pgmig.sum` valid. `rm` and `rebase` refuse applied files

@@ -17,6 +17,30 @@
 //! There is no approval prompt: the run applies what is pending. [`ApplyOptions::dry_run`]
 //! (`--dry-run`) reports what would run and changes nothing.
 //!
+//! # Existing databases
+//!
+//! A database without history (no revisions table, or an empty one) that already holds objects
+//! is refused ([`Error::DirtyDatabase`]): running every migration onto it would most likely fail
+//! half way, or worse, succeed on top of objects nobody meant to keep. Objects are relations
+//! (tables, views, materialized views, sequences, foreign tables, composite types), enums, domains,
+//! range types, functions and procedures in a user schema, except those an extension owns and those
+//! in the revisions schema; a schema that holds none of them, empty or not, does not count. Two ways
+//! out:
+//!
+//! - [`ApplyOptions::baseline`] (`--baseline <version>`): the database already is the directory up
+//!   to that version (typically a baseline file written by `migrate baseline`). Every file up to and
+//!   including it is recorded as applied, kind `baseline`, without running it, in one transaction;
+//!   the files after it are applied as usual. The version must name a file in every case. The
+//!   option only records anything on a database without history that holds objects:
+//!   - without history and without objects (a new database), it is ignored and every file runs,
+//!     the baseline file included ([`MigrateApplyReport::baseline_skipped`]);
+//!   - with history that has the version applied, it is ignored;
+//!   - with other history, it is refused (`migrate set` changes history).
+//!
+//!   So a deploy script can always pass it: the database it adopted is baselined once, and every
+//!   other database, new or already migrated, runs the files as usual.
+//! - [`ApplyOptions::allow_dirty`] (`--allow-dirty`): apply every file onto it anyway.
+//!
 //! # Commit points
 //!
 //! `-- pgmig:commit` on a line of its own between two statements is a commit point. `migrate diff`
@@ -60,7 +84,7 @@
 //! the two writes (the connection or the process dies, or the second write fails), the row still
 //! marks the statement in flight: pgmig cannot tell whether it took effect, so a re-run refuses to
 //! resume ([`Error::Resume`]) until someone checks the database and resolves the row (`pgmig migrate
-//! set`, once it exists). Each of these writes is a single transaction, so the row is never missing.
+//! set`; see [`crate::migrate_status`]). Each of these writes is a single transaction, so the row is never missing.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -158,6 +182,12 @@ pub struct ApplyOptions {
     pub dry_run: bool,
     /// The schema of the revisions table.
     pub revisions_schema: String,
+    /// On a database without history that holds objects, record the files up to and including
+    /// this version (exact version or file name) as applied without running them; ignored on an
+    /// empty database, which runs every file (see the module docs).
+    pub baseline: Option<String>,
+    /// Apply onto a database without history that already holds objects, instead of refusing.
+    pub allow_dirty: bool,
 }
 
 impl Default for ApplyOptions {
@@ -173,6 +203,8 @@ impl Default for ApplyOptions {
             limit: None,
             dry_run: false,
             revisions_schema: pgmig_migrate::revisions::DEFAULT_SCHEMA.to_owned(),
+            baseline: None,
+            allow_dirty: false,
         }
     }
 }
@@ -196,6 +228,8 @@ pub enum FileStatus {
     Pending,
     /// Older than the newest applied file and left out (`linear-skip`).
     Skipped,
+    /// Recorded as applied by this run without running it (`--baseline`); with `dry_run`, would be.
+    Baselined,
 }
 
 /// One migration file in a [`MigrateApplyReport`].
@@ -224,6 +258,9 @@ pub struct MigrateApplyReport {
     pub applied: usize,
     /// Statements run by this run.
     pub statements: usize,
+    /// `baseline` was given and ignored because the database has no history and holds no objects:
+    /// every file runs (or with `dry_run`, would run) instead.
+    pub baseline_skipped: bool,
 }
 
 /// What became of the work when a migration failed, serialized in snake_case.
@@ -415,7 +452,7 @@ fn commit_points(sql: &pgmig_sql::File) -> std::result::Result<Vec<(usize, pgmig
 }
 
 /// Take the session-level advisory lock `key`, polling until `timeout`.
-fn lock(conn: &mut Conn, name: &str, key: i64, timeout: Duration) -> Result<()> {
+pub(crate) fn lock(conn: &mut Conn, name: &str, key: i64, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
     let mut wait = Duration::from_millis(20);
     loop {
@@ -438,14 +475,39 @@ fn lock(conn: &mut Conn, name: &str, key: i64, timeout: Duration) -> Result<()> 
 
 /// The run, with the lock held.
 fn locked(conn: &mut Conn, dir: &MigrationDir, prepared: &[Prepared], opts: &ApplyOptions) -> Result<MigrateApplyReport> {
-    let table = if opts.dry_run { Table::open(conn, &opts.revisions_schema)? } else { Some(Table::ensure(conn, &opts.revisions_schema)?) };
-    let rows = match &table {
+    let prepared_of = |f: &pgmig_migrate::File| prepared.iter().find(|p| std::ptr::eq(p.file, f)).expect("every file is prepared");
+    let before = Table::open(conn, &opts.revisions_schema)?;
+    let history = match &before {
         Some(t) => t.read(conn)?,
+        None => Vec::new(),
+    };
+    let mut baselined: Vec<Revision> =
+        baseline_files(dir, &history, opts)?.into_iter().map(|f| baseline_revision(prepared_of(f))).collect();
+    let mut baseline_skipped = false;
+    // Without history: a baseline applies only to a database that holds objects; an empty one
+    // runs every file. Without a baseline, one that holds objects is refused unless allowed.
+    if history.is_empty() && !dir.files().is_empty() && (!baselined.is_empty() || !opts.allow_dirty) {
+        let objects = existing_objects(conn, &opts.revisions_schema)?;
+        if objects.is_empty() {
+            baseline_skipped = !baselined.is_empty();
+            baselined.clear();
+        } else if baselined.is_empty() {
+            return Err(Error::DirtyDatabase { count: objects.len(), objects: objects.into_iter().take(5).collect() });
+        }
+    }
+    let table = if opts.dry_run { before } else { Some(Table::ensure(conn, &opts.revisions_schema)?) };
+    let rows = match &table {
+        _ if opts.dry_run => history.into_iter().chain(baselined.iter().cloned()).collect(),
+        Some(t) => {
+            if !baselined.is_empty() {
+                record_baseline(conn, t, &baselined)?;
+            }
+            t.read(conn)?
+        }
         None => Vec::new(),
     };
     let table_name = table.as_ref().map_or_else(|| format!("{}.pgmig_revisions", opts.revisions_schema), Table::name);
     let status = history::pending(dir, &rows, opts.exec_order.into(), &table_name)?;
-    let prepared_of = |f: &pgmig_migrate::File| prepared.iter().find(|p| std::ptr::eq(p.file, f)).expect("every file is prepared");
     let limit = opts.limit.unwrap_or(usize::MAX);
     let mut jobs = Vec::new();
     let mut waiting = Vec::new();
@@ -482,7 +544,8 @@ fn locked(conn: &mut Conn, dir: &MigrationDir, prepared: &[Prepared], opts: &App
         execution_ms: 0,
     };
     for f in &status.applied {
-        reports.push(report_of(prepared_of(f), FileStatus::AlreadyApplied, None, 0, 0));
+        let now = baselined.iter().any(|r| r.version == f.version);
+        reports.push(report_of(prepared_of(f), if now { FileStatus::Baselined } else { FileStatus::AlreadyApplied }, None, 0, 0));
     }
     for f in &status.skipped {
         reports.push(report_of(prepared_of(f), FileStatus::Skipped, None, 0, 0));
@@ -497,7 +560,7 @@ fn locked(conn: &mut Conn, dir: &MigrationDir, prepared: &[Prepared], opts: &App
         reports.push(report_of(j.p, job_status, Some(j.mode), j.p.sql.statements.len().saturating_sub(start), start));
     }
 
-    let mut out = MigrateApplyReport { dry_run: opts.dry_run, files: reports, applied: 0, statements: 0 };
+    let mut out = MigrateApplyReport { dry_run: opts.dry_run, files: reports, applied: 0, statements: 0, baseline_skipped };
     if !opts.dry_run && !jobs.is_empty() {
         let table = table.expect("ensured");
         let ms = run(conn, &table, &jobs, opts)?;
@@ -512,6 +575,100 @@ fn locked(conn: &mut Conn, dir: &MigrationDir, prepared: &[Prepared], opts: &App
     Ok(out)
 }
 
+/// The files `--baseline` would record: on a database without history, every file up to and
+/// including the baseline version (the caller drops them when the database holds no objects); none
+/// when the option is not given, or when the database already has that version applied. A database
+/// with other history is refused.
+fn baseline_files<'a>(dir: &'a MigrationDir, history: &[Revision], opts: &ApplyOptions) -> Result<Vec<&'a pgmig_migrate::File>> {
+    let Some(key) = &opts.baseline else { return Ok(Vec::new()) };
+    let target = crate::exact_file(dir, key)?;
+    let same = |v: &str| pgmig_migrate::compare_versions(v, &target.version).is_eq();
+    if history.iter().any(|r| r.is_complete() && same(&r.version)) {
+        return Ok(Vec::new());
+    }
+    if !history.is_empty() {
+        return Err(Error::Options(format!(
+            "--baseline {key}: the database already has migration history without version {}; a baseline only applies to a database \
+             without history (see `pgmig migrate status`, and `pgmig migrate set` to change history)",
+            target.version
+        )));
+    }
+    Ok(dir.files().iter().filter(|f| pgmig_migrate::compare_versions(&f.version, &target.version).is_le()).collect())
+}
+
+/// The row of a file recorded by `--baseline`: complete, kind baseline, never run.
+fn baseline_revision(p: &Prepared) -> Revision {
+    let f = p.file;
+    let total = u32::try_from(p.sql.statements.len()).unwrap_or(u32::MAX);
+    let mut rev = Revision::start(&f.version, &f.description, Kind::Baseline, total, &f.hash());
+    rev.applied = total;
+    rev
+}
+
+/// Insert the baseline rows in one transaction.
+fn record_baseline(conn: &mut Conn, table: &Table, rows: &[Revision]) -> Result<()> {
+    conn.batch("BEGIN")?;
+    let res = rows.iter().try_for_each(|r| table.insert(conn, r)).map_err(Error::from).and_then(|()| Ok(conn.batch("COMMIT")?));
+    if res.is_err() {
+        let _ = conn.batch("ROLLBACK");
+    }
+    res
+}
+
+/// The objects a database without history already holds (see the module docs), as `table
+/// public.users`, sorted: every relation (table, view, materialized view, sequence, foreign table,
+/// composite type), enum, domain, range type, function and procedure in a user schema (the schemas
+/// inspection reads), except those an extension owns and those in the revisions schema. Indexes,
+/// constraints and triggers belong to a table and are left out. A schema holding none of these
+/// does not count, nor does an empty one.
+fn existing_objects(conn: &mut Conn, revisions_schema: &str) -> Result<Vec<String>> {
+    let user = format!(
+        "n.nspname NOT IN ('pg_catalog', 'information_schema') AND left(n.nspname, 3) <> 'pg_' AND n.nspname <> {}",
+        pgmig_model::quote_literal(revisions_schema)
+    );
+    let not_extension = |catalog: &str, alias: &str| {
+        format!(
+            "NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = '{catalog}'::regclass AND d.objid = {alias}.oid AND d.deptype = 'e')"
+        )
+    };
+    let queries = [
+        format!(
+            "SELECT c.relkind, n.nspname, c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.relkind IN ('r', 'p', 'v', 'm', 'S', 'f', 'c') AND {user} AND {}",
+            not_extension("pg_class", "c")
+        ),
+        format!(
+            "SELECT t.typtype, n.nspname, t.typname FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace \
+             WHERE t.typtype IN ('e', 'd', 'r') AND {user} AND {}",
+            not_extension("pg_type", "t")
+        ),
+        format!(
+            "SELECT p.prokind, n.nspname, p.proname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+             WHERE {user} AND {}",
+            not_extension("pg_proc", "p")
+        ),
+    ];
+    let mut objects = Vec::new();
+    for (i, sql) in queries.iter().enumerate() {
+        for row in conn.query(sql)? {
+            let col = |j: usize| row.get(j).cloned().flatten().unwrap_or_default();
+            let what = match (i, col(0).as_str()) {
+                (0, "v") => "view",
+                (0, "m") => "materialized view",
+                (0, "S") => "sequence",
+                (0, "f") => "foreign table",
+                (0, "c") | (1, _) => "type",
+                (0, _) => "table",
+                (_, "p") => "procedure",
+                _ => "function",
+            };
+            objects.push((col(1), col(2), what));
+        }
+    }
+    objects.sort();
+    Ok(objects.into_iter().map(|(s, n, what)| format!("{what} {}", pgmig_model::QualName::new(s, n))).collect())
+}
+
 /// An interrupted file resumes only when the statements it recorded are still its first ones.
 fn check_resume(p: &Prepared, r: &Revision) -> Result<()> {
     let applied = r.applied as usize;
@@ -520,7 +677,8 @@ fn check_resume(p: &Prepared, r: &Revision) -> Result<()> {
         let line = p.sql.statements.get(i).map_or_else(String::new, |s| format!(" (line {})", s.pos.line));
         return refuse(format!(
             "statement {}{line} was started without a transaction by a run that stopped before recording whether it finished; \
-             check whether it took effect, then resolve the row with `pgmig migrate set` (not available yet)",
+             check whether it took effect, finish the file by hand and record it with `pgmig migrate set <version>`, or undo what it \
+             applied and drop the row with `pgmig migrate set` and the version before it (see `pgmig migrate status`)",
             i + 1
         ));
     }

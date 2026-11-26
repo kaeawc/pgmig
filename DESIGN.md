@@ -284,6 +284,43 @@ it back). Otherwise `schema apply` against a migrated database would drop the ta
    pooler.
 4. Emit a structured report (`MIG-22`).
 
+### Existing databases, status and set
+
+`migrate baseline <name> --url <db>` adopts a database that predates pgmig: it writes `schema
+inspect` of it (the managed objects, schema-qualified, never the revisions schema) as the first
+file of an empty directory. It refuses a directory that already has files: a fresh database replays
+every file in order, so a file recreating the whole schema after them would fail.
+
+`migrate apply` refuses a database with no history (no revisions table, or an empty one) that
+already holds objects: a relation (table, view, materialized view, sequence, foreign table,
+composite type), enum, domain, range type, function or procedure in a user schema, not owned by an
+extension and not in the revisions schema. A schema without such objects, empty or not, does not
+count. Running every file onto it would fail half way, or succeed on top of objects nobody meant to
+keep. `--baseline <version>` (an exact version or file name, never a prefix, checked in every case)
+records every file up to and including it as applied, kind `baseline`, without running it, in one
+transaction, then applies the rest; it does so only on a database without history that holds
+objects. On a database without history and without objects it is ignored and every file runs, the
+baseline file included (the report's `baseline_skipped`); on one that has that version applied it is
+ignored; on one with other history it is refused. So a deploy can always pass it: new databases get
+the whole schema, the adopted one is baselined once. `--allow-dirty` applies every file anyway.
+
+`migrate status` only reads (no lock): the current version (newest complete row), each file's
+status, the pending files, the last error, and each problem `apply` would refuse or stop at (the
+directory not matching its sum file, an applied file edited or missing, a row edited by hand, an
+out-of-order file, a failure, a statement left in flight), each with how to recover. `--exit-code`
+exits 3 when the database is not up to date.
+
+`migrate set <version>` makes the history exactly the files up to and including that version,
+running nothing, in one transaction under the apply lock: files without a row get one (kind normal,
+every statement applied, the file's hash), rows that are not complete are recorded as complete,
+rows edited by hand are rewritten, and rows after the version or without a file are deleted.
+Recording a row that is not complete as complete (a failure, a file stopped part way, a statement
+left in flight: some statements may not have run), deleting a row that records a complete
+migration, and recording an applied file that was edited since, need `--force`; `0` clears the
+history. It is the recovery path for a statement left in
+flight: check whether it took effect, then finish the file by hand and `set --force` its version, or
+undo what it applied and `set` the version before it so `apply` runs the file again.
+
 ### Down migrations
 
 `migrate down` doesn't use hand-written down files. It inspects the database as it is now, replays

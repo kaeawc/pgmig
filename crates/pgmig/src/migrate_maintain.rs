@@ -31,6 +31,8 @@ pub enum RevisionStatus {
     Partial,
     /// Applied, but the file was edited after (its hash does not match the recorded one).
     Changed,
+    /// Its row was edited by hand (`migrate status` only: `migrate ls` refuses such a table).
+    Edited,
 }
 
 impl RevisionStatus {
@@ -40,6 +42,7 @@ impl RevisionStatus {
             RevisionStatus::Pending => "pending",
             RevisionStatus::Partial => "partial",
             RevisionStatus::Changed => "changed",
+            RevisionStatus::Edited => "edited",
         }
     }
 }
@@ -314,7 +317,9 @@ mod tests {
 
     #[test]
     fn statuses_print_as_their_names() {
-        for s in [RevisionStatus::Applied, RevisionStatus::Pending, RevisionStatus::Partial, RevisionStatus::Changed] {
+        for s in
+            [RevisionStatus::Applied, RevisionStatus::Pending, RevisionStatus::Partial, RevisionStatus::Changed, RevisionStatus::Edited]
+        {
             assert_eq!(serde_json::to_string(&s).expect("serialize"), format!("\"{}\"", s.as_str()));
         }
     }

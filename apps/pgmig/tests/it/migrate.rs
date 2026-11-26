@@ -368,3 +368,38 @@ fn rebase_moves_a_branch_file_after_the_others() {
     let out = pgmig(&["migrate", "rebase", &to, "--dir", &d.arg()]);
     assert!(stderr(&out).contains("nothing to move"), "{}", stderr(&out));
 }
+
+#[test]
+fn baseline_status_and_set() {
+    let db = TestDb::new();
+    db.connect().batch("CREATE TABLE legacy (id int PRIMARY KEY, name text)").expect("legacy");
+    let d = Dir::new(&[]);
+    let v = parse(&pgmig(&["migrate", "baseline", "base", "--url", &db.conninfo, "--dir", &d.arg(), "--format", "json"]));
+    let version = v["version"].as_str().expect("version").to_owned();
+    let file = std::fs::read_to_string(v["file"].as_str().expect("file")).expect("read");
+    assert!(file.contains("CREATE TABLE public.legacy"), "{file}");
+
+    // Refused without --baseline (exit 1, code dirty_database); then baselined.
+    let out = pgmig(&["migrate", "apply", "--url", &db.conninfo, "--dir", &d.arg(), "--format", "json"]);
+    assert_eq!((out.status.code(), parse(&out)["code"].as_str()), (Some(1), Some("dirty_database")));
+    let out = pgmig(&["migrate", "status", "--url", &db.conninfo, "--dir", &d.arg(), "--exit-code"]);
+    assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
+    assert!(stdout(&out).contains("no revisions table") && stdout(&out).contains("1 migration pending"), "{}", stdout(&out));
+    let out = pgmig(&["migrate", "apply", "--url", &db.conninfo, "--dir", &d.arg(), "--baseline", &version]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(stdout(&out).contains("(baseline: recorded as applied, not run)"), "{}", stdout(&out));
+    let out = pgmig(&["migrate", "status", "--url", &db.conninfo, "--dir", &d.arg(), "--exit-code"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    assert!(stdout(&out).contains(&format!("current version: {version}")), "{}", stdout(&out));
+    assert!(stdout(&out).contains(&format!("applied  {version}  base (baseline)")), "{}", stdout(&out));
+
+    // `set 0` needs --force; JSON names the target and the changes.
+    let out = pgmig(&["migrate", "set", "0", "--url", &db.conninfo, "--dir", &d.arg(), "--format", "json"]);
+    assert_eq!((out.status.code(), parse(&out)["code"].as_str()), (Some(1), Some("needs_force")));
+    let v = parse(&pgmig(&["migrate", "set", "0", "--force", "--dry-run", "--url", &db.conninfo, "--dir", &d.arg(), "--format", "json"]));
+    assert_eq!((v["dry_run"].as_bool(), v["changes"][0]["action"].as_str()), (Some(true), Some("delete")));
+    assert!(v["target"]["display"].is_string(), "{v}");
+    let v = parse(&pgmig(&["migrate", "status", "--url", &db.conninfo, "--dir", &d.arg(), "--format", "json"]));
+    assert_eq!((v["current"].as_str(), v["pending"].as_array().map(Vec::len)), (Some(version.as_str()), Some(0)));
+    assert_eq!(v["files"][0]["kind"], "baseline");
+}
