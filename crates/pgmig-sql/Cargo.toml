@@ -1,0 +1,21 @@
+[package]
+name = "pgmig-sql"
+description = "pgmig's SQL text handling: statement splitting with source positions and `-- pgmig:` directives. No I/O."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
+
+[lib]
+# Doctests compile and link one binary per example; unit tests cover the same ground far faster.
+doctest = false
+
+[dependencies]
+thiserror = { workspace = true }
+
+[lints]
+workspace = true
