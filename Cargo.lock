@@ -626,6 +626,7 @@ dependencies = [
  "pgmig-model",
  "pgmig-plan",
  "pgmig-shadow",
+ "pgmig-sql",
  "thiserror",
 ]
 
@@ -681,6 +682,13 @@ version = "0.1.0"
 dependencies = [
  "pgmem",
  "pgmig-conn",
+ "thiserror",
+]
+
+[[package]]
+name = "pgmig-sql"
+version = "0.1.0"
+dependencies = [
  "thiserror",
 ]
 
