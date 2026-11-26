@@ -9,6 +9,16 @@ Status: early. Only tables, columns and schemas are planned so far (milestone M0
 [docs/ROADMAP.md](docs/ROADMAP.md)). The design is in [DESIGN.md](DESIGN.md) and the full feature list in
 [docs/FEATURES.md](docs/FEATURES.md).
 
+## Install
+
+```bash
+cargo binstall pgmig-cli       # the `pgmig` binary, prebuilt (or: cargo install pgmig-cli)
+cargo add pgmig                # the library
+```
+
+Prebuilt binaries for Linux (glibc and static musl), macOS and Windows are attached to each
+[GitHub release](https://github.com/kaeawc/pgmig/releases).
+
 ## Try it
 
 ```bash

@@ -100,7 +100,7 @@ Rules:
   PostGIS, an unsupported statement), the user points `shadow` at a real Postgres DSN. Errors from
   pgmem for unsupported features say so and suggest this.
 - **Stable surface.** pgmig uses only pgmem's public `Server` API, never its executor internals.
-  The dependency is pinned to a git revision until pgmem is on crates.io (kaeawc/pgmem#162).
+  The dependency comes from crates.io.
 
 pgmem gaps that block pgmig features are tracked in [docs/ROADMAP.md](docs/ROADMAP.md#pgmem-dependencies).
 
@@ -333,12 +333,10 @@ All packages call the `pgmig` facade, whose inputs and outputs are serde types.
 
 ## Open questions
 
-1. **Release tooling.** cargo-dist was chosen at kickoff, but the earlier release-pipeline research in
-   rust-build recommends a hand-written workflow (native runners, SBOMs, attestations, a Homebrew
-   tap). The Go package's prebuilt static libraries and later the wheels and npm binaries also need a
-   home in the release. Decide before M5.
-2. **Publishing.** pgmig can't be published to crates.io while pgmem is a git dependency. Needs pgmem
-   crates on crates.io (pgmem issue) before pgmig's first crates.io release.
-3. **Lint configuration from code.** Whether `pgmig.toml` is enough or rule configuration also needs
+1. **Release tooling.** Releases use the same hand-written workflow as pgmem
+   (`.github/workflows/release.yml`: native runners, crates.io trusted publishing, binaries on the
+   GitHub release). The Go package's prebuilt static libraries and later the wheels and npm
+   binaries still need a place in it, as do SBOMs, attestations and a Homebrew tap. Decide before M5.
+2. **Lint configuration from code.** Whether `pgmig.toml` is enough or rule configuration also needs
    to be settable from the language packages at call time.
-4. **Oldest supported Postgres.** Proposed: 15, since 14 reaches end of community support in November 2026.
+3. **Oldest supported Postgres.** Proposed: 15, since 14 reaches end of community support in November 2026.

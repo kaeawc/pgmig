@@ -518,8 +518,9 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "pgmem"
-version = "0.1.0"
-source = "git+https://github.com/kaeawc/pgmem?rev=351ededb9aa02d95aad06c3d316d736bb2ca5c94#351ededb9aa02d95aad06c3d316d736bb2ca5c94"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "336d8994a92691274d45806c7bcc8b2dfb181e230c57e1b400bde0d8c13e96bf"
 dependencies = [
  "pgmem-exec",
  "pgmem-storage",
@@ -530,8 +531,9 @@ dependencies = [
 
 [[package]]
 name = "pgmem-catalog"
-version = "0.1.0"
-source = "git+https://github.com/kaeawc/pgmem?rev=351ededb9aa02d95aad06c3d316d736bb2ca5c94#351ededb9aa02d95aad06c3d316d736bb2ca5c94"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ee41723a52a52d6e3a4fe91e8a85f1e309cca48725c45e503d05104fb202197"
 dependencies = [
  "pgmem-ir",
  "pgmem-types",
@@ -539,8 +541,9 @@ dependencies = [
 
 [[package]]
 name = "pgmem-exec"
-version = "0.1.0"
-source = "git+https://github.com/kaeawc/pgmem?rev=351ededb9aa02d95aad06c3d316d736bb2ca5c94#351ededb9aa02d95aad06c3d316d736bb2ca5c94"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03b73e7de95e5e08ccea3cff6236eb159388cc546876b9e067329012b3ccb317"
 dependencies = [
  "blowfish",
  "getrandom",
@@ -559,13 +562,15 @@ dependencies = [
 
 [[package]]
 name = "pgmem-ir"
-version = "0.1.0"
-source = "git+https://github.com/kaeawc/pgmem?rev=351ededb9aa02d95aad06c3d316d736bb2ca5c94#351ededb9aa02d95aad06c3d316d736bb2ca5c94"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13d6424eb2759e966b0bdc3196d8612c37dfefd234e82c804d3df12e8420f70a"
 
 [[package]]
 name = "pgmem-parse"
-version = "0.1.0"
-source = "git+https://github.com/kaeawc/pgmem?rev=351ededb9aa02d95aad06c3d316d736bb2ca5c94#351ededb9aa02d95aad06c3d316d736bb2ca5c94"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15b7dc663663ea52e13ad68de5ccf52f0b1493def43f9d481fcb7a10e225bf22"
 dependencies = [
  "pgmem-ir",
  "pgmem-types",
@@ -574,8 +579,9 @@ dependencies = [
 
 [[package]]
 name = "pgmem-storage"
-version = "0.1.0"
-source = "git+https://github.com/kaeawc/pgmem?rev=351ededb9aa02d95aad06c3d316d736bb2ca5c94#351ededb9aa02d95aad06c3d316d736bb2ca5c94"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "183447420d3c2a67133aefe5749fd3efdb250a4c693a8be230094e3327ae8857"
 dependencies = [
  "pgmem-catalog",
  "pgmem-types",
@@ -583,8 +589,9 @@ dependencies = [
 
 [[package]]
 name = "pgmem-types"
-version = "0.1.0"
-source = "git+https://github.com/kaeawc/pgmem?rev=351ededb9aa02d95aad06c3d316d736bb2ca5c94#351ededb9aa02d95aad06c3d316d736bb2ca5c94"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ba1e7f074f7f6fb969dcbd5495b5d73685a6a1a6430a68ee97a885f01d08caa"
 dependencies = [
  "jiff",
  "num-bigint",
@@ -596,8 +603,9 @@ dependencies = [
 
 [[package]]
 name = "pgmem-wire"
-version = "0.1.0"
-source = "git+https://github.com/kaeawc/pgmem?rev=351ededb9aa02d95aad06c3d316d736bb2ca5c94#351ededb9aa02d95aad06c3d316d736bb2ca5c94"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03b825c7c55178e6975be8c7b3d1158e1a57c2b5cc5ac2ca7a7b88ee2dc9049d"
 dependencies = [
  "pgmem-exec",
  "pgmem-ir",
