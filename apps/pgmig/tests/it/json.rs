@@ -127,20 +127,25 @@ fn validate_prints_diagnostics() {
     let out = pgmig(&["schema", "validate", &bad.path(), "--shadow", &shadow, "--format", "json"]);
     assert_eq!(code(&out), Some(1));
     assert!(out.stderr.is_empty());
-    let expected = r#"{
+    // Postgres points at the type; pgmem reports no position (kaeawc/pgmem#166), so the statement
+    // start is used.
+    let col = if std::env::var("PGMIG_TEST_DSN").is_ok_and(|s| !s.is_empty()) { 20 } else { 1 };
+    let expected = format!(
+        r#"{{
   "diagnostics": [
-    {
+    {{
       "code": "load",
-      "message": "<FILE>:1:1: type \"nosuch\" does not exist (SQLSTATE 42704)",
+      "message": "<FILE>:1:{col}: type \"nosuch\" does not exist (SQLSTATE 42704)",
       "sqlstate": "42704",
       "file": "<FILE>",
       "line": 1,
-      "col": 1,
+      "col": {col},
       "apply": null
-    }
+    }}
   ]
-}
-"#;
+}}
+"#
+    );
     assert_eq!(stdout(&out, &bad), expected);
 }
 
