@@ -57,27 +57,43 @@
 //! no `using`; [`add_casts`] takes the answer from the caller, who asks a server, and fills it in.
 //! A type change that needs `USING` also drops the column's old default first and sets the new
 //! one after (Postgres would have to convert the default too, and refuses when it cannot).
+//!
+//! # Serialization
+//!
+//! [`Change`], [`CommentTarget`] and [`EnumPosition`] are adjacently tagged: `{"kind": "<variant
+//! in snake_case>", "data": <the variant's fields>}`, where `data` is an object for a variant with
+//! named fields, the value for a variant with one (a newtype), and absent for one with none (`{"kind": "end"}`). Models' parts serialize as `pgmig_model` documents.
 
 use std::collections::{BTreeMap, BTreeSet};
+
+use serde::{Deserialize, Serialize};
 
 use pgmig_model::{Column, Constraint, ConstraintKind, Enum, Identity, Model, OwnedBy, QualName, Sequence, Table, quote_ident};
 
 /// An object that can carry a comment. New kinds (constraints, indexes) add a variant here, a
 /// matching `Object` in the planner, and a comparison in [`diff`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum CommentTarget {
     Schema(String),
     Table(QualName),
-    Column(QualName, String),
+    Column {
+        table: QualName,
+        column: String,
+    },
     /// A type that is not a table's row type (an enum).
     Type(QualName),
     Sequence(QualName),
     /// A table constraint by its table and name.
-    Constraint(QualName, String),
+    Constraint {
+        table: QualName,
+        name: String,
+    },
 }
 
 /// Where [`Change::AddEnumValue`] puts the new value.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum EnumPosition {
     Before(String),
     After(String),
@@ -85,7 +101,8 @@ pub enum EnumPosition {
     End,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum Change {
     CreateSchema(String),
     DropSchema(String),
@@ -231,6 +248,137 @@ pub enum Change {
     },
 }
 
+/// Declares [`ChangeKind`] with one variant per [`Change`] variant, and its names.
+macro_rules! change_kinds {
+    ($($variant:ident => $name:literal,)*) => {
+        /// What kind of change a [`Change`] is: one kind per variant, named like the variant's
+        /// `kind` tag (snake_case). The names are stable: a diff policy lists them (`skip`).
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        pub enum ChangeKind {
+            $($variant,)*
+        }
+
+        impl ChangeKind {
+            /// Every kind, in the order of [`Change`]'s variants.
+            pub const ALL: &[ChangeKind] = &[$(ChangeKind::$variant,)*];
+
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    $(ChangeKind::$variant => $name,)*
+                }
+            }
+        }
+
+        impl Change {
+            pub fn kind(&self) -> ChangeKind {
+                match self {
+                    $(Change::$variant { .. } => ChangeKind::$variant,)*
+                }
+            }
+        }
+    };
+}
+
+change_kinds! {
+    CreateSchema => "create_schema",
+    DropSchema => "drop_schema",
+    CreateTable => "create_table",
+    DropTable => "drop_table",
+    AddColumn => "add_column",
+    DropColumn => "drop_column",
+    AlterColumnType => "alter_column_type",
+    SetNotNull => "set_not_null",
+    DropNotNull => "drop_not_null",
+    SetDefault => "set_default",
+    DropDefault => "drop_default",
+    AddIdentity => "add_identity",
+    AlterIdentity => "alter_identity",
+    DropIdentity => "drop_identity",
+    CreateSequence => "create_sequence",
+    DropSequence => "drop_sequence",
+    AlterSequence => "alter_sequence",
+    SetSequenceOwner => "set_sequence_owner",
+    CreateEnum => "create_enum",
+    DropEnum => "drop_enum",
+    AddEnumValue => "add_enum_value",
+    RenameEnumValue => "rename_enum_value",
+    UnsupportedEnumChange => "unsupported_enum_change",
+    AddConstraint => "add_constraint",
+    DropConstraint => "drop_constraint",
+    RenameConstraint => "rename_constraint",
+    AlterConstraint => "alter_constraint",
+    SetComment => "set_comment",
+}
+
+impl std::fmt::Display for ChangeKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A name that is not a [`ChangeKind`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownKind(pub String);
+
+impl std::fmt::Display for UnknownKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let names: Vec<&str> = ChangeKind::ALL.iter().map(|k| k.as_str()).collect();
+        write!(f, "unknown kind of change {:?} (expected one of {})", self.0, names.join(", "))
+    }
+}
+
+impl std::error::Error for UnknownKind {}
+
+impl std::str::FromStr for ChangeKind {
+    type Err = UnknownKind;
+
+    fn from_str(s: &str) -> Result<ChangeKind, UnknownKind> {
+        ChangeKind::ALL.iter().copied().find(|k| k.as_str() == s).ok_or_else(|| UnknownKind(s.to_owned()))
+    }
+}
+
+impl Change {
+    /// The object the change is about, as messages name it: `app` (a schema), `public.t` (a
+    /// table, sequence or type), `public.t.c` (a column, or a constraint by its name), and for a
+    /// comment its target's kind first (`column public.t.c`).
+    pub fn object(&self) -> String {
+        let col = |t: &QualName, c: &str| format!("{t}.{}", quote_ident(c));
+        match self {
+            Change::CreateSchema(s) | Change::DropSchema(s) => quote_ident(s),
+            Change::CreateTable(t) | Change::DropTable { table: t, .. } => t.name.to_string(),
+            Change::AddColumn { table, column } => col(table, &column.name),
+            Change::DropColumn { table, column, .. }
+            | Change::AlterColumnType { table, column, .. }
+            | Change::SetNotNull { table, column }
+            | Change::DropNotNull { table, column }
+            | Change::SetDefault { table, column, .. }
+            | Change::DropDefault { table, column, .. }
+            | Change::AddIdentity { table, column, .. }
+            | Change::AlterIdentity { table, column, .. }
+            | Change::DropIdentity { table, column, .. } => col(table, column),
+            Change::CreateSequence(s) | Change::DropSequence(s) => s.name.to_string(),
+            Change::AlterSequence { to, .. } => to.name.to_string(),
+            Change::SetSequenceOwner { name, .. } => name.to_string(),
+            Change::CreateEnum(e) | Change::DropEnum(e) => e.name.to_string(),
+            Change::AddEnumValue { name, .. } | Change::RenameEnumValue { name, .. } | Change::UnsupportedEnumChange { name, .. } => {
+                name.to_string()
+            }
+            Change::AddConstraint { table, constraint } | Change::DropConstraint { table, constraint } => col(table, &constraint.name),
+            Change::RenameConstraint { table, from, .. } => col(table, from),
+            Change::AlterConstraint { table, to } => col(table, &to.name),
+            Change::SetComment { target, .. } => match target {
+                CommentTarget::Schema(s) => format!("schema {}", quote_ident(s)),
+                CommentTarget::Table(t) => format!("table {t}"),
+                CommentTarget::Column { table, column } => format!("column {}", col(table, column)),
+                CommentTarget::Type(t) => format!("type {t}"),
+                CommentTarget::Sequence(s) => format!("sequence {s}"),
+                CommentTarget::Constraint { table, name } => format!("constraint {}", col(table, name)),
+            },
+        }
+    }
+}
+
 /// Fills in `using` on the [`Change::AlterColumnType`]s of `diff(a, b)` whose old type has no
 /// assignment cast to the new one. `assignable(from, to)` answers that for two printed type names
 /// (`from` is `a`'s, `to` is `b`'s); the caller asks a server, and answers `false` when it cannot
@@ -344,7 +492,12 @@ pub fn diff(a: &Model, b: &Model) -> Vec<Change> {
                 changes.push(Change::CreateTable(created));
                 set_comment(CommentTarget::Table(name.clone()), None, table.comment.as_ref(), &mut changes);
                 for col in &table.columns {
-                    set_comment(CommentTarget::Column(name.clone(), col.name.clone()), None, col.comment.as_ref(), &mut changes);
+                    set_comment(
+                        CommentTarget::Column { table: name.clone(), column: col.name.clone() },
+                        None,
+                        col.comment.as_ref(),
+                        &mut changes,
+                    );
                 }
             }
             Some(old) => diff_table(old, table, &|c| owned(name, Some(c)), &mut changes),
@@ -447,7 +600,7 @@ fn constraint_steps<'a>(a: &'a Table, b: &'a Table) -> Vec<Step<'a>> {
 /// Constraint changes: the constraints of new tables not created with them, and those of tables
 /// both models have (see the module doc).
 fn diff_constraints(a: &Model, b: &Model, changes: &mut Vec<Change>) {
-    let target = |t: &QualName, c: &Constraint| CommentTarget::Constraint(t.clone(), c.name.clone());
+    let target = |t: &QualName, c: &Constraint| CommentTarget::Constraint { table: t.clone(), name: c.name.clone() };
     let kept: Vec<(&Table, &Table)> = b.tables.values().filter_map(|t| Some((a.tables.get(&t.name)?, t))).collect();
     let steps: Vec<(&QualName, Vec<Step>)> = kept.iter().map(|(old, new)| (&new.name, constraint_steps(old, new))).collect();
     // Constraints of `a` that stop existing under their name: a foreign key using one must go too.
@@ -582,7 +735,7 @@ fn diff_table(a: &Table, b: &Table, owned: &dyn Fn(&str) -> Vec<QualName>, chang
     for col in &b.columns {
         let Some(old) = a.column(&col.name) else {
             changes.push(Change::AddColumn { table: table.clone(), column: col.clone() });
-            set_comment(CommentTarget::Column(table.clone(), col.name.clone()), None, col.comment.as_ref(), changes);
+            set_comment(CommentTarget::Column { table: table.clone(), column: col.name.clone() }, None, col.comment.as_ref(), changes);
             continue;
         };
         let column = || col.name.clone();
@@ -633,7 +786,7 @@ fn diff_table(a: &Table, b: &Table, owned: &dyn Fn(&str) -> Vec<QualName>, chang
             }),
             _ => {}
         }
-        set_comment(CommentTarget::Column(table.clone(), column()), old.comment.as_ref(), col.comment.as_ref(), changes);
+        set_comment(CommentTarget::Column { table: table.clone(), column: column() }, old.comment.as_ref(), col.comment.as_ref(), changes);
         match (old.not_null, col.not_null) {
             (false, true) => changes.push(Change::SetNotNull { table: table.clone(), column: column() }),
             (true, false) => changes.push(Change::DropNotNull { table: table.clone(), column: column() }),
@@ -654,6 +807,31 @@ fn diff_table(a: &Table, b: &Table, owned: &dyn Fn(&str) -> Vec<QualName>, chang
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Kind names are part of pgmig's interface (`skip`): they are the changes' `kind` tags.
+    #[test]
+    fn kinds_are_named_like_the_changes_tags() {
+        for kind in ChangeKind::ALL {
+            assert_eq!(serde_json::to_string(kind).expect("serialize"), format!("\"{kind}\""));
+            assert_eq!(kind.as_str().parse::<ChangeKind>(), Ok(*kind));
+        }
+        let changes = [
+            Change::DropSchema("app".into()),
+            Change::DropNotNull { table: QualName::new("public", "t"), column: "c".into() },
+            Change::SetComment { target: CommentTarget::Schema("app".into()), comment: None },
+        ];
+        for c in &changes {
+            let json = serde_json::to_value(c).expect("serialize");
+            assert_eq!(json["kind"], c.kind().as_str());
+        }
+        assert_eq!(changes[1].object(), "public.t.c");
+        assert_eq!(changes[2].object(), "schema app");
+        let err = "drop_tables".parse::<ChangeKind>().expect_err("unknown");
+        assert!(
+            err.to_string().starts_with("unknown kind of change \"drop_tables\" (expected one of create_schema, drop_schema,"),
+            "{err}"
+        );
+    }
 
     fn col(name: &str, type_name: &str) -> Column {
         Column {
@@ -772,7 +950,7 @@ mod tests {
 
     fn targets() -> [CommentTarget; 3] {
         let t = QualName::new("public", "t");
-        [CommentTarget::Schema("app".into()), CommentTarget::Table(t.clone()), CommentTarget::Column(t, "id".into())]
+        [CommentTarget::Schema("app".into()), CommentTarget::Table(t.clone()), CommentTarget::Column { table: t, column: "id".into() }]
     }
 
     #[test]
@@ -809,7 +987,10 @@ mod tests {
         let t = QualName::new("public", "t");
         assert_eq!(
             diff(&a, &b),
-            vec![Change::AddColumn { table: t.clone(), column: n }, set(CommentTarget::Column(t, "note".into()), Some("hi"))]
+            vec![
+                Change::AddColumn { table: t.clone(), column: n },
+                set(CommentTarget::Column { table: t, column: "note".into() }, Some("hi"))
+            ]
         );
     }
 
@@ -1115,7 +1296,7 @@ mod tests {
             diff(&a, &b),
             vec![
                 Change::RenameConstraint { table: t("t"), from: "old".into(), to: renamed },
-                set(CommentTarget::Constraint(t("t"), "new".into()), Some("c")),
+                set(CommentTarget::Constraint { table: t("t"), name: "new".into() }, Some("c")),
             ]
         );
         // A different definition, or more than one name changing, is a drop and an add.
@@ -1145,7 +1326,7 @@ mod tests {
             vec![
                 Change::DropConstraint { table: t("t"), constraint: old },
                 Change::AddConstraint { table: t("t"), constraint: new },
-                set(CommentTarget::Constraint(t("t"), "c".into()), Some("same")),
+                set(CommentTarget::Constraint { table: t("t"), name: "c".into() }, Some("same")),
             ]
         );
     }
@@ -1227,7 +1408,7 @@ mod tests {
             [
                 Change::AddConstraint { table: t("t"), constraint: unvalidated },
                 Change::AddConstraint { table: t("t"), constraint: f },
-                set(CommentTarget::Constraint(t("t"), "t_id_fkey".into()), Some("self")),
+                set(CommentTarget::Constraint { table: t("t"), name: "t_id_fkey".into() }, Some("self")),
             ]
         );
     }
@@ -1272,7 +1453,166 @@ mod tests {
             tables(&[("t", vec![c])])
         };
         assert!(diff(&with(None), &with(None)).is_empty());
-        assert_eq!(diff(&with(Some("a")), &with(None)), vec![set(CommentTarget::Constraint(t("t"), "c".into()), None)]);
-        assert_eq!(diff(&with(None), &with(Some("b"))), vec![set(CommentTarget::Constraint(t("t"), "c".into()), Some("b"))]);
+        assert_eq!(diff(&with(Some("a")), &with(None)), vec![set(CommentTarget::Constraint { table: t("t"), name: "c".into() }, None)]);
+        assert_eq!(
+            diff(&with(None), &with(Some("b"))),
+            vec![set(CommentTarget::Constraint { table: t("t"), name: "c".into() }, Some("b"))]
+        );
+    }
+
+    /// One change of every variant; [`variant`] fails to compile when a variant is added.
+    fn every_change() -> Vec<Change> {
+        use pgmig_model::{Generated, SequenceOptions};
+        let t = QualName::new("public", "t");
+        let s = QualName::new("public", "s");
+        let e = QualName::new("public", "e");
+        let ints = SequenceOptions::defaults("integer", 1).expect("integer");
+        let identity = Identity { generated: Generated::Always, options: ints, sequence: Some(QualName::new("public", "t_id_seq")) };
+        let constraint = Constraint {
+            name: "t_pkey".into(),
+            kind: ConstraintKind::PrimaryKey,
+            definition: "PRIMARY KEY (id)".into(),
+            deferrable: false,
+            deferred: false,
+            validated: true,
+            columns: vec!["id".into()],
+            references: None,
+            comment: None,
+        };
+        let table = Table {
+            name: t.clone(),
+            columns: vec![col("id", "integer")],
+            comment: Some("t".into()),
+            constraints: vec![constraint.clone()],
+        };
+        let owned = OwnedBy { table: t.clone(), column: "id".into() };
+        let sequence =
+            Sequence { name: s.clone(), data_type: "bigint".into(), options: ints, owned_by: Some(owned.clone()), comment: None };
+        let enum_ = Enum { name: e.clone(), labels: vec!["a".into()], comment: None };
+        let id = || "id".to_owned();
+        vec![
+            Change::CreateSchema("app".into()),
+            Change::DropSchema("old".into()),
+            Change::CreateTable(table.clone()),
+            Change::DropTable { table, owned_sequences: vec![s.clone()] },
+            Change::AddColumn { table: t.clone(), column: col("n", "text") },
+            Change::DropColumn {
+                table: t.clone(),
+                column: id(),
+                type_ref: Some(e.clone()),
+                sequences: vec![s.clone()],
+                owned_sequences: vec![],
+            },
+            Change::AlterColumnType {
+                table: t.clone(),
+                column: id(),
+                type_name: "bigint".into(),
+                type_ref: None,
+                old_type_ref: Some(e.clone()),
+                using: Some("id::bigint".into()),
+            },
+            Change::SetNotNull { table: t.clone(), column: id() },
+            Change::DropNotNull { table: t.clone(), column: id() },
+            Change::SetDefault { table: t.clone(), column: id(), default: "0".into(), sequences: vec![], old_sequences: vec![s.clone()] },
+            Change::DropDefault { table: t.clone(), column: id(), sequences: vec![s.clone()] },
+            Change::AddIdentity { table: t.clone(), column: id(), type_name: "integer".into(), identity: identity.clone() },
+            Change::AlterIdentity {
+                table: t.clone(),
+                column: id(),
+                type_name: "bigint".into(),
+                from: identity.clone(),
+                to: Identity { generated: Generated::ByDefault, ..identity },
+                type_changed: true,
+            },
+            Change::DropIdentity { table: t.clone(), column: id(), sequence: s.clone() },
+            Change::CreateSequence(sequence.clone()),
+            Change::DropSequence(sequence.clone()),
+            Change::AlterSequence { from: sequence.clone(), to: Sequence { data_type: "integer".into(), ..sequence } },
+            Change::SetSequenceOwner { name: s.clone(), owned_by: None, old: Some(owned) },
+            Change::CreateEnum(enum_.clone()),
+            Change::DropEnum(enum_),
+            Change::AddEnumValue { name: e.clone(), value: "b".into(), position: EnumPosition::After("a".into()) },
+            Change::AddEnumValue { name: e.clone(), value: "0".into(), position: EnumPosition::Before("a".into()) },
+            Change::AddEnumValue { name: e.clone(), value: "z".into(), position: EnumPosition::End },
+            Change::RenameEnumValue { name: e.clone(), from: "a".into(), to: "b".into() },
+            Change::UnsupportedEnumChange { name: e.clone(), from: vec!["a".into(), "b".into()], to: vec!["b".into(), "a".into()] },
+            Change::AddConstraint { table: t.clone(), constraint: constraint.clone() },
+            Change::DropConstraint { table: t.clone(), constraint: constraint.clone() },
+            Change::RenameConstraint { table: t.clone(), from: "old".into(), to: constraint.clone() },
+            Change::AlterConstraint { table: t.clone(), to: constraint },
+            Change::SetComment { target: CommentTarget::Schema("app".into()), comment: Some("x".into()) },
+            Change::SetComment { target: CommentTarget::Table(t.clone()), comment: None },
+            Change::SetComment { target: CommentTarget::Column { table: t.clone(), column: id() }, comment: Some("c".into()) },
+            Change::SetComment { target: CommentTarget::Type(e), comment: None },
+            Change::SetComment { target: CommentTarget::Sequence(s), comment: None },
+            Change::SetComment { target: CommentTarget::Constraint { table: t, name: "t_pkey".into() }, comment: None },
+        ]
+    }
+
+    /// The variant's index in the declaration, by an exhaustive match.
+    fn variant(c: &Change) -> usize {
+        match c {
+            Change::CreateSchema(_) => 0,
+            Change::DropSchema(_) => 1,
+            Change::CreateTable(_) => 2,
+            Change::DropTable { .. } => 3,
+            Change::AddColumn { .. } => 4,
+            Change::DropColumn { .. } => 5,
+            Change::AlterColumnType { .. } => 6,
+            Change::SetNotNull { .. } => 7,
+            Change::DropNotNull { .. } => 8,
+            Change::SetDefault { .. } => 9,
+            Change::DropDefault { .. } => 10,
+            Change::AddIdentity { .. } => 11,
+            Change::AlterIdentity { .. } => 12,
+            Change::DropIdentity { .. } => 13,
+            Change::CreateSequence(_) => 14,
+            Change::DropSequence(_) => 15,
+            Change::AlterSequence { .. } => 16,
+            Change::SetSequenceOwner { .. } => 17,
+            Change::CreateEnum(_) => 18,
+            Change::DropEnum(_) => 19,
+            Change::AddEnumValue { .. } => 20,
+            Change::RenameEnumValue { .. } => 21,
+            Change::UnsupportedEnumChange { .. } => 22,
+            Change::AddConstraint { .. } => 23,
+            Change::DropConstraint { .. } => 24,
+            Change::RenameConstraint { .. } => 25,
+            Change::AlterConstraint { .. } => 26,
+            Change::SetComment { .. } => 27,
+        }
+    }
+
+    #[test]
+    fn every_change_round_trips_through_json() {
+        let changes = every_change();
+        let covered: BTreeSet<usize> = changes.iter().map(variant).collect();
+        assert_eq!(covered, (0..28).collect(), "a sample for every variant");
+        for c in &changes {
+            let json = serde_json::to_string(c).expect("serialize");
+            let back: Change = serde_json::from_str(&json).expect(&json);
+            assert_eq!(&back, c, "{json}");
+            assert_eq!(serde_json::to_string(&back).expect("serialize"), json);
+        }
+    }
+
+    /// The JSON of a change is part of pgmig's interface: a change here must be deliberate.
+    #[test]
+    fn change_json_is_pinned() {
+        let t = QualName::new("public", "t");
+        let json = |c: &Change| serde_json::to_string(c).expect("serialize");
+        assert_eq!(json(&Change::CreateSchema("app".into())), r#"{"kind":"create_schema","data":"app"}"#);
+        assert_eq!(
+            json(&Change::SetNotNull { table: t.clone(), column: "id".into() }),
+            r#"{"kind":"set_not_null","data":{"table":{"schema":"public","name":"t"},"column":"id"}}"#
+        );
+        assert_eq!(
+            json(&Change::AddEnumValue { name: t.clone(), value: "b".into(), position: EnumPosition::End }),
+            r#"{"kind":"add_enum_value","data":{"name":{"schema":"public","name":"t"},"value":"b","position":{"kind":"end"}}}"#
+        );
+        assert_eq!(
+            json(&Change::SetComment { target: CommentTarget::Column { table: t, column: "id".into() }, comment: None }),
+            r#"{"kind":"set_comment","data":{"target":{"kind":"column","data":{"table":{"schema":"public","name":"t"},"column":"id"}},"comment":null}}"#
+        );
     }
 }

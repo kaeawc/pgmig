@@ -1,11 +1,23 @@
 // One integration-test binary for the crate: one module per area.
+mod api;
 mod apply;
 mod casts;
+mod clean;
 mod corpus;
 mod filters;
+mod fingerprint;
 mod import;
 mod inspect;
 mod load;
+mod migrate;
+mod migrate_apply;
+mod migrate_diff;
+mod migrate_maintain;
+mod migrate_resume;
+mod migrate_status;
+mod policy;
 mod quoting;
+mod revisions;
+mod search_path;
 mod support;
 mod validate;

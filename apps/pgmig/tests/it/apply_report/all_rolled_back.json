@@ -1,0 +1,79 @@
+{
+  "code": "migration",
+  "message": "<dir>/2_bad.sql:3:{COL}: type \"nosuchtype\" does not exist (SQLSTATE 42704)\nthe run's transaction was rolled back: nothing was applied",
+  "sqlstate": "42704",
+  "file": "<dir>/2_bad.sql",
+  "line": 3,
+  "col": {COL},
+  "apply": null,
+  "migration": {
+    "statement_index": 1,
+    "statement": "CREATE TABLE broken (id nosuchtype)",
+    "applied_files": 0,
+    "outcome": "all_rolled_back",
+    "report": {
+      "dry_run": false,
+      "pending": [
+        "1_users.sql",
+        "2_bad.sql",
+        "3_orders.sql"
+      ],
+      "files": [
+        {
+          "file": "1_users.sql",
+          "version": "1",
+          "status": "rolled_back",
+          "tx_mode": "all",
+          "statements": 2,
+          "resumed_after": 0,
+          "execution_ms": 0,
+          "statement_timings": [
+            {
+              "index": 0,
+              "line": 1,
+              "hash": "ksWyz5NVy1ftXWkoQWmWKN2meRoAt+45nUN3MDu6l80=",
+              "execution_ms": 0
+            },
+            {
+              "index": 1,
+              "line": 2,
+              "hash": "2cuI1a0FxSophImVLIAp/uUp7fKDrDOudqrAbBhITTQ=",
+              "execution_ms": 0
+            }
+          ]
+        },
+        {
+          "file": "2_bad.sql",
+          "version": "2",
+          "status": "failed",
+          "tx_mode": "all",
+          "statements": 3,
+          "resumed_after": 0,
+          "execution_ms": 0,
+          "statement_timings": [
+            {
+              "index": 0,
+              "line": 1,
+              "hash": "ZDbIo/Pbo56s/YkXokzNAtTwBaQif/r7FH4GlNVrqIc=",
+              "execution_ms": 0
+            }
+          ]
+        },
+        {
+          "file": "3_orders.sql",
+          "version": "3",
+          "status": "pending",
+          "tx_mode": "all",
+          "statements": 1,
+          "resumed_after": 0,
+          "execution_ms": 0,
+          "statement_timings": []
+        }
+      ],
+      "applied": 0,
+      "statements": 3,
+      "execution_ms": 0,
+      "baseline_skipped": false
+    }
+  }
+}

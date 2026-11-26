@@ -44,7 +44,7 @@ fn read_opt(p: &Path) -> String {
     fs::read_to_string(p).unwrap_or_default()
 }
 
-fn run_case(dir: &Path) -> Result<(), String> {
+fn run_case(name: &str, dir: &Path, known: &BTreeSet<String>) -> Result<(), String> {
     let target = TestDb::new();
     let mut conn = target.connect();
     let from = read_opt(&dir.join("from.sql"));
@@ -60,7 +60,11 @@ fn run_case(dir: &Path) -> Result<(), String> {
     let planned = plan(&diff_with_casts(&a, &b, sh.conn())).map_err(|e| format!("planning: {e}"))?;
     let sql = planned.to_sql();
     let plan_file = dir.join("plan.sql");
-    if std::env::var_os("PGMIG_BLESS").is_some() {
+    let write = bless() && should_write_plan(postgres_dsn().is_some(), name, known);
+    if bless() && !write {
+        println!("bless: skipped {name} (known pgmem failure; its plan.sql is hand-written from Postgres)");
+    }
+    if write {
         fs::write(&plan_file, &sql).map_err(|e| format!("writing plan.sql: {e}"))?;
     } else {
         let expected = read_opt(&plan_file);
@@ -84,6 +88,16 @@ fn run_case(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn bless() -> bool {
+    std::env::var_os("PGMIG_BLESS").is_some()
+}
+
+/// Blessing on pgmem must not overwrite the hand-written plans of known pgmem failures; on real
+/// Postgres every case is rewritten.
+fn should_write_plan(on_postgres: bool, case: &str, known: &BTreeSet<String>) -> bool {
+    on_postgres || !known.contains(case)
+}
+
 fn known_failures() -> BTreeSet<String> {
     read_opt(&root().join("pgmem_known_failures.txt"))
         .lines()
@@ -97,10 +111,11 @@ fn corpus() {
     let cases = cases();
     assert!(!cases.is_empty(), "no corpus cases under {}", root().display());
 
+    let known = known_failures();
     let mut failed = BTreeSet::new();
     let mut report = String::new();
     for (name, dir) in &cases {
-        if let Err(e) = run_case(dir) {
+        if let Err(e) = run_case(name, dir, &known) {
             report.push_str(&format!("\n== {name} ({})\n{e}\n", backend_name()));
             failed.insert(name.clone());
         }
@@ -110,11 +125,23 @@ fn corpus() {
         assert!(failed.is_empty(), "corpus cases fail on Postgres:{report}");
         return;
     }
-    let known = known_failures();
     let new: Vec<_> = failed.difference(&known).collect();
     let fixed: Vec<_> = known.difference(&failed).collect();
     assert!(
         new.is_empty() && fixed.is_empty(),
         "corpus/pgmem_known_failures.txt is out of date.\nnewly failing: {new:?}\nnow passing (remove them): {fixed:?}{report}"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bless_skips_known_failures_only_on_pgmem() {
+        let known: BTreeSet<String> = ["a/b".to_owned()].into();
+        assert!(!should_write_plan(false, "a/b", &known));
+        assert!(should_write_plan(false, "a/c", &known));
+        assert!(should_write_plan(true, "a/b", &known));
+    }
 }

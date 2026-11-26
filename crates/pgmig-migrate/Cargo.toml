@@ -1,0 +1,25 @@
+[package]
+name = "pgmig-migrate"
+description = "pgmig's migration directory: file naming and order, the chained sum file, and the revisions table."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
+
+[lib]
+# Doctests compile and link one binary per example; unit tests cover the same ground far faster.
+doctest = false
+
+[dependencies]
+base64 = { workspace = true }
+pgmig-conn = { workspace = true }
+pgmig-model = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

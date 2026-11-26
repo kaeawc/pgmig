@@ -16,13 +16,16 @@ exclude = ["tests/"]
 doctest = false
 
 [dependencies]
+pgmig-config = { workspace = true }
 pgmig-conn = { workspace = true }
 pgmig-diff = { workspace = true }
 pgmig-inspect = { workspace = true }
+pgmig-migrate = { workspace = true }
 pgmig-model = { workspace = true }
 pgmig-plan = { workspace = true }
 pgmig-shadow = { workspace = true }
 pgmig-sql = { workspace = true }
+serde = { workspace = true }
 thiserror = { workspace = true }
 
 [lints]
@@ -30,3 +33,4 @@ workspace = true
 
 [dev-dependencies]
 pgmem = { workspace = true }
+serde_json = { workspace = true }

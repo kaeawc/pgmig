@@ -2,7 +2,7 @@ ALTER TABLE public.t ALTER COLUMN id DROP DEFAULT;
 ALTER TABLE public.u ALTER COLUMN id DROP DEFAULT;
 ALTER TABLE public.v ALTER COLUMN id DROP IDENTITY;
 CREATE SEQUENCE public.v_id_seq AS integer;
-ALTER TABLE public.v ALTER COLUMN id SET DEFAULT nextval('v_id_seq'::regclass);
+ALTER TABLE public.v ALTER COLUMN id SET DEFAULT nextval('public.v_id_seq'::regclass);
 ALTER SEQUENCE public.v_id_seq OWNED BY public.v.id;
 DROP SEQUENCE public.t_id_seq;
 ALTER TABLE public.t ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY;

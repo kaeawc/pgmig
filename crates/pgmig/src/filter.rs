@@ -21,8 +21,14 @@
 //! assumes the object exists. A constraint on an excluded column goes with the column, and so does
 //! a sequence `OWNED BY` it (a `serial`'s): owned sequences are managed exactly when their column
 //! is, whatever patterns name the sequence itself.
+//!
+//! A [`Filter`] serializes as `{"include": [...], "exclude": [...]}`, each pattern as the string it
+//! was parsed from (in its canonical spelling, [`Pattern`]'s `Display`).
+
+use std::fmt;
 
 use pgmig_model::{Model, QualName};
+use serde::{Deserialize, Serialize};
 
 /// A pattern that is not `[kind:]glob` with one to three non-empty parts.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -41,8 +47,9 @@ pub enum Kind {
     Sequence,
 }
 
-/// One `--include` or `--exclude` pattern.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One `--include` or `--exclude` pattern. Serialized as its string.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub struct Pattern {
     pub kind: Option<Kind>,
     /// One to three globs: schema, object, column.
@@ -91,6 +98,33 @@ impl Pattern {
     }
 }
 
+impl fmt::Display for Pattern {
+    /// The pattern as [`Pattern::parse`] reads it.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self.kind {
+            None => "",
+            Some(Kind::Schema) => "schema:",
+            Some(Kind::Table) => "table:",
+            Some(Kind::Enum) => "enum:",
+            Some(Kind::Sequence) => "sequence:",
+        };
+        write!(f, "{kind}{}", self.parts.join("."))
+    }
+}
+
+impl TryFrom<String> for Pattern {
+    type Error = PatternError;
+    fn try_from(s: String) -> Result<Pattern, PatternError> {
+        Pattern::parse(&s)
+    }
+}
+
+impl From<Pattern> for String {
+    fn from(p: Pattern) -> String {
+        p.to_string()
+    }
+}
+
 /// An object as patterns see it: its names from the schema down, and the kind of its second level
 /// (a column's is its table's).
 struct Path<'a> {
@@ -99,7 +133,8 @@ struct Path<'a> {
 }
 
 /// `--include` and `--exclude` patterns; the default manages everything.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Filter {
     pub include: Vec<Pattern>,
     pub exclude: Vec<Pattern>,
@@ -163,6 +198,16 @@ pub fn filter_model(model: &Model, filter: &Filter) -> Model {
     m
 }
 
+/// `model` without schema `schema` and everything in it (an exact name, not a pattern).
+pub fn without_schema(model: &Model, schema: &str) -> Model {
+    let mut m = model.clone();
+    m.schemas.remove(schema);
+    m.tables.retain(|n, _| n.schema != schema);
+    m.enums.retain(|n, _| n.schema != schema);
+    m.sequences.retain(|n, _| n.schema != schema);
+    m
+}
+
 /// `model` reduced to the objects in `schema`, without the schema itself: what pgmig manages when
 /// scoped to one schema.
 pub fn scope_model(model: &Model, schema: &str) -> Model {
@@ -203,6 +248,17 @@ pub fn glob(pattern: &str, name: &str) -> bool {
 mod tests {
     use super::*;
     use pgmig_model::{Column, Constraint, ConstraintKind, Enum, Schema, Table};
+
+    #[test]
+    fn filters_serialize_as_pattern_strings() {
+        let f = Filter::parse(&["app", "table:public.t*.a?", "enum:x.e", "sequence:x.s", "schema:s"], &["public.tmp_*"]).expect("patterns");
+        let json = serde_json::to_string(&f).expect("serialize");
+        assert_eq!(json, r#"{"include":["app","table:public.t*.a?","enum:x.e","sequence:x.s","schema:s"],"exclude":["public.tmp_*"]}"#);
+        assert_eq!(serde_json::from_str::<Filter>(&json).expect("deserialize"), f);
+        assert_eq!(serde_json::from_str::<Filter>("{}").expect("defaults"), Filter::default());
+        let err = serde_json::from_str::<Filter>(r#"{"include":["view:public.v"]}"#).expect_err("bad pattern");
+        assert!(err.to_string().contains("invalid filter pattern \"view:public.v\""), "{err}");
+    }
 
     #[test]
     fn globs_match_star_and_question_mark() {

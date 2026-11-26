@@ -36,7 +36,7 @@ fn shadow_spec() -> (ShadowSpec, Option<TestDb>) {
 }
 
 fn excluding(patterns: &[&str]) -> Options {
-    Options { filter: Filter::parse::<&str, _>(&[], patterns).expect("patterns"), schema: None }
+    Options { filter: Filter::parse::<&str, _>(&[], patterns).expect("patterns"), schema: None, ..Options::default() }
 }
 
 fn diff(from: &str, to: &str, opts: &Options) -> Vec<String> {
@@ -52,7 +52,8 @@ fn excluded_tables_are_hidden_from_both_sides() {
     assert_eq!(diff(from, to, &Options::default()).len(), 2, "unfiltered, tmp_b is created and tmp_a dropped");
     assert!(diff(from, to, &excluding(&["public.tmp_*"])).is_empty());
     // Includes: only `users` is managed, so the tmp tables are left alone too.
-    let only_users = Options { filter: Filter::parse(&["table:public.users"], &[] as &[&str]).expect("patterns"), schema: None };
+    let only_users =
+        Options { filter: Filter::parse(&["table:public.users"], &[] as &[&str]).expect("patterns"), schema: None, ..Options::default() };
     assert!(diff(from, to, &only_users).is_empty());
 }
 
@@ -83,7 +84,7 @@ fn a_foreign_key_to_an_excluded_table_plans_and_applies() {
         plan.statements,
         [
             "CREATE TABLE public.c (\n    pid integer\n)",
-            "ALTER TABLE public.c ADD CONSTRAINT c_pid_fkey FOREIGN KEY (pid) REFERENCES p(id)"
+            "ALTER TABLE public.c ADD CONSTRAINT c_pid_fkey FOREIGN KEY (pid) REFERENCES public.p(id)"
         ]
     );
     pgmig::apply(&target.conninfo, &plan).expect("apply");
@@ -100,11 +101,12 @@ fn schema_mode_manages_one_schema_with_unqualified_names() {
     let (spec, _db) = shadow_spec();
     let public = Options { schema: Some("public".into()), ..Options::default() };
     let out = pgmig::schema_inspect(&sql.source(), &spec, &public).expect("inspect").to_sql();
+    // Names pgmig prints lose the schema; text the server prints (types, defaults) keeps it.
     assert_eq!(
         out,
         "CREATE TYPE mood AS ENUM ('a');\n\
          CREATE SEQUENCE t_id_seq AS integer;\n\
-         CREATE TABLE t (\n    id integer DEFAULT nextval('t_id_seq'::regclass) NOT NULL,\n    m mood,\n    CONSTRAINT t_pkey PRIMARY KEY (id)\n);\n\
+         CREATE TABLE t (\n    id integer DEFAULT nextval('public.t_id_seq'::regclass) NOT NULL,\n    m public.mood,\n    CONSTRAINT t_pkey PRIMARY KEY (id)\n);\n\
          ALTER SEQUENCE t_id_seq OWNED BY t.id;\n\
          COMMENT ON TABLE t IS 'c';\n"
     );
@@ -161,7 +163,8 @@ fn a_serial_sequence_follows_its_excluded_column() {
 
 #[test]
 fn an_included_serial_table_brings_its_sequence() {
-    let opts = Options { filter: Filter::parse(&["table:public.users"], &[] as &[&str]).expect("patterns"), schema: None };
+    let opts =
+        Options { filter: Filter::parse(&["table:public.users"], &[] as &[&str]).expect("patterns"), schema: None, ..Options::default() };
     let plan = diff("", "CREATE TABLE users (id serial); CREATE SEQUENCE other;", &opts);
     assert_eq!(plan.len(), 3, "{plan:?}");
     assert!(plan[0].starts_with("CREATE SEQUENCE public.users_id_seq"), "{plan:?}");

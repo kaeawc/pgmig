@@ -8,6 +8,54 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
 
 ### Added
 
+- `pgmig schema clean --url <db>` drops every managed object in a database (for local
+  development), leaving it equal to a new one: `public` stays with its standard comment, the
+  revisions schema is never touched, and extensions are not dropped (tables an extension created,
+  such as `spatial_ref_sys`, are not yet told apart: the clean then fails and rolls back, see #18;
+  indexes are not modelled, so dropping a column drops indexes on it). It shows the drops and the target, and asks
+  for the database name to be typed; `--auto-approve` (required without a terminal), `--dry-run`,
+  `--format json`. Filters and `--schema` apply; managed objects that a kept object needs (its
+  schema, enum, sequence, referenced table) are kept and reported.
+- `--edit` on `schema apply` and `migrate diff` opens the planned SQL in `$VISUAL`/`$EDITOR`; what
+  you save is what runs or is written. An emptied plan applies or writes nothing, a failing editor
+  aborts, and the temp file is always removed. Needs a terminal; refused with `--format json`.
+- Diff policy: `--skip <kind>` (repeatable, on `schema diff`, `schema apply` and `migrate diff`) or
+  `[diff] skip` in the config never plans that kind of change (`drop_table`, `drop_column`, ...).
+  Changes that need a skipped one are skipped too, and every skipped change is reported: on stderr,
+  and as `skipped` (`kind`, `object`, `statement`, `because`) in the JSON responses. `--exit-code`
+  ignores skipped changes.
+- `pgmig schema fingerprint <source>`: a stable `h1:` hash of the managed schema, the same for a
+  live database, SQL files or a migration replay, on pgmem and Postgres 15–18.
+- `migrate apply --format json` reports pending files, per-file status and per-statement timings
+  (index, line, hash, milliseconds; no SQL text), and a failure carries the partial report.
+- Adopting existing databases: `pgmig migrate baseline <name>` writes the live schema as the first
+  migration; `migrate apply --baseline <version>` records files up to it as applied on a populated
+  database with no history (and runs everything on an empty one), and refuses other populated
+  databases unless `--allow-dirty`. `pgmig migrate status` shows the current version, pending files
+  and problems with recovery hints; `pgmig migrate set <version>` repairs the history (`--force` for
+  failed, partial or later complete rows).
+- `pgmig migrate ls`, `show`, `edit`, `rm` and `rebase`: list files (with applied status given
+  `--url`), print, edit in `$VISUAL`/`$EDITOR`, remove, or move out-of-order files to the end with new
+  versions after a merge, each keeping `pgmig.sum` valid. `rm` and `rebase` refuse applied files
+  unless `--force`.
+- `pgmig migrate apply --url <target> --dir <dir>`: applies pending migrations under an advisory
+  lock (`--lock-name`, `--lock-timeout`, `--no-lock`), in `--tx-mode file` (default), `all` or
+  `none` (or `-- pgmig:txmode none` per file), with `--exec-order linear`, `linear-skip` or
+  `non-linear`, session hooks (`--before-sql`, `--after-sql`), resume of partly applied files, and
+  refusal when the directory or the recorded history does not match. `--dry-run` lists pending files.
+- Revisions table library (`pgmig_revisions` in the `pgmig` schema, configurable with
+  `[migrations] revisions_schema`): versioned format, per-row hashes that reveal hand edits.
+- `pgmig migrate diff <name>` writes the next migration from the desired state (nothing when there
+  are no changes) and `pgmig migrate new <name>` writes an empty one; both rehash `pgmig.sum`. A
+  directory holding `pgmig.sum` is read as a migration directory wherever a state is accepted.
+- `pgmig.toml`: every command's options can come from a config file with top-level defaults and
+  `[env.<name>]` sections (`--env`, `--config`), `${VAR}` interpolation and `--var NAME=VALUE`;
+  flags win over the selected environment, which wins over the top level. `pgmig config validate`
+  checks the file. `schema apply` now shows the target (password redacted) and where it came from.
+- Migration directories: `<version>_<description>.sql` files and a `pgmig.sum` whose per-file
+  hashes chain, so an edit, insertion or deletion is detected and parallel additions conflict in
+  version control. `pgmig migrate hash` writes the sum file; `pgmig migrate validate` checks it and,
+  with `--shadow`, replays every migration. Migrations cannot use `-- pgmig:import`.
 - SQL files are loaded one statement at a time, and load errors report `file:line:col` with the
   SQLSTATE and server message. Dollar-quoted bodies, quoted strings and identifiers, comments and
   `BEGIN ATOMIC` bodies may contain `;`.
@@ -21,6 +69,11 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
   runs in a transaction; a failure rolls it back and names the statement and how many earlier
   batches stayed applied. `--dry-run` prints the plan; without a terminal it needs
   `--auto-approve`.
+- `--format json` on `schema inspect`, `diff`, `validate` and `apply`, and documented exit codes:
+  0 success, 1 error, 2 usage, 3 when `--exit-code` is given and the plan is not empty.
+- Library API with serde types (`pgmig::api`): one request and response per command, `Model`,
+  `Change` and `Plan` serializable, structured errors (including apply outcomes), and unknown request
+  fields refused. The CLI is a thin formatter over it.
 - TLS for target and shadow connections (rustls, no OpenSSL): `sslmode` disable, prefer (the new
   default; falls back to plaintext when the handshake fails), require, verify-ca and verify-full,
   with `sslrootcert` or the bundled Mozilla roots. Building now needs a C compiler (for `ring`).
@@ -47,6 +100,16 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
 
 ### Changed
 
+- Literals in plans (comments, enum labels) containing a backslash render as escape strings
+  (`E'...'`), so they read back the same whatever `standard_conforming_strings` the target has (#116).
+
+- Plans mark commit points with a `-- pgmig:commit` directive line after the explanatory comment.
+- The revisions schema (`pgmig` by default) is never managed by `schema` commands: it is left out
+  of inspect, diff and apply on both sides. A project with its own schema named `pgmig` must set
+  `[migrations] revisions_schema` to another name.
+- Inspection runs with `search_path = pg_catalog`, so names inside server-printed definitions
+  (defaults, types, constraint definitions) are always schema-qualified, and the same schema reads
+  the same whatever the connection's search path.
 - Plans are ordered by a dependency graph: each statement runs after what it references, and drops
   run before what they reference. A table whose column uses another table's row type is now
   created after that table and dropped before it.
