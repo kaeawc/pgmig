@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     ApplyOptions, ApplyReport, Change, ChecksumError, DriftCheck, Error, Expected, Guard, Kept, MigrateApplyReport, MigrateEdit, MigrateLs,
     MigrateRebase, MigrateRm, MigrateSet, MigrateShow, MigrateStatus, MigrationOutcome, Model, Options, Plan, SavedApplied, SavedPlan,
-    SetOptions, ShadowSpec, Skipped, Source, SumFile, filter::PatternError,
+    SetOptions, ShadowSpec, Skipped, Source, Suggestion, SumFile, UnusedHint, filter::PatternError,
 };
 
 /// `schema diff`.
@@ -37,6 +37,14 @@ pub struct DiffResponse {
     /// The changes the options' policy (`skip`) left out of the plan.
     #[serde(default)]
     pub skipped: Vec<Skipped>,
+    /// Rename hints to consider: the diff drops something and adds something that looks like it.
+    /// Never planned as a rename without the hint (`-- pgmig:rename`, see [`crate::Rename`]).
+    #[serde(default)]
+    pub hints: Vec<Suggestion>,
+    /// `-- pgmig:rename` hints of the desired state that did not apply (the object is already
+    /// renamed, or is not there): reported, not an error.
+    #[serde(default)]
+    pub unused_hints: Vec<UnusedHint>,
     /// `plan` rendered as a SQL script ([`Plan::to_sql`]).
     pub sql: String,
 }
@@ -127,6 +135,14 @@ pub struct PlanApplyResponse {
     /// The changes the options' policy (`skip`) left out of the plan.
     #[serde(default)]
     pub skipped: Vec<Skipped>,
+    /// Rename hints to consider: the diff drops something and adds something that looks like it.
+    /// Never planned as a rename without the hint (`-- pgmig:rename`, see [`crate::Rename`]).
+    #[serde(default)]
+    pub hints: Vec<Suggestion>,
+    /// `-- pgmig:rename` hints of the desired state that did not apply (the object is already
+    /// renamed, or is not there): reported, not an error.
+    #[serde(default)]
+    pub unused_hints: Vec<UnusedHint>,
     /// `plan` rendered as a SQL script ([`Plan::to_sql`]).
     pub sql: String,
 }
@@ -346,6 +362,14 @@ pub struct MigrateDiffResponse {
     /// The changes the options' policy (`skip`) left out of the file.
     #[serde(default)]
     pub skipped: Vec<Skipped>,
+    /// Rename hints to consider: the diff drops something and adds something that looks like it.
+    /// Never planned as a rename without the hint (`-- pgmig:rename`, see [`crate::Rename`]).
+    #[serde(default)]
+    pub hints: Vec<Suggestion>,
+    /// `-- pgmig:rename` hints of the desired state that did not apply (the object is already
+    /// renamed, or is not there): reported, not an error.
+    #[serde(default)]
+    pub unused_hints: Vec<UnusedHint>,
     /// The new file's contents: `plan` rendered as a SQL script ([`Plan::to_sql`]), or with
     /// `editor`, what the editor saved. With several files, the plan as one script; the files hold
     /// its units.
@@ -637,6 +661,9 @@ pub enum ErrorCode {
     Config,
     /// A `-- pgmig:<name>` directive is misplaced or has bad arguments.
     Directive,
+    /// A rename hint applies, but the current schema could not be copied and renamed in the shadow
+    /// database to diff what is left.
+    RenameHint,
     /// The revisions table cannot be used (a newer format, a table pgmig did not create).
     Revisions,
     /// A row of the revisions table was edited by hand.
@@ -717,6 +744,7 @@ impl ErrorCode {
             ErrorCode::FileReordered => "file_reordered",
             ErrorCode::Config => "config",
             ErrorCode::Directive => "directive",
+            ErrorCode::RenameHint => "rename_hint",
             ErrorCode::Revisions => "revisions",
             ErrorCode::RevisionEdited => "revision_edited",
             ErrorCode::HistoryMissing => "history_missing",
@@ -934,6 +962,7 @@ impl From<&Error> for ApiError {
                 }));
                 e
             }
+            Error::RenameSetup { source, .. } => err(ErrorCode::RenameHint).sqlstate(source),
             Error::SavedPlan(_) => err(ErrorCode::SavedPlan),
             Error::PlanStale { .. } => err(ErrorCode::PlanStale),
             Error::PlanDiverged { .. } => err(ErrorCode::PlanDiverged),
@@ -1117,6 +1146,7 @@ fn is_diagnostic(e: &Error) -> bool {
         | Error::ImportEmpty { .. }
         | Error::ImportCycle { .. }
         | Error::MigrationImport { .. }
+        | Error::Directive { .. }
         | Error::Migrate(_)
         | Error::Checksum(_) => true,
         Error::NotSql
@@ -1128,7 +1158,6 @@ fn is_diagnostic(e: &Error) -> bool {
         | Error::Inspect(_)
         | Error::Plan(_)
         | Error::Apply { .. }
-        | Error::Directive { .. }
         | Error::Revisions(_)
         | Error::History(_)
         | Error::LockTimeout { .. }
@@ -1145,6 +1174,7 @@ fn is_diagnostic(e: &Error) -> bool {
         | Error::VerifyFailed { .. }
         | Error::VerifyStatement { .. }
         | Error::VerifySetup { .. }
+        | Error::RenameSetup { .. }
         | Error::SavedPlan(_)
         | Error::PlanStale { .. }
         | Error::PlanDiverged { .. } => false,
@@ -1154,7 +1184,14 @@ fn is_diagnostic(e: &Error) -> bool {
 /// [`crate::schema_diff`].
 pub fn schema_diff(req: &DiffRequest) -> Result<DiffResponse, ApiError> {
     let d = crate::diff_sources(&req.from, &req.to, &req.shadow, &req.options, &req.options.plan_options())?;
-    Ok(DiffResponse { sql: d.plan.to_sql(), plan: d.plan, changes: d.changes, skipped: d.skipped })
+    Ok(DiffResponse {
+        sql: d.plan.to_sql(),
+        plan: d.plan,
+        changes: d.changes,
+        skipped: d.skipped,
+        hints: d.suggestions,
+        unused_hints: d.unused_hints,
+    })
 }
 
 /// [`crate::schema_inspect`].
@@ -1206,6 +1243,8 @@ pub fn migrate_diff(req: &MigrateDiffRequest) -> Result<MigrateDiffResponse, Api
         plan: res.plan,
         changes: res.changes,
         skipped: res.skipped,
+        hints: res.hints,
+        unused_hints: res.unused_hints,
         edited: res.edited,
     })
 }
@@ -1279,9 +1318,16 @@ pub fn config_validate(req: &ConfigValidateRequest) -> Result<ConfigValidateResp
 pub fn schema_plan_apply(req: &PlanApplyRequest) -> Result<PlanApplyResponse, ApiError> {
     let d = crate::plan_apply_changes(&req.target, &req.desired, &req.shadow, &req.options)?;
     if req.verify {
-        crate::verify_plan(crate::Current::Model(&d.current), &d.plan, &d.to, &req.shadow, &req.options)?;
+        crate::verify_plan_with(crate::Current::Model(&d.current), &d.plan, &d.to, &d.renames, &req.shadow, &req.options)?;
     }
-    Ok(PlanApplyResponse { sql: d.plan.to_sql(), plan: d.plan, changes: d.changes, skipped: d.skipped })
+    Ok(PlanApplyResponse {
+        sql: d.plan.to_sql(),
+        plan: d.plan,
+        changes: d.changes,
+        skipped: d.skipped,
+        hints: d.suggestions,
+        unused_hints: d.unused_hints,
+    })
 }
 
 /// [`crate::schema_plan_clean`].
@@ -1457,7 +1503,30 @@ mod tests {
             statement: Some("DROP SCHEMA old".into()),
             because: Some(crate::SkipCause { kind: crate::ChangeKind::DropTable, object: "old.t".into() }),
         }];
-        let json = round_trip(&DiffResponse { plan: plan(), sql: plan().to_sql(), changes: changes.clone(), skipped: skipped.clone() });
+        let hints = vec![Suggestion {
+            directive: "-- pgmig:rename column public.t.a b".into(),
+            message: "column public.t.a is dropped and column b of the same type (text) is added".into(),
+        }];
+        let unused_hints = vec![UnusedHint {
+            directive: "-- pgmig:rename table public.old new".into(),
+            file: "schema.sql".into(),
+            line: 3,
+            column: 1,
+            reason: "table public.old does not exist in the current schema".into(),
+        }];
+        let json = round_trip(&DiffResponse {
+            plan: plan(),
+            sql: plan().to_sql(),
+            changes: changes.clone(),
+            skipped: skipped.clone(),
+            hints: hints.clone(),
+            unused_hints: unused_hints.clone(),
+        });
+        assert!(
+            json.contains(r#""hints":[{"directive":"-- pgmig:rename column public.t.a b","message":"column public.t.a is dropped"#)
+                && json.contains(r#""unused_hints":[{"directive":"-- pgmig:rename table public.old new","file":"schema.sql","line":3,"column":1,"reason":"#),
+            "{json}"
+        );
         assert!(
             json.contains(r#""skipped":[{"kind":"drop_schema","object":"old","statement":"DROP SCHEMA old","because":{"kind":"drop_table","object":"old.t"}}]"#),
             "{json}"
@@ -1465,7 +1534,7 @@ mod tests {
         round_trip(&InspectResponse { plan: plan(), sql: plan().to_sql(), model: Model::empty_database() });
         let fp = FingerprintResponse { fingerprint: crate::fingerprint(&Model::empty_database()) };
         assert_eq!(round_trip(&fp), format!(r#"{{"fingerprint":"{}"}}"#, fp.fingerprint));
-        round_trip(&PlanApplyResponse { plan: plan(), sql: plan().to_sql(), changes, skipped });
+        round_trip(&PlanApplyResponse { plan: plan(), sql: plan().to_sql(), changes, skipped, hints, unused_hints });
         round_trip(&ApplyReport { batches: 2, statements: 5, non_transactional: 1 });
         round_trip(&MigrateDiffResponse {
             file: Some("m/1_a.sql".into()),
@@ -1475,6 +1544,8 @@ mod tests {
             sql: plan().to_sql(),
             changes: vec![],
             skipped: vec![],
+            hints: vec![],
+            unused_hints: vec![],
             edited: true,
         });
         round_trip(&EditPlanResponse { plan: plan(), sql: plan().to_sql() });
@@ -1562,6 +1633,7 @@ mod tests {
             FileReordered,
             Config,
             Directive,
+            RenameHint,
             Revisions,
             RevisionEdited,
             HistoryMissing,
@@ -1710,8 +1782,15 @@ mod tests {
 
     #[test]
     fn responses_carry_the_rendered_script() {
-        let json =
-            serde_json::to_value(DiffResponse { plan: plan(), sql: plan().to_sql(), changes: vec![], skipped: vec![] }).expect("serialize");
+        let json = serde_json::to_value(DiffResponse {
+            plan: plan(),
+            sql: plan().to_sql(),
+            changes: vec![],
+            skipped: vec![],
+            hints: vec![],
+            unused_hints: vec![],
+        })
+        .expect("serialize");
         assert_eq!(json["sql"], "CREATE SCHEMA app;\n");
     }
 

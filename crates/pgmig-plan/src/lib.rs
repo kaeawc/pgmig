@@ -121,6 +121,17 @@
 //! before the tables, columns, domains and composite types that use it; it is dropped after them.
 //! `CREATE DOMAIN` carries the validated checks, and `NOT VALID` ones are added after it.
 //!
+//! # Renames
+//!
+//! The renames of rename hints (`RenameTable`, `RenameColumn`, `RenameEnum`, `RenameDomain`,
+//! `RenameCompositeType`, `RenameSequence`, `RenameIndex`; see [`pgmig_diff::rename`]) are not
+//! sorted: they run first, before even the added enum values, because every other change names the
+//! objects as they are called once the renames are made. Types, sequences and tables go first, then
+//! columns and indexes, which are named by their table's new name. A rename never uses `IF EXISTS`,
+//! and its statement is the same whatever [`PlanOptions::if_exists`] says. They are no commit point:
+//! only an added enum value is. The policy ([`skip`]) still sees what each creates (the new name)
+//! and drops (the old one), so a skipped rename takes with it the changes that name the new object.
+//!
 //! # Policy
 //!
 //! [`skip`] leaves chosen kinds of change out before planning, with the changes that depend on
@@ -345,12 +356,19 @@ pub fn plan_with(changes: &[Change], opts: &PlanOptions) -> Result<Plan, Error> 
         })
         .collect();
     let tables = Tables { whole, rekeyed, partitions: Partitions::of(changes) };
-    let (adds, rest): (Vec<&Change>, Vec<&Change>) = changes.iter().partition(|c| matches!(c, Change::AddEnumValue { .. }));
+    // Hinted renames run first, whatever else is planned: every other change names the objects as
+    // they are called once the renames are made (see [`pgmig_diff::rename`]).
+    let mut renames: Vec<&Change> = changes.iter().filter(|c| rename_rank(c).is_some()).collect();
+    renames.sort_by_key(|c| rename_rank(c));
+    let (adds, rest): (Vec<&Change>, Vec<&Change>) =
+        changes.iter().filter(|c| rename_rank(c).is_none()).partition(|c| matches!(c, Change::AddEnumValue { .. }));
     let mut plan = Plan::default();
+    plan.statements.extend(renames.iter().map(|c| statement(c, opts)));
+    let renamed = plan.statements.len();
     for step in sorted(&adds, opts, &tables)?.into_iter().flatten() {
         plan.statements.push(step.sql);
     }
-    plan.commit_after = (!plan.statements.is_empty() && !rest.is_empty()).then(|| plan.statements.len() - 1);
+    plan.commit_after = (plan.statements.len() > renamed && !rest.is_empty()).then(|| plan.statements.len() - 1);
     for step in sorted(&rest, opts, &tables)?.into_iter().flatten() {
         if step.non_transactional {
             plan.non_transactional.push(plan.statements.len());
@@ -358,6 +376,21 @@ pub fn plan_with(changes: &[Change], opts: &PlanOptions) -> Result<Plan, Error> 
         plan.statements.push(step.sql);
     }
     Ok(plan)
+}
+
+/// Where a hinted rename runs among the renames: types and tables first, then the columns and
+/// indexes, which are named by their table's new name. `None` for a change that is not one.
+fn rename_rank(change: &Change) -> Option<u8> {
+    match change {
+        Change::RenameEnum { .. }
+        | Change::RenameDomain { .. }
+        | Change::RenameCompositeType { .. }
+        | Change::RenameSequence { .. }
+        | Change::RenameTable { .. } => Some(0),
+        Change::RenameColumn { .. } => Some(1),
+        Change::RenameIndex { .. } => Some(2),
+        _ => None,
+    }
 }
 
 /// What the plan does to whole tables, which decides where the concurrent-index policy applies.
@@ -544,6 +577,14 @@ fn phase(change: &Change, partitions: &Partitions) -> u8 {
         Change::AddEnumValue { .. } | Change::UnsupportedEnumChange { .. } => 0,
         Change::UnsupportedDomainChange { .. } | Change::UnsupportedCompositeChange { .. } | Change::UnsupportedPartitionChange { .. } => 0,
         Change::CreateSchema(_) => 0,
+        // Never sorted: they run before everything else (see `plan_with`).
+        Change::RenameTable { .. }
+        | Change::RenameColumn { .. }
+        | Change::RenameEnum { .. }
+        | Change::RenameSequence { .. }
+        | Change::RenameDomain { .. }
+        | Change::RenameCompositeType { .. }
+        | Change::RenameIndex { .. } => 0,
         Change::CreateEnum(_) | Change::CreateSequence(_) | Change::CreateDomain(_) | Change::CreateCompositeType(_) => 1,
         // Before defaults that print the new name are set.
         Change::RenameEnumValue { .. } | Change::AlterSequence { .. } => 2,
@@ -931,6 +972,43 @@ fn object_deps(change: &Change) -> Deps {
                 ..Deps::default()
             }
         }
+        // Not sorted (see `plan_with`); the policy uses these to leave out what needs a skipped
+        // rename: whatever requires or alters the new name.
+        Change::RenameTable { from, to } => {
+            let new = QualName::new(from.schema.clone(), to.clone());
+            Deps {
+                creates: vec![Object::Table(new.clone()), Object::Type(new)],
+                drops: vec![Object::Table(from.clone()), Object::Type(from.clone())],
+                ..Deps::default()
+            }
+        }
+        Change::RenameColumn { table, from, to } => {
+            Deps { creates: vec![column(table, to)], drops: vec![column(table, from)], requires: vec![in_table(table)], ..Deps::default() }
+        }
+        Change::RenameEnum { from, to } | Change::RenameDomain { from, to } => Deps {
+            creates: vec![Object::Type(QualName::new(from.schema.clone(), to.clone()))],
+            drops: vec![Object::Type(from.clone())],
+            ..Deps::default()
+        },
+        Change::RenameCompositeType { from, to } => {
+            let new = QualName::new(from.schema.clone(), to.clone());
+            Deps {
+                creates: vec![Object::Type(new.clone()), Object::Relation(new)],
+                drops: vec![Object::Type(from.clone()), Object::Relation(from.clone())],
+                ..Deps::default()
+            }
+        }
+        Change::RenameSequence { from, to } => Deps {
+            creates: vec![Object::Sequence(QualName::new(from.schema.clone(), to.clone()))],
+            drops: vec![Object::Sequence(from.clone())],
+            ..Deps::default()
+        },
+        Change::RenameIndex { table, from, to } => Deps {
+            creates: vec![index_object(table, to)],
+            drops: vec![index_object(table, from)],
+            requires: vec![in_table(table)],
+            ..Deps::default()
+        },
         Change::SetComment { target, .. } => {
             // A comment only waits for the object (and a column's table) to exist.
             let requires = match target {
@@ -1162,6 +1240,18 @@ fn statement(change: &Change, opts: &PlanOptions) -> String {
             format!("CREATE TYPE {} AS ENUM ({})", n(&e.name), labels.join(", "))
         }
         Change::DropEnum(e) => drop("TYPE", n(&e.name)),
+        Change::RenameTable { from, to } => format!("ALTER TABLE {} RENAME TO {}", n(from), quote_ident(to)),
+        Change::RenameColumn { table, from, to } => {
+            format!("ALTER TABLE {} RENAME COLUMN {} TO {}", n(table), quote_ident(from), quote_ident(to))
+        }
+        Change::RenameEnum { from, to } | Change::RenameCompositeType { from, to } => {
+            format!("ALTER TYPE {} RENAME TO {}", n(from), quote_ident(to))
+        }
+        Change::RenameDomain { from, to } => format!("ALTER DOMAIN {} RENAME TO {}", n(from), quote_ident(to)),
+        Change::RenameSequence { from, to } => format!("ALTER SEQUENCE {} RENAME TO {}", n(from), quote_ident(to)),
+        Change::RenameIndex { table, from, to } => {
+            format!("ALTER INDEX {} RENAME TO {}", n(&QualName::new(table.schema.clone(), from.clone())), quote_ident(to))
+        }
         Change::CreateSequence(seq) => {
             let mut s = format!("CREATE SEQUENCE{ine} {}", n(&seq.name));
             if seq.data_type != "bigint" {
@@ -1632,6 +1722,67 @@ mod tests {
         let only_adds = plan(&changes[1..2]).expect("plan");
         assert_eq!(only_adds.commit_after, None);
         assert_eq!(only_adds.to_sql(), "ALTER TYPE app.mood ADD VALUE 'a' BEFORE 'c';\n");
+    }
+
+    fn renames() -> Vec<Change> {
+        let t = QualName::new("public", "accounts");
+        vec![
+            Change::RenameIndex { table: t.clone(), from: "i".into(), to: "j".into() },
+            Change::RenameColumn { table: t.clone(), from: "name".into(), to: "Full Name".into() },
+            Change::RenameTable { from: QualName::new("public", "users"), to: "accounts".into() },
+            Change::RenameEnum { from: QualName::new("app", "mood"), to: "feeling".into() },
+            Change::RenameDomain { from: QualName::new("public", "d"), to: "e".into() },
+            Change::RenameCompositeType { from: QualName::new("public", "p"), to: "q".into() },
+            Change::RenameSequence { from: QualName::new("public", "s"), to: "r".into() },
+        ]
+    }
+
+    #[test]
+    fn renames_run_first_types_and_tables_then_columns_then_indexes() {
+        let mut changes = vec![Change::CreateSchema("other".into())];
+        changes.extend(renames());
+        assert_eq!(
+            sql(&changes),
+            [
+                "ALTER TABLE public.users RENAME TO accounts",
+                "ALTER TYPE app.mood RENAME TO feeling",
+                "ALTER DOMAIN public.d RENAME TO e",
+                "ALTER TYPE public.p RENAME TO q",
+                "ALTER SEQUENCE public.s RENAME TO r",
+                "ALTER TABLE public.accounts RENAME COLUMN name TO \"Full Name\"",
+                "ALTER INDEX public.i RENAME TO j",
+                "CREATE SCHEMA other",
+            ]
+        );
+        let opts = PlanOptions { unqualified_schema: Some("public".into()), ..PlanOptions::default() };
+        let p = plan_with(&renames(), &opts).expect("plan");
+        assert!(p.statements.contains(&"ALTER TABLE users RENAME TO accounts".to_owned()), "{:?}", p.statements);
+        assert!(p.statements.contains(&"ALTER INDEX i RENAME TO j".to_owned()), "{:?}", p.statements);
+    }
+
+    #[test]
+    fn renames_come_before_added_enum_values_and_are_not_a_commit_point() {
+        let t = QualName::new("public", "t");
+        let rename = Change::RenameEnum { from: QualName::new("app", "old_mood"), to: "mood".into() };
+        let changes = [
+            add("a", EnumPosition::End),
+            rename.clone(),
+            Change::SetDefault { table: t, column: "m".into(), default: "'a'::app.mood".into(), sequences: vec![], old_sequences: vec![] },
+        ];
+        let p = plan(&changes).expect("plan");
+        assert_eq!(
+            p.statements,
+            [
+                "ALTER TYPE app.old_mood RENAME TO mood",
+                "ALTER TYPE app.mood ADD VALUE 'a'",
+                "ALTER TABLE public.t ALTER COLUMN m SET DEFAULT 'a'::app.mood",
+            ]
+        );
+        // The rename needs no commit before the rest; the new value does.
+        assert_eq!(p.commit_after, Some(1));
+        let only = plan(&[rename.clone(), Change::CreateSchema("x".into())]).expect("plan");
+        assert_eq!(only.commit_after, None);
+        assert_eq!(plan(&[rename]).expect("plan").commit_after, None);
     }
 
     #[test]

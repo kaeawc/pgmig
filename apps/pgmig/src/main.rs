@@ -5,7 +5,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand, ValueEnum};
 use pgmig::api::{self, ApiError};
 use pgmig::config::{Config, Settings, Vars};
-use pgmig::{ChangeKind, Filter, Options, ShadowSpec, Skipped, Source};
+use pgmig::{ChangeKind, Filter, Options, ShadowSpec, Skipped, Source, Suggestion, UnusedHint};
 use serde::Serialize;
 
 const AFTER_HELP: &str = "\
@@ -744,6 +744,17 @@ fn print_skipped(skipped: &[Skipped]) {
     }
 }
 
+/// Notes on rename hints, on stderr: a warning for each hint that did not apply, and for each drop
+/// and add that look like a rename the hint to write. Nothing is renamed without a hint.
+fn print_hints(suggestions: &[Suggestion], unused: &[UnusedHint]) {
+    for u in unused {
+        eprintln!("warning: {u}");
+    }
+    for s in suggestions {
+        eprintln!("note: {}; add `{}` to the desired state", s.message, s.directive);
+    }
+}
+
 /// `[migrations] revisions_schema`, or the default.
 fn revisions_schema(s: &Settings) -> String {
     s.migrations_revisions_schema.clone().unwrap_or_else(|| pgmig::revisions::DEFAULT_SCHEMA.to_owned())
@@ -1058,6 +1069,7 @@ fn run(cli: Cli, loaded: &Loaded, format: Format) -> anyhow::Result<ExitCode> {
                     print!("{}", res.plan.to_sql());
                     std::io::stdout().flush()?;
                     print_skipped(&res.skipped);
+                    print_hints(&res.hints, &res.unused_hints);
                 }
                 Format::Json => print_json(&res)?,
             }
@@ -1265,6 +1277,7 @@ fn migrate_diff(req: &api::MigrateDiffRequest, format: Format) -> anyhow::Result
         return print_json(&res);
     }
     print_skipped(&res.skipped);
+    print_hints(&res.hints, &res.unused_hints);
     if req.verify && res.file.is_some() {
         eprintln!("verified: in the shadow database the migration makes the desired state");
     }
@@ -1539,6 +1552,7 @@ fn schema_plan(req: &api::SchemaPlanRequest, target: &Target, out: Option<&Path>
     let text = saved.to_json();
     if format == Format::Text {
         print_skipped(&saved.skipped);
+        print_hints(&saved.hints, &saved.unused_hints);
         if req.verify {
             eprintln!("verified: in the shadow database the plan makes the desired state");
         }
@@ -1655,6 +1669,7 @@ fn schema_apply(req: api::PlanApplyRequest, target: &Target, flags: ApplyFlags, 
     let mut res = api::schema_plan_apply(&req)?;
     if !json {
         print_skipped(&res.skipped);
+        print_hints(&res.hints, &res.unused_hints);
     }
     if res.plan.is_empty() {
         if json {

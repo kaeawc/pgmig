@@ -138,6 +138,8 @@ fn diff_prints_changes_and_statements() {
     }
   ],
   "skipped": [],
+  "hints": [],
+  "unused_hints": [],
   "sql": "ALTER TABLE public.t ADD COLUMN n text;\n"
 }
 "#;

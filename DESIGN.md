@@ -158,7 +158,20 @@ differences can be altered in place and which force a drop and recreate (for exa
 column list changes incompatibly, a function whose return type changes, an enum losing a value).
 
 Renames are never inferred. A drop and an add of similar objects stay a drop and an add unless the
-user confirms a rename interactively or marks it with `-- pgmig:rename` (`DIF-15`).
+user confirms a rename interactively or marks it with `-- pgmig:rename` (`DIF-15`); the diff only
+says which hint to write.
+
+A hint is a file-level directive in the desired-state SQL, collected when the files are loaded (the
+SQL itself is still only executed, never parsed). The hints that apply to the pair of models (the
+old object is in A, the new one in B, the new name is free in A and the old one is not in B) become
+`Rename*` changes, planned first. The rest is diffed against A *as it is after those renames*: pgmig
+runs the renames on a copy of A in a shadow database and inspects it, so everything a rename also
+changes in what the server prints (an index definition naming a renamed column, a foreign key naming
+a renamed table) is the server's own text and not a patch to the model. A rename plus another
+change to the object is a rename followed by the usual alter. A hint that does not apply is reported
+and ignored, so it can stay in the files after it ran. The copy is built like the `--verify` copy,
+from what pgmig models, so a hint that applies to a schema with objects pgmig does not model
+(a default calling a function, say) fails with a clear error instead of a guess.
 
 ## Planner
 

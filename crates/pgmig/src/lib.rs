@@ -17,6 +17,7 @@ pub mod drift;
 pub mod edit;
 mod files;
 pub mod filter;
+mod hints;
 pub mod migrate_apply;
 pub mod migrate_maintain;
 pub mod migrate_status;
@@ -27,6 +28,7 @@ pub use clean::{Kept, SchemaClean, clean_confirmed, clean_desired, schema_plan_c
 pub use drift::{DriftCheck, DriftHistory, Expected, drift_check};
 pub use edit::{EDITED_PLAN, edit_sql, plan_from_sql};
 pub use filter::{Filter, Pattern, PatternError, filter_model, scope_model, without_schema};
+pub use hints::{UnusedHint, rename_hints, renamed_copy};
 pub use migrate_apply::{
     ApplyOptions, ExecOrder, FailedAssertion, FileReport, FileStatus, MigrateApplyReport, MigrationOutcome, StatementTiming, TxMode,
     migrate_apply,
@@ -41,7 +43,7 @@ pub use migrate_status::{
 /// `pgmig.toml`: project configuration.
 pub use pgmig_config as config;
 pub use pgmig_conn::Conn;
-pub use pgmig_diff::{Change, ChangeKind, UnknownKind, diff};
+pub use pgmig_diff::{Change, ChangeKind, Rename, Resolution, Suggestion, UnknownKind, diff, resolve, suggest};
 pub use pgmig_inspect::inspect;
 /// What a database's history leaves to apply, lock keys and statement hashes.
 pub use pgmig_migrate::history;
@@ -52,7 +54,7 @@ pub use pgmig_model::{Model, fingerprint};
 pub use pgmig_plan::{Cause as SkipCause, Plan, PlanOptions, Skipped, Unit as PlanUnit, plan, plan_with};
 pub use pgmig_shadow::{PUBLIC_COMMENT as PUBLIC_SCHEMA_COMMENT_SQL, Shadow};
 pub use saved_plan::{SavedApplied, SavedPlan, apply_saved, check_saved, schema_plan_saved};
-pub use verify::{Current, verify_migration_sql, verify_plan};
+pub use verify::{Current, verify_migration_sql, verify_migration_sql_with, verify_plan, verify_plan_with};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -244,6 +246,15 @@ pub enum Error {
          the target was not changed"
     )]
     VerifySetup { statement: String, source: pgmig_conn::Error },
+    /// A `-- pgmig:rename` hint applies, but the current schema could not be copied and renamed in
+    /// the shadow database to diff what is left (see `hints`).
+    #[error(
+        "a rename hint applies, but the current schema could not be copied and renamed in the shadow database: {statement}\n{source}\n\
+         the copy is rebuilt from what pgmig models (tables, enums, sequences, domains, composite types, constraints, indexes, \
+         comments); objects outside that (extensions, functions, views, ...) are not copied, so a statement that needs one fails\n\
+         remove the hint, or rename the object some other way; nothing was changed"
+    )]
+    RenameSetup { statement: String, source: pgmig_conn::Error },
     /// A saved plan file that cannot be used: not a plan file, a format this version does not
     /// read, or SQL that is not the plan's statements.
     #[error("saved plan: {0}")]
@@ -579,22 +590,32 @@ impl Loaded {
 
 /// [`load_model`], keeping the connection open.
 fn open_model(source: &Source, shadow: &ShadowSpec) -> Result<(Model, Loaded)> {
-    let mut loaded = match source {
-        Source::Database(dsn) => Loaded::Database(Conn::connect(dsn)?),
-        Source::Sql(path) => Loaded::Shadow(load_sql(path, shadow)?),
-        Source::Migrations(path) => Loaded::Shadow(replay(&open_checked(path)?, shadow)?),
+    open_model_hinted(source, shadow).map(|(model, loaded, _)| (model, loaded))
+}
+
+/// [`open_model`], and the rename hints of the files (none for a source that is not SQL files).
+fn open_model_hinted(source: &Source, shadow: &ShadowSpec) -> Result<(Model, Loaded, Vec<hints::Hint>)> {
+    let (mut loaded, hints) = match source {
+        Source::Database(dsn) => (Loaded::Database(Conn::connect(dsn)?), Vec::new()),
+        Source::Sql(path) => {
+            let (sh, hints) = load_sql(path, shadow)?;
+            (Loaded::Shadow(sh), hints)
+        }
+        Source::Migrations(path) => (Loaded::Shadow(replay(&open_checked(path)?, shadow)?), Vec::new()),
     };
-    Ok((inspect(loaded.conn())?, loaded))
+    Ok((inspect(loaded.conn())?, loaded, hints))
 }
 
 /// Execute the SQL files at `path` in a fresh shadow database, one statement at a time so an
-/// error points at its statement.
-fn load_sql(path: &Path, shadow: &ShadowSpec) -> Result<Shadow> {
+/// error points at its statement. Returns their rename hints, which are checked before anything runs.
+fn load_sql(path: &Path, shadow: &ShadowSpec) -> Result<(Shadow, Vec<hints::Hint>)> {
+    let files = files::load_files(path)?;
+    let hints = hints::collect(&files)?;
     let mut sh = shadow.open()?;
-    for loaded in files::load_files(path)? {
+    for loaded in files {
         exec_file(sh.conn(), &loaded.path, &loaded.file)?;
     }
-    Ok(sh)
+    Ok((sh, hints))
 }
 
 /// Execute a split file's statements one at a time, so an error points at its statement in `path`.
@@ -660,6 +681,10 @@ pub struct MigrateDiff {
     pub changes: Vec<Change>,
     /// The changes the policy ([`Options::skip`]) left out of the plan.
     pub skipped: Vec<Skipped>,
+    /// Rename hints to consider: drops and adds that look like renames.
+    pub hints: Vec<Suggestion>,
+    /// `-- pgmig:rename` hints of the desired state that did not apply.
+    pub unused_hints: Vec<UnusedHint>,
     /// The plan from the replayed directory to the desired state.
     pub plan: Plan,
     /// The file's contents: [`Plan::to_sql`], or what the editor saved. For several files, the plan
@@ -745,16 +770,20 @@ fn migrate_diff_at(
     let (lock, existing) = open_locked(dir)?;
     // The replay's shadow is wiped (dropped) before `to`'s opens: a real Postgres shadow must start
     // empty.
-    let a = {
+    let (current, a) = {
         let mut sh = replay_or_empty(existing.as_ref(), shadow)?;
-        opts.managed(&inspect(sh.conn())?)
+        let full = inspect(sh.conn())?;
+        let a = opts.managed(&full);
+        (clean::with_needs(&full, &a), a)
     };
-    let (b, mut loaded) = open_model(to, shadow)?;
+    let (b, loaded, hints) = open_model_hinted(to, shadow)?;
     let b = opts.managed(&b);
     let names = opts.qualified_plan_options();
-    let (changes, skipped) = opts.apply_policy(&diff_with_casts(&a, &b, loaded.conn()), &names);
+    let desired = hints::Desired { source: to, shadow, opts };
+    let found = hints::diff_hinted(&current, a, &b, loaded, &desired, &hints)?;
+    let renames: Vec<Rename> = hints.into_iter().map(|h| h.rename).collect();
+    let (changes, skipped) = opts.apply_policy(&found.changes, &names);
     let plan = plan_with(&changes, &names)?;
-    drop(loaded);
     if editor.is_some() && !plan.non_transactional.is_empty() {
         return Err(Error::Options(
             "--edit cannot be combined with concurrent_indexes when the plan has statements outside a transaction: \
@@ -775,14 +804,14 @@ fn migrate_diff_at(
     if verify && statements > 0 {
         let current = Current::Migrations(existing.as_ref());
         if edited {
-            verify_migration_sql(current, &sql, EDITED_MIGRATION, &b, shadow, opts)?;
+            verify_migration_sql_with(current, &sql, EDITED_MIGRATION, &b, &renames, shadow, opts)?;
         } else {
-            verify_plan(current, &plan, &b, shadow, opts)?;
+            verify_plan_with(current, &plan, &b, &renames, shadow, opts)?;
         }
     }
     let written =
         if statements == 0 { Vec::new() } else { write_migrations(dir, lock, existing, migration_files(&plan, &description, &sql), now)? };
-    Ok(MigrateDiff { written, changes, skipped, plan, sql, edited })
+    Ok(MigrateDiff { written, changes, skipped, hints: found.suggestions, unused_hints: found.unused, plan, sql, edited })
 }
 
 /// The files [`migrate_diff`] writes for `plan`, each a description and its contents: `sql` as one
@@ -1045,6 +1074,12 @@ struct Diffed {
     to: Model,
     /// The fingerprint of `from`'s managed objects, as inspected for this diff.
     from_fingerprint: String,
+    /// The rename hints of `to`'s files (`--verify` looks for those a skipped rename leaves).
+    renames: Vec<Rename>,
+    /// Hints to consider: drops and adds that look like renames.
+    suggestions: Vec<Suggestion>,
+    /// Hints that did not apply.
+    unused_hints: Vec<UnusedHint>,
 }
 
 /// The changes that turn `from` into `to` for the objects `opts` manages, under its policy, and
@@ -1055,11 +1090,25 @@ fn diff_sources(from: &Source, to: &Source, shadow: &ShadowSpec, opts: &Options,
     let current = without_schema(&load_model(from, shadow)?, &opts.revisions_schema);
     let a = opts.managed(&current);
     let current = clean::with_needs(&current, &a);
-    let (b, mut loaded) = open_model(to, shadow)?;
+    let (b, loaded, hints) = open_model_hinted(to, shadow)?;
     let b = opts.managed(&b);
-    let (changes, skipped) = opts.apply_policy(&diff_with_casts(&a, &b, loaded.conn()), names);
+    let from_fingerprint = pgmig_model::fingerprint(&a);
+    let desired = hints::Desired { source: to, shadow, opts };
+    let found = hints::diff_hinted(&current, a, &b, loaded, &desired, &hints)?;
+    let (changes, skipped) = opts.apply_policy(&found.changes, names);
     let plan = plan_with(&changes, names)?;
-    Ok(Diffed { changes, skipped, plan, current, to: b, from_fingerprint: pgmig_model::fingerprint(&a) })
+    let renames = hints.into_iter().map(|h| h.rename).collect();
+    Ok(Diffed {
+        changes,
+        skipped,
+        plan,
+        current,
+        to: b,
+        from_fingerprint,
+        renames,
+        suggestions: found.suggestions,
+        unused_hints: found.unused,
+    })
 }
 
 /// `diff(a, b)`, with each type change that has no assignment cast converting `USING` an explicit
@@ -1134,8 +1183,9 @@ pub fn schema_verify(target: &str, desired: &Source, plan: &Plan, shadow: &Shado
     let full = without_schema(&inspect(&mut conn)?, &opts.revisions_schema);
     drop(conn);
     let current = clean::with_needs(&full, &opts.managed(&full));
-    let to = opts.managed(&load_model(desired, shadow)?);
-    verify_plan(Current::Model(&current), plan, &to, shadow, opts)
+    let (to, _, hints) = open_model_hinted(desired, shadow)?;
+    let renames: Vec<Rename> = hints.into_iter().map(|h| h.rename).collect();
+    verify_plan_with(Current::Model(&current), plan, &opts.managed(&to), &renames, shadow, opts)
 }
 
 /// What [`apply`] did.

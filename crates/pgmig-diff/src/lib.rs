@@ -137,6 +137,9 @@ use pgmig_model::{
 };
 
 mod partitions;
+pub mod rename;
+
+pub use rename::{Rename, Resolution, Suggestion, resolve, suggest};
 
 /// An object that can carry a comment. New kinds (constraints, indexes) add a variant here, a
 /// matching `Object` in the planner, and a comparison in [`diff`].
@@ -433,6 +436,45 @@ pub enum Change {
         name: QualName,
         detail: String,
     },
+    /// `ALTER TABLE ... RENAME TO`, from a `-- pgmig:rename` hint (see [`rename`]). `to` is the new
+    /// name, in `from`'s schema.
+    RenameTable {
+        from: QualName,
+        to: String,
+    },
+    /// `ALTER TABLE ... RENAME COLUMN`. `table` is the table's name once the plan has renamed it.
+    RenameColumn {
+        table: QualName,
+        from: String,
+        to: String,
+    },
+    /// `ALTER TYPE ... RENAME TO` for an enum.
+    RenameEnum {
+        from: QualName,
+        to: String,
+    },
+    /// `ALTER SEQUENCE ... RENAME TO`.
+    RenameSequence {
+        from: QualName,
+        to: String,
+    },
+    /// `ALTER DOMAIN ... RENAME TO`.
+    RenameDomain {
+        from: QualName,
+        to: String,
+    },
+    /// `ALTER TYPE ... RENAME TO` for a composite type.
+    RenameCompositeType {
+        from: QualName,
+        to: String,
+    },
+    /// `ALTER INDEX ... RENAME TO`, an index no constraint owns. `table` is the table's name once
+    /// the plan has renamed it, `from` and `to` the index's names, in the table's schema.
+    RenameIndex {
+        table: QualName,
+        from: String,
+        to: String,
+    },
     /// `COMMENT ON ... IS <comment>`; `None` removes the comment. Never emitted for an object
     /// that is being dropped.
     SetComment {
@@ -522,6 +564,13 @@ change_kinds! {
     DetachPartition => "detach_partition",
     AttachPartition => "attach_partition",
     UnsupportedPartitionChange => "unsupported_partition_change",
+    RenameTable => "rename_table",
+    RenameColumn => "rename_column",
+    RenameEnum => "rename_enum",
+    RenameSequence => "rename_sequence",
+    RenameDomain => "rename_domain",
+    RenameCompositeType => "rename_composite_type",
+    RenameIndex => "rename_index",
     SetComment => "set_comment",
 }
 
@@ -602,6 +651,13 @@ impl Change {
             }
             Change::DetachPartition { table, .. } | Change::AttachPartition { table, .. } => table.to_string(),
             Change::UnsupportedPartitionChange { name, .. } => name.to_string(),
+            Change::RenameTable { from, .. }
+            | Change::RenameEnum { from, .. }
+            | Change::RenameSequence { from, .. }
+            | Change::RenameDomain { from, .. }
+            | Change::RenameCompositeType { from, .. } => from.to_string(),
+            Change::RenameColumn { table, from, .. } => col(table, from),
+            Change::RenameIndex { table, from, .. } => QualName::new(table.schema.clone(), from.clone()).to_string(),
             Change::SetComment { target, .. } => match target {
                 CommentTarget::Schema(s) => format!("schema {}", quote_ident(s)),
                 CommentTarget::Table(t) => format!("table {t}"),
@@ -2265,6 +2321,13 @@ mod tests {
                 columns: vec!["id".into()],
             },
             Change::UnsupportedPartitionChange { name: QualName::new("public", "p"), detail: "the partitioning cannot change".into() },
+            Change::RenameTable { from: QualName::new("public", "t"), to: "u".into() },
+            Change::RenameColumn { table: QualName::new("public", "t"), from: "a".into(), to: "b".into() },
+            Change::RenameEnum { from: QualName::new("public", "e"), to: "f".into() },
+            Change::RenameSequence { from: QualName::new("public", "s"), to: "r".into() },
+            Change::RenameDomain { from: QualName::new("public", "d"), to: "e".into() },
+            Change::RenameCompositeType { from: QualName::new("public", "p"), to: "q".into() },
+            Change::RenameIndex { table: QualName::new("public", "t"), from: "i".into(), to: "j".into() },
         ]
     }
 
@@ -2320,6 +2383,13 @@ mod tests {
             Change::DetachPartition { .. } => 46,
             Change::AttachPartition { .. } => 47,
             Change::UnsupportedPartitionChange { .. } => 48,
+            Change::RenameTable { .. } => 49,
+            Change::RenameColumn { .. } => 50,
+            Change::RenameEnum { .. } => 51,
+            Change::RenameSequence { .. } => 52,
+            Change::RenameDomain { .. } => 53,
+            Change::RenameCompositeType { .. } => 54,
+            Change::RenameIndex { .. } => 55,
         }
     }
 
@@ -2327,7 +2397,7 @@ mod tests {
     fn every_change_round_trips_through_json() {
         let changes = every_change();
         let covered: BTreeSet<usize> = changes.iter().map(variant).collect();
-        assert_eq!(covered, (0..49).collect(), "a sample for every variant");
+        assert_eq!(covered, (0..56).collect(), "a sample for every variant");
         for c in &changes {
             let json = serde_json::to_string(c).expect("serialize");
             let back: Change = serde_json::from_str(&json).expect(&json);

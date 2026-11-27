@@ -71,7 +71,7 @@ semantics (defaults, type aliases, normalized expressions) come for free.
 | DIF-12 | Policy: build indexes on partitioned tables with `ON ONLY`, then build each partition's index concurrently and attach it. | M3 |
 | DIF-13 | Policy: create materialized views `WITH NO DATA`. | M3 |
 | DIF-14 | Policy: `IF [NOT] EXISTS` and `CASCADE` on generated statements. | M3 |
-| DIF-15 | Rename detection: offer a rename instead of drop and add, interactively or through a `-- pgmig:rename` hint. Never guessed silently. | M5 |
+| DIF-15 | Rename detection: offer a rename instead of drop and add, interactively or through a `-- pgmig:rename` hint. Never guessed silently. The hint (tables, columns, enums, domains, composite types, sequences, indexes) and the suggestion of one are done; the interactive offer is not. | M5 |
 | DIF-16 | Qualified or unqualified names in output; pretty-printed SQL. | M1 |
 | DIF-17 | Open the planned SQL in `$EDITOR` before applying or writing it. | M2 |
 

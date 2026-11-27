@@ -269,6 +269,37 @@ mod tests {
     }
 
     #[test]
+    fn a_skipped_rename_takes_what_names_the_new_object_with_it() {
+        let users = QualName::new("public", "users");
+        let accounts = QualName::new("public", "accounts");
+        let changes = vec![
+            Change::RenameTable { from: users, to: "accounts".into() },
+            Change::RenameColumn { table: accounts.clone(), from: "a".into(), to: "b".into() },
+            Change::AddColumn { table: accounts.clone(), column: col("c") },
+            Change::SetNotNull { table: accounts, column: "b".into() },
+            Change::AddColumn { table: QualName::new("public", "other"), column: col("c") },
+        ];
+        let (kept, skipped) = skip(&changes, &kinds(&[ChangeKind::RenameTable]), &PlanOptions::default());
+        assert_eq!(kept, [changes[4].clone()]);
+        let shown: Vec<String> = skipped.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            shown,
+            [
+                "rename_table public.users (policy)",
+                "rename_column public.accounts.a (because rename_table public.users is skipped)",
+                "add_column public.accounts.c (because rename_table public.users is skipped)",
+                "set_not_null public.accounts.b (because rename_table public.users is skipped)",
+            ]
+        );
+        assert_eq!(skipped[0].statement.as_deref(), Some("ALTER TABLE public.users RENAME TO accounts"));
+
+        // Skipping only the column's rename leaves the table's, and what names the new column goes.
+        let (kept, skipped) = skip(&changes, &kinds(&[ChangeKind::RenameColumn]), &PlanOptions::default());
+        assert_eq!(kept.len(), 3, "{kept:?}");
+        assert_eq!(skipped.len(), 2);
+    }
+
+    #[test]
     fn a_skipped_table_keeps_its_schema() {
         let changes = vec![
             Change::DropSchema("app".into()),

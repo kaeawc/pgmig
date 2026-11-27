@@ -12,5 +12,6 @@ mod json;
 mod migrate;
 mod plan_options;
 mod policy;
+mod rename_hints;
 mod saved_plan;
 mod support;

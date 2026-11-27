@@ -5,6 +5,10 @@
 //! transactional [`pgmig::Plan::units`] entry, each non-transactional statement on its own outside
 //! one), and check that nothing is left to change.
 //!
+//! A `-- pgmig:rename` hint in `to.sql` is applied as `schema diff` applies it: the plan starts with
+//! the renames, and the rest is diffed against `from` as it is once they ran (see
+//! [`pgmig_diff::rename`]). A hint that does not apply changes nothing.
+//!
 //! `options.toml` sets the case's plan options; a missing file is the defaults, and an unknown key
 //! or a value of the wrong type fails the case. The keys are those of [`pgmig::PlanOptions`]:
 //! `concurrent_indexes`, `if_exists` and `cascade` (booleans, default false). On pgmem, the failing cases must be exactly those in
@@ -14,7 +18,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use pgmig::{PlanOptions, diff, diff_with_casts, inspect, plan_with};
+use pgmig::{Change, Model, PlanOptions, ShadowSpec, diff, diff_with_casts, inspect, plan_with, rename_hints, renamed_copy, resolve};
 
 use crate::support::{TestDb, backend_name, postgres_dsn, shadow};
 
@@ -80,7 +84,9 @@ fn run_case(name: &str, dir: &Path, known: &BTreeSet<String>) -> Result<(), Stri
     sh.load(&read_opt(&dir.join("to.sql"))).map_err(|e| format!("loading to.sql into the shadow: {e}"))?;
     let b = inspect(sh.conn()).map_err(|e| format!("inspecting the shadow: {e}"))?;
 
-    let planned = plan_with(&diff_with_casts(&a, &b, sh.conn()), &case_options(dir)?).map_err(|e| format!("planning: {e}"))?;
+    let to_sql = read_opt(&dir.join("to.sql"));
+    let changes = changes_with_hints(&a, &b, &to_sql, &mut sh)?;
+    let planned = plan_with(&changes, &case_options(dir)?).map_err(|e| format!("planning: {e}"))?;
     let sql = planned.to_sql();
     let plan_file = dir.join("plan.sql");
     let write = bless() && should_write_plan(postgres_dsn().is_some(), name, known);
@@ -112,6 +118,28 @@ fn run_case(name: &str, dir: &Path, known: &BTreeSet<String>) -> Result<(), Stri
         return Err("diff of the desired state with itself is not empty".into());
     }
     Ok(())
+}
+
+/// The changes from `a` to `b` (loaded into `sh` from `to_sql`) with the hints `to_sql` carries.
+fn changes_with_hints(a: &Model, b: &Model, to_sql: &str, sh: &mut pgmig::Shadow) -> Result<Vec<Change>, String> {
+    let hints = rename_hints(Path::new("to.sql"), to_sql).map_err(|e| e.to_string())?;
+    let renames: Vec<Change> = resolve(a, b, &hints).applied.into_iter().map(|(_, c)| c).collect();
+    if renames.is_empty() {
+        return Ok(diff_with_casts(a, b, sh.conn()));
+    }
+    // The renames run on a copy of `a` in a database of their own; a real Postgres shadow is one
+    // database, so the copy gets another.
+    let (spec, _db) = match postgres_dsn() {
+        None => (ShadowSpec::Pgmem, None),
+        Some(_) => {
+            let db = TestDb::new();
+            (ShadowSpec::Postgres(db.conninfo.clone()), Some(db))
+        }
+    };
+    let renamed = renamed_copy(a, &renames, &spec).map_err(|e| format!("renaming a copy of from.sql: {e}"))?;
+    let mut changes = renames;
+    changes.extend(diff_with_casts(&renamed, b, sh.conn()));
+    Ok(changes)
 }
 
 fn bless() -> bool {
