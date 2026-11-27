@@ -18,9 +18,15 @@ ignore = []
 confidence-threshold = 0.93
 allow = [
     "Apache-2.0",
+    "BSD-3-Clause",
+    "ISC",
     "MIT",
     "Unicode-3.0",
     "Zlib",
+]
+# The bundled Mozilla root certificates (TLS without `sslrootcert`) are published as data.
+exceptions = [
+    { crate = "webpki-roots", allow = ["CDLA-Permissive-2.0"] },
 ]
 
 [bans]
@@ -29,7 +35,10 @@ multiple-versions = "deny"
 wildcards = "deny"
 allow-wildcard-paths = true
 highlight = "all"
-skip = []
+skip = [
+    # ring 0.17 (rustls' provider without aws-lc) still depends on getrandom 0.2.
+    { crate = "getrandom@0.2", reason = "ring 0.17 has not moved past getrandom 0.2" },
+]
 deny = [
     { crate = "openssl-sys", reason = "TLS goes through rustls; keep the build pure Rust" },
     { crate = "aws-lc-sys", reason = "keep the build pure Rust" },

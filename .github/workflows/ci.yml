@@ -125,6 +125,48 @@ jobs:
         env:
           PGMIG_TEST_DSN: host=127.0.0.1 port=5432 user=postgres
 
+  # TLS against Postgres 18 with a throwaway CA: verify-full connects with the right root and is
+  # refused with a wrong one (tests in crates/pgmig-conn/tests/it/tls.rs, skipped elsewhere).
+  tls:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: test
+          cache-on-failure: true
+          save-if: false
+      - uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2.90.7
+        with:
+          tool: cargo-nextest
+      - name: Start Postgres 18 with TLS
+        run: |
+          scripts/tls-test-certs.sh "$RUNNER_TEMP/tls"
+          # Postgres refuses a key others can read; 999 is the image's postgres user.
+          sudo chown 999:999 "$RUNNER_TEMP/tls/server.key"
+          sudo chmod 600 "$RUNNER_TEMP/tls/server.key"
+          docker run -d --name pg-tls -p 5433:5432 \
+            -e POSTGRES_HOST_AUTH_METHOD=trust \
+            -v "$RUNNER_TEMP/tls:/tls:ro" \
+            postgres:18 \
+            -c ssl=on -c ssl_cert_file=/tls/server.pem -c ssl_key_file=/tls/server.key
+          # Over TCP: the entrypoint's init server listens on the Unix socket only.
+          for _ in $(seq 60); do
+            if docker exec pg-tls pg_isready -h localhost -U postgres; then exit 0; fi
+            sleep 1
+          done
+          docker logs pg-tls
+          exit 1
+      - run: cargo nextest run --locked -p pgmig-conn --cargo-profile ci --profile ci
+        env:
+          PGMIG_TEST_TLS_DSN: port=5433 user=postgres
+          PGMIG_TEST_TLS_ROOT: ${{ runner.temp }}/tls/ca.pem
+          PGMIG_TEST_TLS_WRONG_ROOT: ${{ runner.temp }}/tls/wrong.pem
+
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 20

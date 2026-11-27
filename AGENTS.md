@@ -10,7 +10,8 @@ Milestones: [docs/ROADMAP.md](docs/ROADMAP.md).
 - New dependencies go in root `[workspace.dependencies]` with `default-features = false` and only
   the features used; crates reference them with `{ workspace = true }`.
 - One version of every crate (`deny.toml`, enforced by the CI `deny` job). Versions shared with
-  pgmem (`postgres`, `tokio`) must match pgmem's. Pure Rust only: no C toolchain, no OpenSSL.
+  pgmem (`postgres`, `tokio`) must match pgmem's. No OpenSSL and no system libraries: Rust crates only, except
+  build-time C compiled by `cc` (`ring`, for TLS).
 - pgmem comes from crates.io. Bump it in root `Cargo.toml` when pgmig needs a newer release.
 - Every behaviour is checked against real Postgres: tests run on pgmem by default and on real
   Postgres when `PGMIG_TEST_DSN` is set (CI job `postgres`, versions 15 and later). A test that

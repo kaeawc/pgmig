@@ -78,6 +78,9 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
 - Library API with serde types (`pgmig::api`): one request and response per command, `Model`,
   `Change` and `Plan` serializable, structured errors (including apply outcomes), and unknown request
   fields refused. The CLI is a thin formatter over it.
+- TLS for target and shadow connections (rustls, no OpenSSL): `sslmode` disable, prefer (the new
+  default; falls back to plaintext when the handshake fails), require, verify-ca and verify-full,
+  with `sslrootcert` or the bundled Mozilla roots. Building now needs a C compiler (for `ring`).
 - `--include` / `--exclude` globs over `[kind:]schema.object[.column]` on `schema diff`, `inspect`
   and `apply`, applied to both sides. `--schema <name>` manages one schema and prints unqualified
   names; `apply` always executes qualified names.
