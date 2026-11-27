@@ -328,3 +328,19 @@ fn migrate_diff_verify_copies_unmodelled_objects() {
     assert_eq!(err.code, ErrorCode::VerifyFailed, "{err}");
     assert!(err.message.contains("objects outside that (extensions, functions, views, ...) are not copied"), "{err}");
 }
+
+#[test]
+fn schema_mode_does_not_copy_unmanaged_objects_it_does_not_need() {
+    let (spec, _keep) = shadow();
+    let opts = Options { schema: Some("app".into()), ..Options::default() };
+    // `public.u` uses a function pgmig does not model; nothing in `app` needs it.
+    let loaded = "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1'; CREATE TABLE public.u (id int DEFAULT f());\n\
+                  CREATE SCHEMA app; CREATE TABLE app.t (id int);";
+    let db = TestDb::new();
+    db.connect().batch(loaded).expect("load target");
+    let t = Tmp::new();
+    let to = t.sql("to.sql", "CREATE SCHEMA app; CREATE TABLE app.t (id int, v text);");
+    let req = PlanApplyRequest { target: db.conninfo.clone(), desired: to, shadow: spec.clone(), options: opts, verify: true };
+    let res = api::schema_plan_apply(&req).expect("plan and verify");
+    assert_eq!(res.plan.statements.len(), 1, "{:?}", res.plan);
+}

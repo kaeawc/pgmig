@@ -15,8 +15,11 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
   migration written; JSON errors carry code `verify_failed` and a `verify` object. The copy is
   schema only (no rows), so failures that depend on data (`SET NOT NULL` over NULLs, a unique
   index over duplicates, `USING` casts) are not caught. `migrate diff` replays the migration
-  directory for it; `schema apply` rebuilds it from what pgmig models (the whole target but the
-  revisions schema; extensions, functions and views are not copied). Statements outside any
+  directory for it; `schema apply` rebuilds it from what pgmig models: the objects it
+  manages, what they need (foreign-key target tables, types, sequences and their schemas) and the
+  unmanaged tables with a foreign key to a managed table, so an unmanaged object using something
+  unmodelled does not break setup and dropping a table that an unmanaged one references fails
+  verification as it does for real (extensions, functions and views are not copied). Statements outside any
   schema (`CREATE ROLE`, `ALTER SYSTEM`, ...) in an edited plan or a migration really run, on the
   shadow's server.
 

@@ -119,17 +119,40 @@ pub fn clean_desired(full: &Model, opts: &Options) -> (Model, Vec<Kept>) {
         .map(|t| (t.name.clone(), t))
         .collect();
 
+    let kept = close_needs(full, &mut d);
+    (d, kept)
+}
+
+/// `managed` plus what it needs from `full`, transitively (the closure [`clean_desired`] keeps
+/// for unmanaged objects): schemas, foreign-key target tables, enums, domains, composites and
+/// sequences it uses. Also the unmanaged tables that hold a foreign key to a table of `managed`
+/// (so dropping that table fails for them as it does for real), with what they need; nothing
+/// else unmanaged.
+pub(crate) fn with_needs(full: &Model, managed: &Model) -> Model {
+    let mut d = managed.clone();
+    for (name, t) in &full.tables {
+        let references_managed = t.constraints.iter().any(|k| k.references.as_ref().is_some_and(|r| managed.tables.contains_key(&r.table)));
+        if references_managed && !d.tables.contains_key(name) {
+            d.tables.insert(name.clone(), t.clone());
+        }
+    }
+    close_needs(full, &mut d);
+    d
+}
+
+/// Restore into `d` from `full` everything `d` needs, until nothing is missing; what was restored.
+fn close_needs(full: &Model, d: &mut Model) -> Vec<Kept> {
     let mut kept = Vec::new();
     loop {
         let mut changed = false;
-        for (need, because) in needs(full, &d) {
-            if let Some(object) = restore(full, &mut d, &need) {
+        for (need, because) in needs(full, d) {
+            if let Some(object) = restore(full, d, &need) {
                 kept.push(Kept { object, because });
                 changed = true;
             }
         }
         if !changed {
-            return (d, kept);
+            return kept;
         }
     }
 }
