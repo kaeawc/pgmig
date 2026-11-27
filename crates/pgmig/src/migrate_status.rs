@@ -368,7 +368,7 @@ fn statement_count(d: &MigrationDir, f: &pgmig_migrate::File) -> Result<u32> {
     let path = d.path.join(&f.name);
     let text = std::str::from_utf8(&f.bytes)
         .map_err(|e| Error::Io { path: path.clone(), source: std::io::Error::new(std::io::ErrorKind::InvalidData, e) })?;
-    let sql = pgmig_sql::split(text).map_err(|source| Error::Split { path, source })?;
+    let (sql, _) = crate::migrate_apply::split_migration_text(&path, text)?;
     Ok(u32::try_from(sql.statements.len()).unwrap_or(u32::MAX))
 }
 

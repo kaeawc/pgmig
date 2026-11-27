@@ -28,7 +28,8 @@ pub use drift::{DriftCheck, DriftHistory, Expected, drift_check};
 pub use edit::{EDITED_PLAN, edit_sql, plan_from_sql};
 pub use filter::{Filter, Pattern, PatternError, filter_model, scope_model, without_schema};
 pub use migrate_apply::{
-    ApplyOptions, ExecOrder, FileReport, FileStatus, MigrateApplyReport, MigrationOutcome, StatementTiming, TxMode, migrate_apply,
+    ApplyOptions, ExecOrder, FailedAssertion, FileReport, FileStatus, MigrateApplyReport, MigrationOutcome, StatementTiming, TxMode,
+    migrate_apply,
 };
 pub use migrate_maintain::{
     Guard, ListedMigration, MigrateEdit, MigrateLs, MigrateRebase, MigrateRm, MigrateShow, MissingRevision, RebasedFile, RevisionStatus,
@@ -149,6 +150,21 @@ pub enum Error {
         statement: String,
         /// The server's error, verbatim with its SQLSTATE (boxed: it keeps [`Error`] small).
         source: Box<pgmig_conn::Error>,
+        outcome: MigrationOutcome,
+        /// Files of this run committed before the failing one.
+        applied_files: usize,
+        /// What became of each file of the run.
+        report: Box<MigrateApplyReport>,
+    },
+    /// A pre-migration assertion (`-- pgmig:assert`) of a pending file was not true: nothing of the
+    /// file ran and no revisions row was written.
+    #[error("{}", migrate_apply::assertion_message(.path, .failures, *.outcome, *.applied_files))]
+    AssertionFailed {
+        path: PathBuf,
+        /// The failing assertion; with `-- pgmig:assert any`, every assertion of the group.
+        failures: Vec<FailedAssertion>,
+        /// [`MigrationOutcome::FileRolledBack`], or [`MigrationOutcome::AllRolledBack`] with
+        /// `--tx-mode all`.
         outcome: MigrationOutcome,
         /// Files of this run committed before the failing one.
         applied_files: usize,
@@ -981,12 +997,14 @@ fn replay(dir: &MigrationDir, shadow: &ShadowSpec) -> Result<Shadow> {
     Ok(sh)
 }
 
-/// A migration file of `dir`, split into statements.
+/// A migration file of `dir`, split into statements, without its assertions.
 fn split_migration(dir: &MigrationDir, f: &pgmig_migrate::File) -> Result<pgmig_sql::File> {
     let path = dir.path.join(&f.name);
     let text = std::str::from_utf8(&f.bytes)
         .map_err(|e| Error::Io { path: path.clone(), source: std::io::Error::new(std::io::ErrorKind::InvalidData, e) })?;
-    pgmig_sql::split(text).map_err(|source| Error::Split { path, source })
+    // Assertions (`-- pgmig:assert`) are not statements and the shadow has no data to check them
+    // against: the replay leaves them out.
+    migrate_apply::split_migration_text(&path, text).map(|(file, _)| file)
 }
 
 /// [`replay`] of `dir`, or a fresh shadow database for a directory that does not exist yet.

@@ -8,6 +8,19 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
 
 ### Added
 
+- Pre-migration assertions: a `-- pgmig:assert` line directly above a query (`SELECT`, `WITH`, `VALUES`, `TABLE`) at the top
+  of a migration file makes it an assertion, and `-- pgmig:assert any` puts it in the file's one-of
+  group. Before `migrate apply` runs a pending file (and on every run that starts it, resumes
+  included) it evaluates them read-only on the target: each plain assertion must return true and,
+  when there are `any` assertions, at least one of them; NULL counts as false. Otherwise the run
+  stops with `Error::AssertionFailed` (error code `assertion_failed`) naming the assertion and what
+  it returned: nothing of the file runs and no revisions row is written. Assertions are not
+  statements (not counted in `total`, `applied` or the reports); replay in the shadow database
+  (`migrate diff`, drift, `--verify`, fingerprints), `--dry-run` and `--baseline` skip them. A
+  misplaced or malformed assertion is a directive error; one that errors or returns another shape
+  stops the run like a false one (`error` and `sqlstate` on the failed assertion). Assertions run
+  read-only (also with `--tx-mode all`, in a rolled-back read-only savepoint) and must be
+  side-effect free; they run before a file's `before_sql` hook in the per-file modes.
 - `--if-exists` and `--cascade` on `schema diff`, `schema apply`, `schema plan` and `migrate diff`
   (or `[diff] if_exists = true` and `[diff] cascade = true`; `--no-if-exists` and `--no-cascade`
   override), as `PlanOptions::if_exists` / `cascade` and the `if_exists` / `cascade` fields of the

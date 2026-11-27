@@ -310,3 +310,18 @@ fn replay_refuses_a_misplaced_directive_like_migrate_apply() {
     let r = replay_files(&t, &[("1_t.sql", "CREATE TABLE a (id int);\n-- pgmig:txmode none\nCREATE TABLE b (id int);\n")], &spec);
     assert!(matches!(r, Err(Error::Directive { .. })), "{r:?}");
 }
+
+/// Replay skips assertions: the shadow has no data (the first one would fail).
+#[test]
+fn replay_ignores_assertions() {
+    let (spec, _db) = shadow();
+    let t = Tmp::new();
+    let sql = "-- pgmig:assert\nSELECT false;\n-- pgmig:assert any\nSELECT false;\nCREATE TABLE a (id int);\n";
+    let plan = replay_files(&t, &[("1_a.sql", sql)], &spec).expect("replay");
+    assert!(plan.statements.iter().any(|s| s.contains("DROP TABLE")), "the table the file made is part of the replayed state: {plan:?}");
+
+    // A misplaced assertion is refused as `migrate apply` does.
+    let t2 = Tmp::new();
+    let r = replay_files(&t2, &[("1_a.sql", "CREATE TABLE a (id int);\n-- pgmig:assert\nSELECT true;\n")], &spec);
+    assert!(matches!(r, Err(Error::Directive { .. })), "{r:?}");
+}

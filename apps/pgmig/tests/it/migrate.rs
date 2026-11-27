@@ -415,3 +415,19 @@ fn diff_verify_checks_the_migration_before_writing_it() {
     assert!(stderr(&out).starts_with("verified: in the shadow database the migration makes the desired state\nwrote "), "{}", stderr(&out));
     assert_eq!(sql_files(&dir).len(), 1);
 }
+
+#[test]
+fn apply_stops_at_a_failing_assertion() {
+    let db = TestDb::new();
+    let d = Dir::new(&[(M1, "-- pgmig:assert\nSELECT false;\nCREATE TABLE a (id int);\n")]);
+    assert_eq!(pgmig(&["migrate", "hash", "--dir", &d.arg()]).status.code(), Some(0));
+    let out = pgmig(&["migrate", "apply", "--url", &db.conninfo, "--dir", &d.arg()]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(stderr(&out).contains("assertion failed: SELECT false returned false"), "{}", stderr(&out));
+    let out = pgmig(&["migrate", "apply", "--url", &db.conninfo, "--dir", &d.arg(), "--format", "json"]);
+    assert_eq!(out.status.code(), Some(1));
+    let json = parse(&out);
+    assert_eq!((json["code"].as_str(), json["line"].as_u64()), (Some("assertion_failed"), Some(2)));
+    assert_eq!(json["migration"]["outcome"], "file_rolled_back");
+    assert_eq!(db.connect().query("SELECT to_regclass('a')::text").expect("query")[0][0], None);
+}
