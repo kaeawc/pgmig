@@ -8,6 +8,9 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
 
 ### Added
 
+- `schema clean` warns before cleaning a database that is not on this machine (the target names a
+  host other than a Unix socket, `localhost` or a loopback address, and the server does not report
+  a loopback address); the JSON response carries `local` and `server_address`.
 - Migration files and `pgmig.sum` are written crash-safely: synced temporary files moved into
   place, so a file never appears partly written under its final name. Commands that write into
   the migration directory (`migrate diff`, `new`, `baseline`, `hash`, `edit`, `rm`, `rebase`) lock it (`.pgmig.lock`, safe to ignore in version

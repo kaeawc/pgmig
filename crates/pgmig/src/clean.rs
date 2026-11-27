@@ -34,6 +34,12 @@ pub struct Kept {
 pub struct SchemaClean {
     /// `current_database()` of the target: what the confirmation prompt asks for.
     pub database: String,
+    /// The address the server accepted the connection on (`inet_server_addr()`); `None` over a
+    /// Unix socket.
+    pub server_address: Option<String>,
+    /// Whether the server is on this machine: a Unix socket or a loopback address. A cleaning
+    /// prompt warns when it is not, so a copied production URL stands out.
+    pub local: bool,
     /// The drops, schema-qualified.
     pub plan: Plan,
     pub changes: Vec<Change>,
@@ -47,12 +53,33 @@ pub fn schema_plan_clean(target: &str, opts: &Options) -> Result<SchemaClean> {
     opts.validate()?;
     let mut conn = Conn::connect(target)?;
     let full = inspect(&mut conn)?;
-    let database =
-        conn.query("SELECT current_database()")?.into_iter().next().and_then(|r| r.into_iter().next().flatten()).unwrap_or_default();
+    let first = |rows: Vec<pgmig_conn::Row>| rows.into_iter().next().and_then(|r| r.into_iter().next().flatten());
+    let database = first(conn.query("SELECT current_database()")?).unwrap_or_default();
+    // pgmem has no inet_server_addr() (kaeawc/pgmem#255): its address is then unknown, and the
+    // target's host alone decides.
+    let (server_address, server_local) = match conn.query("SELECT host(inet_server_addr())") {
+        // NULL: a Unix socket.
+        Ok(rows) => {
+            let addr = first(rows);
+            let local = addr.as_deref().is_none_or(is_loopback);
+            (addr, local)
+        }
+        Err(e) if e.code.as_deref() == Some("42883") => (None, false),
+        Err(e) => return Err(e.into()),
+    };
+    // Local when the target names only this machine (a published container port reports the
+    // container's address) or the server says so (a name that resolves to loopback).
+    let local = Conn::is_local_target(target)? || server_local;
     let (desired, kept) = clean_desired(&full, opts);
     let changes = diff(&opts.managed(&full), &opts.managed(&desired));
     let plan = plan_with(&changes, &PlanOptions::default())?;
-    Ok(SchemaClean { database, plan, changes, kept })
+    Ok(SchemaClean { database, server_address, local, plan, changes, kept })
+}
+
+/// Whether `addr` (as `host(inet)` prints it) is a loopback address: `127.0.0.0/8`, `::1` or an
+/// IPv4-mapped `::ffff:127.x.y.z`.
+fn is_loopback(addr: &str) -> bool {
+    addr.parse::<std::net::IpAddr>().is_ok_and(|ip| pgmig_conn::is_loopback(&ip))
 }
 
 /// Whether `answer` (a line typed at the prompt) confirms cleaning `database`: the database name
@@ -240,6 +267,16 @@ mod tests {
     use super::*;
     use crate::Filter;
     use pgmig_model::{Enum, Schema};
+
+    #[test]
+    fn loopback_addresses() {
+        for a in ["127.0.0.1", "127.1.2.3", "::1", "::ffff:127.0.0.1"] {
+            assert!(is_loopback(a), "{a}");
+        }
+        for a in ["10.0.0.5", "192.168.1.1", "::ffff:10.0.0.1", "2001:db8::1", "", "localhost"] {
+            assert!(!is_loopback(a), "{a}");
+        }
+    }
 
     fn col(name: &str, type_ref: Option<QualName>) -> Column {
         Column {

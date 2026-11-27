@@ -1340,6 +1340,13 @@ fn schema_clean(
         std::io::stdout().flush()?;
         eprintln!("Target: {} (from {}), database {}", target.display, target.source, res.database);
     }
+    if !res.local && !json {
+        eprintln!(
+            "warning: database {} is not on this machine (server address {}); check this is not a shared or production database",
+            res.database,
+            res.server_address.as_deref().unwrap_or("unknown"),
+        );
+    }
     if dry_run {
         if json {
             print_json(&CleanOutput { target, plan: res, applied: false, report: None })?;

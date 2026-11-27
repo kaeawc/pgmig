@@ -160,6 +160,13 @@ pub struct CleanPlanRequest {
 pub struct CleanPlanResponse {
     /// `current_database()` of the target, which the CLI asks to be typed to confirm.
     pub database: String,
+    /// The address the server accepted the connection on; absent over a Unix socket.
+    #[serde(default)]
+    pub server_address: Option<String>,
+    /// Whether the server is on this machine (a Unix socket or a loopback address). The CLI warns
+    /// before cleaning a database that is not.
+    #[serde(default)]
+    pub local: bool,
     /// The plan to pass to [`apply`]: schema-qualified.
     pub plan: Plan,
     pub changes: Vec<Change>,
@@ -1061,7 +1068,15 @@ pub fn schema_plan_apply(req: &PlanApplyRequest) -> Result<PlanApplyResponse, Ap
 /// [`crate::schema_plan_clean`].
 pub fn schema_plan_clean(req: &CleanPlanRequest) -> Result<CleanPlanResponse, ApiError> {
     let c = crate::schema_plan_clean(&req.target, &req.options)?;
-    Ok(CleanPlanResponse { database: c.database, sql: c.plan.to_sql(), plan: c.plan, changes: c.changes, kept: c.kept })
+    Ok(CleanPlanResponse {
+        database: c.database,
+        server_address: c.server_address,
+        local: c.local,
+        sql: c.plan.to_sql(),
+        plan: c.plan,
+        changes: c.changes,
+        kept: c.kept,
+    })
 }
 
 /// [`crate::edit_sql`] on the plan's SQL, then [`crate::plan_from_sql`] on what was saved.
