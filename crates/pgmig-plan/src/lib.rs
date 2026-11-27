@@ -62,7 +62,10 @@
 //! lock instead of one held for the whole build. The two steps take the constraint's place in the
 //! order: after the columns it uses are added and set (those statements commit before the build
 //! starts), and before the foreign keys that reference it. The plain `ADD CONSTRAINT` stays for a
-//! constraint on a table the plan creates or drops, on a partitioned table (Postgres allows neither
+//! constraint on a table the plan creates or drops, on a table that loses a primary key or unique
+//! constraint in the same plan (a replaced key stays in one transaction, so the table never goes
+//! without it, or without the foreign keys to it, while an index builds), for a key in a
+//! tablespace (`pg_get_indexdef` leaves the tablespace out), on a partitioned table (Postgres allows neither
 //! `CONCURRENTLY` nor `USING INDEX` there; [`pgmig_model::Constraint::on_partitioned_table`]), for
 //! an exclusion constraint, and for an index `USING INDEX` cannot take (not a b-tree, such as a key
 //! `WITHOUT OVERLAPS`). A primary key needs its columns `NOT NULL`, and `USING INDEX` sets what is
@@ -291,19 +294,42 @@ pub fn plan_with(changes: &[Change], opts: &PlanOptions) -> Result<Plan, Error> 
             _ => None,
         })
         .collect();
+    // Tables that lose a primary key or unique constraint in the plan: a key added there keeps the
+    // plain `ADD CONSTRAINT`, so the old key is replaced in one transaction instead of the table
+    // going without it (and without foreign keys to it) while a new index builds.
+    let rekeyed: BTreeSet<&QualName> = changes
+        .iter()
+        .filter_map(|c| match c {
+            Change::DropConstraint { table, constraint }
+                if matches!(constraint.kind, ConstraintKind::PrimaryKey | ConstraintKind::Unique) =>
+            {
+                Some(table)
+            }
+            _ => None,
+        })
+        .collect();
+    let tables = Tables { whole, rekeyed };
     let (adds, rest): (Vec<&Change>, Vec<&Change>) = changes.iter().partition(|c| matches!(c, Change::AddEnumValue { .. }));
     let mut plan = Plan::default();
-    for step in sorted(&adds, opts, &whole)?.into_iter().flatten() {
+    for step in sorted(&adds, opts, &tables)?.into_iter().flatten() {
         plan.statements.push(step.sql);
     }
     plan.commit_after = (!plan.statements.is_empty() && !rest.is_empty()).then(|| plan.statements.len() - 1);
-    for step in sorted(&rest, opts, &whole)?.into_iter().flatten() {
+    for step in sorted(&rest, opts, &tables)?.into_iter().flatten() {
         if step.non_transactional {
             plan.non_transactional.push(plan.statements.len());
         }
         plan.statements.push(step.sql);
     }
     Ok(plan)
+}
+
+/// What the plan does to whole tables, which decides where the concurrent-index policy applies.
+struct Tables<'a> {
+    /// Tables the plan creates or drops: their indexes are not built or dropped concurrently.
+    whole: BTreeSet<&'a QualName>,
+    /// Tables that lose a primary key or unique constraint (see [`plan_with`]).
+    rekeyed: BTreeSet<&'a QualName>,
 }
 
 /// A planned statement.
@@ -314,11 +340,11 @@ struct Step {
 }
 
 /// `change` as steps: one statement, or with the policy, two for a key built concurrently (see
-/// [`using_index`]). `whole` holds the tables the plan creates or drops, whose indexes are not
-/// built or dropped concurrently.
-fn steps(change: &Change, opts: &PlanOptions, whole: &BTreeSet<&QualName>) -> Vec<Step> {
+/// [`using_index`]).
+fn steps(change: &Change, opts: &PlanOptions, tables: &Tables) -> Vec<Step> {
+    let whole = &tables.whole;
     if opts.concurrent_indexes
-        && let Some(pair) = using_index(change, opts, whole)
+        && let Some(pair) = using_index(change, opts, tables)
     {
         return Vec::from(pair);
     }
@@ -354,17 +380,24 @@ fn concurrent_create(sql: &str) -> Option<String> {
 /// A primary key or unique constraint added to a table that exists before the plan, as two steps:
 /// its index built `CONCURRENTLY` under the constraint's name, outside a transaction, then `ADD
 /// CONSTRAINT ... USING INDEX` (see the module doc). `None` when the constraint keeps the plain
-/// `ADD CONSTRAINT`: another kind, a table the plan creates or drops, a partitioned table, or an
+/// `ADD CONSTRAINT`: another kind, a table the plan creates or drops, a table that loses a primary
+/// key or unique constraint in the plan (the replacement stays in one transaction), a key in a
+/// tablespace (`USING INDEX TABLESPACE`), a partitioned table, or an
 /// index `USING INDEX` cannot take (not a b-tree, as a key `WITHOUT OVERLAPS` is) or not in the form
 /// the server prints.
-fn using_index(change: &Change, opts: &PlanOptions, whole: &BTreeSet<&QualName>) -> Option<[Step; 2]> {
+fn using_index(change: &Change, opts: &PlanOptions, tables: &Tables) -> Option<[Step; 2]> {
     let Change::AddConstraint { table, constraint: c } = change else { return None };
     let kind = match c.kind {
         ConstraintKind::PrimaryKey => "PRIMARY KEY",
         ConstraintKind::Unique => "UNIQUE",
         ConstraintKind::Check | ConstraintKind::ForeignKey | ConstraintKind::Exclusion => return None,
     };
-    if c.on_partitioned_table || whole.contains(table) {
+    if c.on_partitioned_table || tables.whole.contains(table) || tables.rekeyed.contains(table) {
+        return None;
+    }
+    // `pg_get_indexdef` leaves out the tablespace a key's index is in, so the index built from it
+    // would not match the constraint.
+    if c.definition.contains(" USING INDEX TABLESPACE ") {
         return None;
     }
     let index = c.index_definition.as_deref()?;
@@ -388,10 +421,10 @@ fn using_index(change: &Change, opts: &PlanOptions, whole: &BTreeSet<&QualName>)
     ])
 }
 
-fn sorted(changes: &[&Change], opts: &PlanOptions, whole: &BTreeSet<&QualName>) -> Result<Vec<Vec<Step>>, Error> {
+fn sorted(changes: &[&Change], opts: &PlanOptions, tables: &Tables) -> Result<Vec<Vec<Step>>, Error> {
     let nodes: Vec<Node> = changes.iter().map(|c| Node { phase: phase(c), deps: deps(c) }).collect();
     match graph::sort(&nodes) {
-        Ok(order) => Ok(order.into_iter().map(|i| steps(changes[i], opts, whole)).collect()),
+        Ok(order) => Ok(order.into_iter().map(|i| steps(changes[i], opts, tables)).collect()),
         Err(graph::Cycle(steps)) => Err(Error::Cycle(steps.into_iter().map(|i| statement(changes[i], opts)).collect())),
     }
 }
@@ -2470,6 +2503,18 @@ mod tests {
         let mut exclusion = constraint("t_x_excl", pgmig_model::ConstraintKind::Exclusion, "EXCLUDE USING gist (x WITH =)", &["x"]);
         exclusion.index_definition = None;
         plain(add_constraint("t", exclusion));
+        // In a tablespace, which `pg_get_indexdef` leaves out.
+        plain(add_constraint("t", Constraint { definition: "UNIQUE (x) USING INDEX TABLESPACE ts".into(), ..unique_key("t") }));
+    }
+
+    #[test]
+    fn a_key_replacing_another_on_the_same_table_stays_in_one_transaction() {
+        let old = Constraint { definition: "UNIQUE (y)".into(), ..unique_key("t") };
+        let changes =
+            [Change::DropConstraint { table: QualName::new("public", "t"), constraint: old }, add_constraint("t", unique_key("t"))];
+        let planned = plan_with(&changes, &concurrent()).expect("plan");
+        assert!(planned.non_transactional.is_empty(), "{:?}", planned.statements);
+        assert_eq!(planned.statements.last().map(String::as_str), Some("ALTER TABLE public.t ADD CONSTRAINT t_x_key UNIQUE (x)"));
     }
 
     #[test]

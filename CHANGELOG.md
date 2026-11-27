@@ -32,7 +32,9 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
   CONSTRAINT <name> {PRIMARY KEY | UNIQUE} USING INDEX <name>` (keeping `DEFERRABLE` and `INITIALLY
   DEFERRED`) in a transaction. The build runs after the columns the key uses are added and set, and
   the foreign keys that reference the key are added after it is attached. Keys on tables the plan
-  creates, on partitioned tables, and exclusion constraints keep the plain `ADD CONSTRAINT`. A
+  creates, on tables that lose a key in the same plan (a replaced key stays in one transaction),
+  keys `USING INDEX TABLESPACE`, keys on partitioned tables, and exclusion constraints keep the
+  plain `ADD CONSTRAINT`. A
   failed build says how to remove the `INVALID` index it may leave, as for other concurrent builds.
   Skipping `add_constraint` skips both steps; skipping `create_index` does not touch them. The
   inspected `Constraint` gains `index_definition` (`pg_get_indexdef` of the index a primary key or
