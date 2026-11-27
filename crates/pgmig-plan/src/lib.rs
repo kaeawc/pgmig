@@ -53,6 +53,14 @@
 //! [`pgmig_model::Index::on_partitioned_table`]). A `CONCURRENTLY` build that fails leaves an
 //! `INVALID` index behind; `DROP INDEX CONCURRENTLY` removes it.
 //!
+//! [`PlanOptions::if_exists`] writes `IF NOT EXISTS` on the creates Postgres has it for (`CREATE
+//! SCHEMA`, `TABLE`, `SEQUENCE`, `INDEX [CONCURRENTLY]`, `ADD COLUMN`) and `IF EXISTS` on drops
+//! (`DROP SCHEMA`, `TABLE`, `SEQUENCE`, `INDEX`, `TYPE`, `DOMAIN`, `DROP COLUMN`, `DROP
+//! CONSTRAINT`, `DROP ATTRIBUTE`); `CREATE TYPE`, `CREATE DOMAIN` and `ADD CONSTRAINT` have no such
+//! form and stay as they are. [`PlanOptions::cascade`] writes `CASCADE` on the drops except `DROP
+//! ATTRIBUTE` and `DROP INDEX CONCURRENTLY` (which has none); it can drop objects outside the diff
+//! (views, functions) without listing them.
+//!
 //! The policy also adds a primary key or unique constraint to a table that exists before the plan
 //! in two steps: `CREATE UNIQUE INDEX CONCURRENTLY` builds its index under the constraint's name,
 //! in a unit of its own outside a transaction (the statement is
@@ -279,6 +287,20 @@ pub struct PlanOptions {
     /// it with `USING INDEX` (see the module doc). Absent from older JSON: false.
     #[serde(default)]
     pub concurrent_indexes: bool,
+    /// `IF NOT EXISTS` on the creating statements Postgres has it for (`CREATE SCHEMA`, `CREATE
+    /// TABLE`, `CREATE SEQUENCE`, `CREATE INDEX`, `ADD COLUMN`) and `IF EXISTS` on dropping ones
+    /// (`DROP SCHEMA`/`TABLE`/`SEQUENCE`/`INDEX`/`TYPE`/`DOMAIN`, `DROP COLUMN`, `DROP CONSTRAINT`,
+    /// `DROP ATTRIBUTE`), so a plan can run again over a database it was partly applied to.
+    /// Postgres has no `IF NOT EXISTS` for `CREATE TYPE`, `CREATE DOMAIN` or `ADD CONSTRAINT`:
+    /// those stay as they are. Absent from older JSON: false.
+    #[serde(default)]
+    pub if_exists: bool,
+    /// `CASCADE` on `DROP SCHEMA`/`TABLE`/`SEQUENCE`/`INDEX`/`TYPE`/`DOMAIN` and on `DROP COLUMN`
+    /// and `DROP CONSTRAINT`: Postgres then also drops what depends on the object (views,
+    /// functions, objects outside the diff's scope) without listing it. Not on `DROP INDEX
+    /// CONCURRENTLY`, which has no `CASCADE`. Absent from older JSON: false.
+    #[serde(default)]
+    pub cascade: bool,
 }
 
 impl PlanOptions {
@@ -395,7 +417,7 @@ fn steps(change: &Change, opts: &PlanOptions, tables: &Tables) -> Vec<Step> {
     }
     let sql = statement(change, opts);
     if opts.concurrent_indexes
-        && let Some(sql) = concurrently(change, &sql, whole)
+        && let Some(sql) = concurrently(change, &sql, whole, opts)
     {
         return vec![Step { sql, non_transactional: true }];
     }
@@ -404,10 +426,14 @@ fn steps(change: &Change, opts: &PlanOptions, tables: &Tables) -> Vec<Step> {
 
 /// The `CONCURRENTLY` form of `sql`, the statement for `change`, when the policy applies to it
 /// (see the module doc).
-fn concurrently(change: &Change, sql: &str, whole: &BTreeSet<&QualName>) -> Option<String> {
+fn concurrently(change: &Change, sql: &str, whole: &BTreeSet<&QualName>, opts: &PlanOptions) -> Option<String> {
     match change {
-        Change::CreateIndex { table, index } if !index.on_partitioned_table && !whole.contains(table) => concurrent_create(sql),
+        Change::CreateIndex { table, index } if !index.on_partitioned_table && !whole.contains(table) => {
+            concurrent_create(sql, opts.if_exists)
+        }
         Change::DropIndex { table, index } if !index.on_partitioned_table && !whole.contains(table) => {
+            // `DROP INDEX CONCURRENTLY` has no `CASCADE`.
+            let sql = sql.strip_suffix(" CASCADE").unwrap_or(sql);
             sql.strip_prefix("DROP INDEX ").map(|rest| format!("DROP INDEX CONCURRENTLY {rest}"))
         }
         _ => None,
@@ -416,10 +442,13 @@ fn concurrently(change: &Change, sql: &str, whole: &BTreeSet<&QualName>) -> Opti
 
 /// `CREATE [UNIQUE] INDEX CONCURRENTLY ...` for a `CREATE [UNIQUE] INDEX ...` statement in the form
 /// the server prints; `None` for one that is not in that form.
-fn concurrent_create(sql: &str) -> Option<String> {
+fn concurrent_create(sql: &str, if_not_exists: bool) -> Option<String> {
     let rest = sql.strip_prefix("CREATE UNIQUE INDEX ").map(|r| ("CREATE UNIQUE INDEX", r));
     let (head, rest) = rest.or_else(|| sql.strip_prefix("CREATE INDEX ").map(|r| ("CREATE INDEX", r)))?;
-    Some(format!("{head} CONCURRENTLY {rest}"))
+    // `sql` may already carry `IF NOT EXISTS` (see `create_index_if_not_exists`).
+    let rest = rest.strip_prefix("IF NOT EXISTS ").unwrap_or(rest);
+    let ine = if if_not_exists { " IF NOT EXISTS" } else { "" };
+    Some(format!("{head} CONCURRENTLY{ine} {rest}"))
 }
 
 /// A primary key or unique constraint added to a table that exists before the plan, as two steps:
@@ -458,7 +487,7 @@ fn using_index(change: &Change, opts: &PlanOptions, tables: &Tables) -> Option<[
         (true, true) => " DEFERRABLE INITIALLY DEFERRED",
     };
     Some([
-        Step { sql: concurrent_create(index)?, non_transactional: true },
+        Step { sql: concurrent_create(index, opts.if_exists)?, non_transactional: true },
         Step {
             sql: format!("ALTER TABLE {} ADD CONSTRAINT {name} {kind} USING INDEX {name}{timing}", opts.name(table)),
             non_transactional: false,
@@ -1083,28 +1112,46 @@ fn identity_clause(type_name: &str, identity: &Identity) -> String {
     s
 }
 
+/// `sql`, a `CREATE [UNIQUE] INDEX name ...` statement as the server prints it, with `IF NOT EXISTS`
+/// after the keywords when the policy asks for it (and the statement is in that form).
+fn create_index_if_not_exists(sql: &str, opts: &PlanOptions) -> String {
+    if !opts.if_exists {
+        return sql.to_owned();
+    }
+    for head in ["CREATE UNIQUE INDEX ", "CREATE INDEX "] {
+        if let Some(rest) = sql.strip_prefix(head) {
+            return format!("{head}IF NOT EXISTS {rest}");
+        }
+    }
+    sql.to_owned()
+}
+
 fn statement(change: &Change, opts: &PlanOptions) -> String {
     let n = |q: &QualName| opts.name(q);
+    let ine = if opts.if_exists { " IF NOT EXISTS" } else { "" };
+    let ie = if opts.if_exists { " IF EXISTS" } else { "" };
+    let cascade = if opts.cascade { " CASCADE" } else { "" };
+    let drop = |kind: &str, name: String| format!("DROP {kind}{ie} {name}{cascade}");
     match change {
-        Change::CreateSchema(name) => format!("CREATE SCHEMA {}", quote_ident(name)),
-        Change::DropSchema(name) => format!("DROP SCHEMA {}", quote_ident(name)),
+        Change::CreateSchema(name) => format!("CREATE SCHEMA{ine} {}", quote_ident(name)),
+        Change::DropSchema(name) => drop("SCHEMA", quote_ident(name)),
         Change::CreateTable(t) => {
             let mut cols: Vec<String> = t.columns.iter().map(|c| format!("    {}", column_def(c))).collect();
             cols.extend(t.constraints.iter().map(|c| format!("    {}", constraint_def(c))));
             let body = if cols.is_empty() { String::new() } else { format!("(\n{}\n)", cols.join(",\n")) };
             // A partition has its parent's columns: only its own constraints are written.
             let mut s = match &t.partition_of {
-                Some(p) if body.is_empty() => format!("CREATE TABLE {} PARTITION OF {} {}", n(&t.name), n(&p.parent), p.bound),
-                Some(p) => format!("CREATE TABLE {} PARTITION OF {} {body} {}", n(&t.name), n(&p.parent), p.bound),
-                None if body.is_empty() => format!("CREATE TABLE {} ()", n(&t.name)),
-                None => format!("CREATE TABLE {} {body}", n(&t.name)),
+                Some(p) if body.is_empty() => format!("CREATE TABLE{ine} {} PARTITION OF {} {}", n(&t.name), n(&p.parent), p.bound),
+                Some(p) => format!("CREATE TABLE{ine} {} PARTITION OF {} {body} {}", n(&t.name), n(&p.parent), p.bound),
+                None if body.is_empty() => format!("CREATE TABLE{ine} {} ()", n(&t.name)),
+                None => format!("CREATE TABLE{ine} {} {body}", n(&t.name)),
             };
             if let Some(key) = &t.partition_key {
                 s.push_str(&format!(" PARTITION BY {key}"));
             }
             s
         }
-        Change::DropTable { table: t, .. } => format!("DROP TABLE {}", n(&t.name)),
+        Change::DropTable { table: t, .. } => drop("TABLE", n(&t.name)),
         Change::DetachPartition { table, parent, .. } => format!("ALTER TABLE {} DETACH PARTITION {}", n(parent), n(table)),
         Change::AttachPartition { table, partition_of: p, .. } => {
             format!("ALTER TABLE {} ATTACH PARTITION {} {}", n(&p.parent), n(table), p.bound)
@@ -1114,9 +1161,9 @@ fn statement(change: &Change, opts: &PlanOptions) -> String {
             let labels: Vec<String> = e.labels.iter().map(|l| quote_literal(l)).collect();
             format!("CREATE TYPE {} AS ENUM ({})", n(&e.name), labels.join(", "))
         }
-        Change::DropEnum(e) => format!("DROP TYPE {}", n(&e.name)),
+        Change::DropEnum(e) => drop("TYPE", n(&e.name)),
         Change::CreateSequence(seq) => {
-            let mut s = format!("CREATE SEQUENCE {}", n(&seq.name));
+            let mut s = format!("CREATE SEQUENCE{ine} {}", n(&seq.name));
             if seq.data_type != "bigint" {
                 s.push_str(&format!(" AS {}", seq.data_type));
             }
@@ -1126,7 +1173,7 @@ fn statement(change: &Change, opts: &PlanOptions) -> String {
             }
             s
         }
-        Change::DropSequence(seq) => format!("DROP SEQUENCE {}", n(&seq.name)),
+        Change::DropSequence(seq) => drop("SEQUENCE", n(&seq.name)),
         Change::AlterSequence { from, to } => {
             let retyped = from.data_type != to.data_type;
             let mut s = format!("ALTER SEQUENCE {}", n(&to.name));
@@ -1195,7 +1242,7 @@ fn statement(change: &Change, opts: &PlanOptions) -> String {
             }
             s
         }
-        Change::DropDomain(d) => format!("DROP DOMAIN {}", n(&d.name)),
+        Change::DropDomain(d) => drop("DOMAIN", n(&d.name)),
         Change::SetDomainDefault { name, default } => format!("ALTER DOMAIN {} SET DEFAULT {default}", n(name)),
         Change::DropDomainDefault { name } => format!("ALTER DOMAIN {} DROP DEFAULT", n(name)),
         Change::SetDomainNotNull { name } => format!("ALTER DOMAIN {} SET NOT NULL", n(name)),
@@ -1218,19 +1265,19 @@ fn statement(change: &Change, opts: &PlanOptions) -> String {
                 format!("CREATE TYPE {} AS (\n{}\n)", n(&c.name), attributes.join(",\n"))
             }
         }
-        Change::DropCompositeType(c) => format!("DROP TYPE {}", n(&c.name)),
+        Change::DropCompositeType(c) => drop("TYPE", n(&c.name)),
         Change::AddAttribute { composite, attribute } => {
             format!("ALTER TYPE {} ADD ATTRIBUTE {} {}", n(composite), quote_ident(&attribute.name), attribute.type_clause())
         }
         Change::DropAttribute { composite, attribute, .. } => {
-            format!("ALTER TYPE {} DROP ATTRIBUTE {}", n(composite), quote_ident(attribute))
+            format!("ALTER TYPE {} DROP ATTRIBUTE{ie} {}", n(composite), quote_ident(attribute))
         }
         Change::AlterAttributeType { composite, attribute, type_name, collation, .. } => {
             let collate = collation.as_ref().map(|c| format!(" COLLATE {c}")).unwrap_or_default();
             format!("ALTER TYPE {} ALTER ATTRIBUTE {} TYPE {type_name}{collate}", n(composite), quote_ident(attribute))
         }
-        Change::AddColumn { table, column } => format!("ALTER TABLE {} ADD COLUMN {}", n(table), column_def(column)),
-        Change::DropColumn { table, column, .. } => format!("ALTER TABLE {} DROP COLUMN {}", n(table), quote_ident(column)),
+        Change::AddColumn { table, column } => format!("ALTER TABLE {} ADD COLUMN{ine} {}", n(table), column_def(column)),
+        Change::DropColumn { table, column, .. } => format!("ALTER TABLE {} DROP COLUMN{ie} {}{cascade}", n(table), quote_ident(column)),
         Change::AlterColumnType { table, column, type_name, using, .. } => {
             let using = using.as_ref().map(|u| format!(" USING {u}")).unwrap_or_default();
             format!("ALTER TABLE {} ALTER COLUMN {} TYPE {type_name}{using}", n(table), quote_ident(column))
@@ -1243,7 +1290,7 @@ fn statement(change: &Change, opts: &PlanOptions) -> String {
         Change::DropDefault { table, column, .. } => format!("ALTER TABLE {} ALTER COLUMN {} DROP DEFAULT", n(table), quote_ident(column)),
         Change::AddConstraint { table, constraint } => format!("ALTER TABLE {} ADD {}", n(table), constraint_def(constraint)),
         Change::DropConstraint { table, constraint } => {
-            format!("ALTER TABLE {} DROP CONSTRAINT {}", n(table), quote_ident(&constraint.name))
+            format!("ALTER TABLE {} DROP CONSTRAINT{ie} {}{cascade}", n(table), quote_ident(&constraint.name))
         }
         Change::RenameConstraint { table, from, to } => {
             format!("ALTER TABLE {} RENAME CONSTRAINT {} TO {}", n(table), quote_ident(from), quote_ident(&to.name))
@@ -1258,9 +1305,11 @@ fn statement(change: &Change, opts: &PlanOptions) -> String {
         }
         // Postgres prints a partitioned table's index `ON ONLY`, which would build it without its
         // partitions' indexes (and leave it invalid): the plan builds it on all of them. pgmem prints no `ONLY` (kaeawc/pgmem#287).
-        Change::CreateIndex { index, .. } if index.on_partitioned_table => index.definition.replacen(" ON ONLY ", " ON ", 1),
-        Change::CreateIndex { index, .. } => index.definition.clone(),
-        Change::DropIndex { table, index } => format!("DROP INDEX {}", n(&QualName::new(table.schema.clone(), index.name.clone()))),
+        Change::CreateIndex { index, .. } if index.on_partitioned_table => {
+            create_index_if_not_exists(&index.definition.replacen(" ON ONLY ", " ON ", 1), opts)
+        }
+        Change::CreateIndex { index, .. } => create_index_if_not_exists(&index.definition, opts),
+        Change::DropIndex { table, index } => drop("INDEX", n(&QualName::new(table.schema.clone(), index.name.clone()))),
         Change::SetComment { target, comment } => {
             let object = match target {
                 CommentTarget::Schema(s) => format!("SCHEMA {}", quote_ident(s)),
@@ -2708,7 +2757,7 @@ mod tests {
     fn a_quoted_key_name_is_matched_and_kept() {
         let mut c = constraint("T key", pgmig_model::ConstraintKind::Unique, "UNIQUE (x)", &["x"]);
         c.index_definition = Some("CREATE UNIQUE INDEX \"T key\" ON public.t USING btree (x) INCLUDE (y) NULLS NOT DISTINCT".into());
-        let opts = PlanOptions { unqualified_schema: Some("public".into()), concurrent_indexes: true };
+        let opts = PlanOptions { unqualified_schema: Some("public".into()), concurrent_indexes: true, ..PlanOptions::default() };
         let planned = plan_with(&[add_constraint("t", c)], &opts).expect("plan");
         assert_eq!(
             planned.statements,
@@ -2823,7 +2872,7 @@ mod tests {
     #[test]
     fn plan_options_json_without_the_new_field_reads_as_before() {
         let opts: PlanOptions = serde_json::from_str(r#"{"unqualified_schema":"app"}"#).expect("old shape");
-        assert_eq!(opts, PlanOptions { unqualified_schema: Some("app".into()), concurrent_indexes: false });
+        assert_eq!(opts, PlanOptions { unqualified_schema: Some("app".into()), ..PlanOptions::default() });
         let opts: PlanOptions = serde_json::from_str(r#"{"unqualified_schema":null,"concurrent_indexes":true}"#).expect("new shape");
         assert!(opts.concurrent_indexes);
     }
@@ -2985,5 +3034,176 @@ mod tests {
             sql(&[Change::CreateIndex { table: QualName::new("public", "p"), index: i }]),
             ["CREATE INDEX p_x_idx ON public.p USING btree (x)"]
         );
+    }
+
+    fn one(change: Change, if_exists: bool, cascade: bool) -> String {
+        let opts = PlanOptions { if_exists, cascade, ..PlanOptions::default() };
+        let mut statements = plan_with(&[change], &opts).expect("plan").statements;
+        assert_eq!(statements.len(), 1, "{statements:?}");
+        statements.remove(0)
+    }
+
+    #[test]
+    fn if_exists_and_cascade_apply_to_the_statements_that_take_them() {
+        let t = QualName::new("public", "t");
+        let pair = pgmig_model::Composite { name: QualName::new("public", "pair"), attributes: vec![], comment: None };
+        let unique = constraint("t_x_key", pgmig_model::ConstraintKind::Unique, "UNIQUE (x)", &["x"]);
+        let cases: Vec<(Change, [&str; 4])> = vec![
+            (Change::CreateSchema("app".into()), ["CREATE SCHEMA app", "CREATE SCHEMA IF NOT EXISTS app", "", ""]),
+            (
+                Change::DropSchema("app".into()),
+                ["DROP SCHEMA app", "DROP SCHEMA IF EXISTS app", "DROP SCHEMA app CASCADE", "DROP SCHEMA IF EXISTS app CASCADE"],
+            ),
+            (
+                Change::CreateTable(table("public", "t", vec![])),
+                ["CREATE TABLE public.t ()", "CREATE TABLE IF NOT EXISTS public.t ()", "", ""],
+            ),
+            (
+                Change::CreateTable(partition("p", "t", "FOR VALUES IN (1)")),
+                [
+                    "CREATE TABLE public.p PARTITION OF public.t FOR VALUES IN (1)",
+                    "CREATE TABLE IF NOT EXISTS public.p PARTITION OF public.t FOR VALUES IN (1)",
+                    "",
+                    "",
+                ],
+            ),
+            (
+                drop_table(table("public", "t", vec![])),
+                [
+                    "DROP TABLE public.t",
+                    "DROP TABLE IF EXISTS public.t",
+                    "DROP TABLE public.t CASCADE",
+                    "DROP TABLE IF EXISTS public.t CASCADE",
+                ],
+            ),
+            (
+                Change::CreateSequence(sequence("s", "bigint", opts("bigint", 1))),
+                ["CREATE SEQUENCE public.s", "CREATE SEQUENCE IF NOT EXISTS public.s", "", ""],
+            ),
+            (
+                Change::DropSequence(sequence("s", "bigint", opts("bigint", 1))),
+                [
+                    "DROP SEQUENCE public.s",
+                    "DROP SEQUENCE IF EXISTS public.s",
+                    "DROP SEQUENCE public.s CASCADE",
+                    "DROP SEQUENCE IF EXISTS public.s CASCADE",
+                ],
+            ),
+            (
+                Change::DropEnum(mood(&["a"])),
+                [
+                    "DROP TYPE app.mood",
+                    "DROP TYPE IF EXISTS app.mood",
+                    "DROP TYPE app.mood CASCADE",
+                    "DROP TYPE IF EXISTS app.mood CASCADE",
+                ],
+            ),
+            (
+                Change::DropCompositeType(pair.clone()),
+                [
+                    "DROP TYPE public.pair",
+                    "DROP TYPE IF EXISTS public.pair",
+                    "DROP TYPE public.pair CASCADE",
+                    "DROP TYPE IF EXISTS public.pair CASCADE",
+                ],
+            ),
+            (
+                Change::DropDomain(domain("public", "d", "integer", None)),
+                [
+                    "DROP DOMAIN public.d",
+                    "DROP DOMAIN IF EXISTS public.d",
+                    "DROP DOMAIN public.d CASCADE",
+                    "DROP DOMAIN IF EXISTS public.d CASCADE",
+                ],
+            ),
+            (
+                Change::AddColumn { table: t.clone(), column: col("x", None) },
+                ["ALTER TABLE public.t ADD COLUMN x integer", "ALTER TABLE public.t ADD COLUMN IF NOT EXISTS x integer", "", ""],
+            ),
+            (
+                Change::DropColumn { table: t.clone(), column: "x".into(), type_ref: None, sequences: vec![], owned_sequences: vec![] },
+                [
+                    "ALTER TABLE public.t DROP COLUMN x",
+                    "ALTER TABLE public.t DROP COLUMN IF EXISTS x",
+                    "ALTER TABLE public.t DROP COLUMN x CASCADE",
+                    "ALTER TABLE public.t DROP COLUMN IF EXISTS x CASCADE",
+                ],
+            ),
+            (
+                Change::DropConstraint { table: t.clone(), constraint: unique.clone() },
+                [
+                    "ALTER TABLE public.t DROP CONSTRAINT t_x_key",
+                    "ALTER TABLE public.t DROP CONSTRAINT IF EXISTS t_x_key",
+                    "ALTER TABLE public.t DROP CONSTRAINT t_x_key CASCADE",
+                    "ALTER TABLE public.t DROP CONSTRAINT IF EXISTS t_x_key CASCADE",
+                ],
+            ),
+            (
+                Change::DropAttribute { composite: pair.name.clone(), attribute: "b".into(), type_ref: None },
+                [
+                    "ALTER TYPE public.pair DROP ATTRIBUTE b",
+                    "ALTER TYPE public.pair DROP ATTRIBUTE IF EXISTS b",
+                    "ALTER TYPE public.pair DROP ATTRIBUTE b",
+                    "ALTER TYPE public.pair DROP ATTRIBUTE IF EXISTS b",
+                ],
+            ),
+            (
+                create_index("t", "t_i"),
+                ["CREATE INDEX t_i ON public.t USING btree (x)", "CREATE INDEX IF NOT EXISTS t_i ON public.t USING btree (x)", "", ""],
+            ),
+            (
+                drop_index("t", "t_i"),
+                [
+                    "DROP INDEX public.t_i",
+                    "DROP INDEX IF EXISTS public.t_i",
+                    "DROP INDEX public.t_i CASCADE",
+                    "DROP INDEX IF EXISTS public.t_i CASCADE",
+                ],
+            ),
+        ];
+        for (change, [plain, ie, casc, both]) in cases {
+            assert_eq!(one(change.clone(), false, false), plain);
+            assert_eq!(one(change.clone(), true, false), ie);
+            // Create statements have no CASCADE: the same as without it.
+            assert_eq!(one(change.clone(), false, true), if casc.is_empty() { plain } else { casc });
+            assert_eq!(one(change, true, true), if both.is_empty() { ie } else { both });
+        }
+    }
+
+    #[test]
+    fn statements_without_an_if_not_exists_form_are_left_alone() {
+        let t = QualName::new("public", "t");
+        let unchanged = [
+            Change::CreateEnum(mood(&["a"])),
+            Change::CreateDomain(domain("public", "d", "integer", None)),
+            Change::AddConstraint {
+                table: t,
+                constraint: constraint("t_x_check", pgmig_model::ConstraintKind::Check, "CHECK ((x > 0))", &["x"]),
+            },
+        ];
+        for change in unchanged {
+            assert_eq!(one(change.clone(), true, true), one(change, false, false));
+        }
+    }
+
+    #[test]
+    fn concurrent_indexes_take_if_exists_but_not_cascade() {
+        let opts = PlanOptions { concurrent_indexes: true, if_exists: true, cascade: true, ..PlanOptions::default() };
+        let planned = plan_with(&[create_index("t", "t_new"), drop_index("t", "t_old")], &opts).expect("plan");
+        assert_eq!(
+            planned.statements,
+            ["DROP INDEX CONCURRENTLY IF EXISTS public.t_old", "CREATE INDEX CONCURRENTLY IF NOT EXISTS t_new ON public.t USING btree (x)"]
+        );
+        // A plain drop in the transaction (the table goes too) keeps CASCADE.
+        let t = table("public", "t", vec![]);
+        let with_table = Table { indexes: vec![index("t", "t_i", "(x)", &["x"])], ..t };
+        let planned = plan_with(&[drop_table(with_table)], &opts).expect("plan");
+        assert_eq!(planned.statements, ["DROP TABLE IF EXISTS public.t CASCADE"]);
+    }
+
+    #[test]
+    fn plan_options_json_reads_if_exists_and_cascade() {
+        let opts: PlanOptions = serde_json::from_str(r#"{"unqualified_schema":null,"if_exists":true,"cascade":true}"#).expect("shape");
+        assert!(opts.if_exists && opts.cascade && !opts.concurrent_indexes);
     }
 }

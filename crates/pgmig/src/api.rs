@@ -1707,6 +1707,20 @@ mod tests {
         assert!(err.to_string().contains("unknown variant `drop_tables`"), "{err}");
     }
 
+    #[test]
+    fn options_carry_if_exists_and_cascade_and_leave_them_out_when_false() {
+        let src = r#"{"kind":"sql","data":"s.sql"}"#;
+        let json = format!(r#"{{"from":{src},"to":{src},"options":{{"if_exists":true,"cascade":true}}}}"#);
+        let req: DiffRequest = serde_json::from_str(&json).expect("request");
+        assert!(req.options.if_exists && req.options.cascade && !req.options.concurrent_indexes);
+        let plan = req.options.plan_options();
+        assert!(plan.if_exists && plan.cascade);
+        let out = round_trip(&req);
+        assert!(out.contains(r#""if_exists":true"#) && out.contains(r#""cascade":true"#), "{out}");
+        let plain = round_trip(&DiffRequest { options: Options::default(), ..req });
+        assert!(!plain.contains("if_exists") && !plain.contains("cascade"), "{plain}");
+    }
+
     /// A typo in a request must fail, not fall back to a default that manages everything.
     #[test]
     fn requests_refuse_unknown_fields() {

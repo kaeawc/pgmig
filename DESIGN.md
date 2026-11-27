@@ -391,6 +391,8 @@ tx_mode = "file"
 [diff]
 skip = ["drop_table"]
 concurrent_indexes = true
+if_exists = true
+cascade = false
 
 [lint.rules]
 "lock/*" = "error"

@@ -33,7 +33,8 @@ diff`), `include`, `exclude`, `schema`,
 `format`, and the `migrate apply` flags under `[migrations]`: `dir`, `tx_mode`, `exec_order`,
 `lock_name`, `lock_timeout`, `before_sql`, `after_sql`. `[migrations] revisions_schema` (default
 `pgmig`) names the schema of the revisions table; pgmig never manages that schema. `[diff] skip`
-is --skip, `[diff] verify = true` is --verify, `[diff] concurrent_indexes = true` is --concurrent-indexes. `[env.NAME]` sections, selected with --env NAME,
+is --skip, `[diff] verify = true` is --verify, `[diff] concurrent_indexes = true` is --concurrent-indexes, `[diff] if_exists = true` is --if-exists,
+`[diff] cascade = true` is --cascade. `[env.NAME]` sections, selected with --env NAME,
 override the top level. A flag wins over both. `${KEY}` in a value is replaced by --var KEY=VALUE,
 or else by the environment variable KEY; `$${` is a literal `${`.";
 
@@ -510,7 +511,7 @@ enum SchemaCommand {
         #[arg(
             long,
             value_name = "FILE",
-            conflicts_with_all = ["to", "shadow", "include", "exclude", "schema", "skip", "concurrent_indexes", "no_concurrent_indexes", "edit", "verify", "no_verify"]
+            conflicts_with_all = ["to", "shadow", "include", "exclude", "schema", "skip", "concurrent_indexes", "no_concurrent_indexes", "if_exists", "no_if_exists", "cascade", "no_cascade", "edit", "verify", "no_verify"]
         )]
         plan: Option<PathBuf>,
         #[command(flatten)]
@@ -624,11 +625,13 @@ impl ScopeArgs {
             revisions_schema: revisions_schema(settings),
             skip: Vec::new(),
             concurrent_indexes: false,
+            if_exists: false,
+            cascade: false,
         })
     }
 }
 
-/// The diff policy: what plans leave out (`--skip`) and how they build indexes.
+/// The diff policy: what plans leave out (`--skip`) how they build indexes, and `IF EXISTS` and `CASCADE`.
 #[derive(clap::Args)]
 struct PolicyArg {
     /// Never plan this kind of change (repeatable): one of the `kind` names of the JSON changes,
@@ -650,6 +653,26 @@ struct PolicyArg {
     /// Plain CREATE INDEX and DROP INDEX, whatever `[diff] concurrent_indexes` says.
     #[arg(long)]
     no_concurrent_indexes: bool,
+    /// Write IF NOT EXISTS on the statements that create a schema, table, sequence, index or column
+    /// and IF EXISTS on the ones that drop a schema, table, sequence, index, type, domain, column,
+    /// constraint or composite type attribute, so a plan that was partly applied can run again.
+    /// Postgres has no IF NOT EXISTS for CREATE TYPE, CREATE DOMAIN or ADD CONSTRAINT: those stay
+    /// as they are (config: `[diff] if_exists`).
+    #[arg(long, overrides_with = "no_if_exists")]
+    if_exists: bool,
+    /// No IF [NOT] EXISTS, whatever `[diff] if_exists` says.
+    #[arg(long)]
+    no_if_exists: bool,
+    /// Write CASCADE on the statements that drop a schema, table, sequence, index, type, domain,
+    /// column or constraint. WARNING: Postgres then also drops everything that depends on the
+    /// object, such as views and functions pgmig does not manage, or objects --include, --exclude
+    /// and --skip leave out, and the plan does not list them. Not written on DROP INDEX
+    /// CONCURRENTLY, which has no CASCADE. Off by default (config: `[diff] cascade`).
+    #[arg(long, overrides_with = "no_cascade")]
+    cascade: bool,
+    /// No CASCADE, whatever `[diff] cascade` says.
+    #[arg(long)]
+    no_cascade: bool,
 }
 
 fn parse_kind(s: &str) -> Result<ChangeKind, String> {
@@ -658,7 +681,7 @@ fn parse_kind(s: &str) -> Result<ChangeKind, String> {
 
 impl PolicyArg {
     /// `options` with the policy: the flags, or where none are given, `[diff] skip` (checked when
-    /// the file was read) and `[diff] concurrent_indexes`.
+    /// the file was read), `[diff] concurrent_indexes`, `[diff] if_exists` and `[diff] cascade`.
     fn add_to(self, mut options: Options, settings: &Settings) -> anyhow::Result<Options> {
         options.skip = if self.skip.is_empty() {
             let names = settings.diff_skip.iter().flatten();
@@ -670,6 +693,16 @@ impl PolicyArg {
             (true, _) => true,
             (_, true) => false,
             _ => settings.diff_concurrent_indexes.unwrap_or(false),
+        };
+        options.if_exists = match (self.if_exists, self.no_if_exists) {
+            (true, _) => true,
+            (_, true) => false,
+            _ => settings.diff_if_exists.unwrap_or(false),
+        };
+        options.cascade = match (self.cascade, self.no_cascade) {
+            (true, _) => true,
+            (_, true) => false,
+            _ => settings.diff_cascade.unwrap_or(false),
         };
         Ok(options)
     }
