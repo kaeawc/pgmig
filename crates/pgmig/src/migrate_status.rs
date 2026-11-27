@@ -105,6 +105,12 @@ impl MigrateStatus {
 /// `migrate status`: the history of the database at `target` (revisions table in
 /// `revisions_schema`) against the directory at `dir`. Only reads; takes no lock.
 pub fn migrate_status(target: &str, dir: &Path, revisions_schema: &str) -> Result<MigrateStatus> {
+    read_status(target, dir, revisions_schema).map(|(status, ..)| status)
+}
+
+/// [`migrate_status`], with the directory as read (not checked against its sum file) and the
+/// revisions table's rows, hand-edited ones included: what `drift check` replays.
+pub(crate) fn read_status(target: &str, dir: &Path, revisions_schema: &str) -> Result<(MigrateStatus, MigrationDir, Vec<Stored>)> {
     if revisions_schema.is_empty() {
         return Err(Error::Options("revisions_schema must be a schema name, not an empty string".into()));
     }
@@ -235,7 +241,7 @@ pub fn migrate_status(target: &str, dir: &Path, revisions_schema: &str) -> Resul
         });
     }
     let last_error = rows.iter().rev().filter(|s| !s.revision.is_complete()).find_map(|s| s.revision.error.clone());
-    Ok(MigrateStatus {
+    let status = MigrateStatus {
         dir: dir.to_owned(),
         revisions_table: table.map(|t| t.name()),
         current,
@@ -244,7 +250,8 @@ pub fn migrate_status(target: &str, dir: &Path, revisions_schema: &str) -> Resul
         last_error,
         missing,
         issues,
-    })
+    };
+    Ok((status, d, rows))
 }
 
 /// How [`migrate_set`] runs. Every field may be left out of its JSON.

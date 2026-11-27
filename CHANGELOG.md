@@ -8,6 +8,17 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
 
 ### Added
 
+- `pgmig drift check --url <db>`: compare a live database with the migration directory at the
+  version its revisions table records (`--dir`, or `[migrations] dir`: the applied files are replayed
+  in the shadow database, a file that stopped part way only as far as it was applied) or with any
+  state (`--to`: SQL files, a migration directory, or another database). Prints the SQL that brings
+  the database back (schema-qualified) and a summary on stderr; `--format json` prints `drifted`,
+  `changes`, `skipped`, `plan`, `sql`, `unsupported` and `history` (current version, replayed,
+  partial and pending files, and the history's problems with how to recover, as `migrate status`
+  reports them). Pending files are not drift; history problems are. Exits `3` on drift, `0`
+  without. Filters, `--schema` and `--skip` work as for `schema diff`. Library: `pgmig::drift_check`
+  and `api::drift_check` (`DriftCheckRequest`, `DriftCheckResponse`).
+
 - `--concurrent-indexes` on `schema diff`, `schema apply` and `migrate diff` (or `[diff]
   concurrent_indexes = true`; `--no-concurrent-indexes` overrides): indexes are created and dropped
   `CONCURRENTLY`, each such statement in a unit of its own that runs outside a transaction. Indexes on

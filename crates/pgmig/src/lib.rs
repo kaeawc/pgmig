@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod api;
 pub mod clean;
+pub mod drift;
 pub mod edit;
 mod files;
 pub mod filter;
@@ -22,6 +23,7 @@ pub mod migrate_status;
 pub mod verify;
 
 pub use clean::{Kept, SchemaClean, clean_confirmed, clean_desired, schema_plan_clean};
+pub use drift::{DriftCheck, DriftHistory, Expected, drift_check};
 pub use edit::{EDITED_PLAN, edit_sql, plan_from_sql};
 pub use filter::{Filter, Pattern, PatternError, filter_model, scope_model, without_schema};
 pub use migrate_apply::{
@@ -927,13 +929,17 @@ pub(crate) fn check_no_imports(dir: &MigrationDir) -> Result<()> {
 fn replay(dir: &MigrationDir, shadow: &ShadowSpec) -> Result<Shadow> {
     let mut sh = shadow.open()?;
     for f in dir.files() {
-        let path = dir.path.join(&f.name);
-        let text = std::str::from_utf8(&f.bytes)
-            .map_err(|e| Error::Io { path: path.clone(), source: std::io::Error::new(std::io::ErrorKind::InvalidData, e) })?;
-        let file = pgmig_sql::split(text).map_err(|source| Error::Split { path: path.clone(), source })?;
-        migrate_apply::run_file(sh.conn(), &path, &file)?;
+        migrate_apply::run_file(sh.conn(), &dir.path.join(&f.name), &split_migration(dir, f)?)?;
     }
     Ok(sh)
+}
+
+/// A migration file of `dir`, split into statements.
+fn split_migration(dir: &MigrationDir, f: &pgmig_migrate::File) -> Result<pgmig_sql::File> {
+    let path = dir.path.join(&f.name);
+    let text = std::str::from_utf8(&f.bytes)
+        .map_err(|e| Error::Io { path: path.clone(), source: std::io::Error::new(std::io::ErrorKind::InvalidData, e) })?;
+    pgmig_sql::split(text).map_err(|source| Error::Split { path, source })
 }
 
 /// [`replay`] of `dir`, or a fresh shadow database for a directory that does not exist yet.

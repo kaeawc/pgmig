@@ -14,7 +14,7 @@ Exit codes:
   1  error (also: `schema validate` or `migrate validate` found errors)
   2  usage error (unknown flag, missing argument)
   3  `--exit-code` was given and the plan is not empty (`migrate status`: the database is not up
-     to date: files pending, or problems)
+     to date: files pending, or problems); `drift check` (always): the database drifted
 
 A state (--from, --to, SOURCE) is a database when it is a postgres:// URL or a key=value
 connection string, a migration directory when it is a directory holding pgmig.sum (checked
@@ -61,9 +61,45 @@ enum Command {
     /// Work with a migration directory (`<version>_<description>.sql` files and pgmig.sum).
     #[command(subcommand)]
     Migrate(MigrateCommand),
+    /// Compare a live database with what it should be.
+    #[command(subcommand)]
+    Drift(DriftCommand),
     /// Work with the configuration file (pgmig.toml).
     #[command(subcommand)]
     Config(ConfigCommand),
+}
+
+#[derive(Subcommand)]
+enum DriftCommand {
+    /// Compare a live database with what it should be and print the SQL that brings it back (on
+    /// stdout; a summary on stderr). Expected is the migration directory at the version the
+    /// database's revisions table records (--dir: every file recorded as applied is replayed in
+    /// the shadow database, and of a file that stopped part way the statements recorded as
+    /// applied), or any state (--to: SQL files, a migration directory, another database). With
+    /// neither flag, `[migrations] dir` from the config file, else `to`. Pending files are listed
+    /// and are not drift; problems with the history (an applied file edited or missing, a failed or
+    /// interrupted file, a row edited by hand, ...) are reported with how to recover and are drift.
+    /// Exits 3 on drift, 0 without. Only reads the database.
+    Check {
+        /// The database to check (config: `url`).
+        #[arg(long)]
+        url: Option<String>,
+        /// The migration directory, at the version the database records (config: `[migrations] dir`).
+        #[arg(long, conflicts_with = "to")]
+        dir: Option<PathBuf>,
+        /// SQL file, directory of SQL files, migration directory, or database URL to compare with
+        /// (config: `to`, when there is no `[migrations] dir`).
+        #[arg(long)]
+        to: Option<String>,
+        #[command(flatten)]
+        shadow: ShadowArg,
+        #[command(flatten)]
+        scope: ScopeArgs,
+        #[command(flatten)]
+        skip: PolicyArg,
+        #[command(flatten)]
+        format: FormatArg,
+    },
 }
 
 #[derive(Subcommand)]
@@ -747,6 +783,7 @@ impl Cli {
                 | MigrateCommand::Rebase { format, .. }
                 | MigrateCommand::Validate { format, .. },
             )
+            | Command::Drift(DriftCommand::Check { format, .. })
             | Command::Config(ConfigCommand::Validate { format }) => format.format,
         }
     }
@@ -850,6 +887,32 @@ fn run(cli: Cli, loaded: &Loaded, format: Format) -> anyhow::Result<ExitCode> {
             return migrate_set(&req, &shown, format);
         }
         Command::Migrate(command) => return migrate(command, settings, format),
+        Command::Drift(DriftCommand::Check { url, dir, to, shadow, scope, skip, format: _ }) => {
+            let s = settings;
+            let (target, shown) = target(url, loaded)?;
+            // A flag wins; then `[migrations] dir`, then `to`.
+            let (dir, to) = match (dir, to) {
+                (None, None) => match (&s.migrations_dir, &s.to) {
+                    (Some(d), _) => (Some(PathBuf::from(d)), None),
+                    (None, Some(t)) => (None, Some(t.clone())),
+                    (None, None) => {
+                        return Err(ApiError::usage(
+                            "missing --dir or --to: pass one, or set `[migrations] dir` or `to` in pgmig.toml (see --config, --env)",
+                        )
+                        .into());
+                    }
+                },
+                given => given,
+            };
+            let req = api::DriftCheckRequest {
+                target,
+                dir,
+                to: to.as_deref().map(Source::parse),
+                shadow: shadow.spec(s),
+                options: skip.add_to(scope.options(s)?, s)?,
+            };
+            return drift_check(&req, &shown, format);
+        }
         Command::Config(ConfigCommand::Validate { .. }) => {
             let req = api::ConfigValidateRequest {
                 path: cli.config.unwrap_or_else(|| PathBuf::from(pgmig::config::FILE_NAME)),
@@ -1246,6 +1309,56 @@ fn migrate_status(req: &api::MigrateStatusRequest, target: &Target, format: Form
   {}",
             i.message, i.hint
         );
+    }
+    Ok(code)
+}
+
+/// `drift check`: the plan on stdout; the history's problems, pending files, skipped and
+/// unsupported changes and a one-line verdict on stderr. Exits 3 on drift.
+fn drift_check(req: &api::DriftCheckRequest, target: &Target, format: Format) -> anyhow::Result<ExitCode> {
+    let res = api::drift_check(req)?;
+    let code = if res.drifted { ExitCode::from(CHANGES) } else { ExitCode::SUCCESS };
+    if format == Format::Json {
+        print_json(&TargetOutput { target, result: &res })?;
+        return Ok(code);
+    }
+    print!("{}", res.sql);
+    std::io::stdout().flush()?;
+    eprintln!("Target: {} (from {})", target.display, target.source);
+    if let Some(h) = &res.history {
+        match (&h.revisions_table, &h.current) {
+            (None, _) => eprintln!("no revisions table: nothing applied, expected an empty database"),
+            (Some(_), None) => eprintln!("current version: none"),
+            (Some(_), Some(v)) => eprintln!("current version: {v}"),
+        }
+        for f in &h.partial {
+            eprintln!("{f}: replayed only as far as it was applied");
+        }
+        for f in &h.pending {
+            eprintln!("pending {f} (not applied; not drift)");
+        }
+        for i in &h.issues {
+            eprintln!("problem: {}\n  {}", i.message, i.hint);
+        }
+    }
+    print_skipped(&res.skipped);
+    for u in &res.unsupported {
+        eprintln!("cannot plan: {u}");
+    }
+    let n = res.changes.len();
+    let issues = res.history.as_ref().map_or(0, |h| h.issues.len());
+    match (n, issues) {
+        (0, 0) => eprintln!("no drift"),
+        (n, i) => {
+            let mut parts = Vec::new();
+            if n > 0 {
+                parts.push(format!("{n} change{} to bring the database back", if n == 1 { "" } else { "s" }));
+            }
+            if i > 0 {
+                parts.push(format!("{i} history problem{}", if i == 1 { "" } else { "s" }));
+            }
+            eprintln!("drift: {}", parts.join(", "));
+        }
     }
     Ok(code)
 }

@@ -138,9 +138,31 @@ A failure prints the usual error object (`code` `migration`, `message`, `sqlstat
 | `execution_ms` | The run, hooks and bookkeeping included. Times are whole milliseconds. |
 | `baseline_skipped` | `--baseline` was ignored because the database is empty. |
 
+### `drift check`
+
+`pgmig drift check --url <db> --dir migrations/` compares a live database with the migration
+directory at the version its revisions table records: every file recorded as applied (baselines
+included) is replayed in the shadow database, in version order, and of a file that stopped part way
+only the statements recorded as applied. Files not applied yet are listed as pending and are not
+drift. The history is checked as `migrate status` checks it (an applied file edited or missing, a
+failed or interrupted file, a statement left in flight, a row edited by hand, a file out of order,
+a directory that does not match `pgmig.sum`); each problem is printed with how to recover, and counts
+as drift. `--to <state>` compares with any state instead: SQL files, a migration directory replayed
+to its newest file, or another database (staging against production, say). With neither flag,
+`[migrations] dir` is used, else `to`. `--include`, `--exclude`, `--schema` and `--skip` work as for
+`schema diff`.
+
+The SQL that turns the database back into the expected state goes to stdout (schema-qualified: it
+is meant to be run), a summary to stderr. A change the planner cannot plan is listed (`cannot plan:`;
+JSON `unsupported`) and the plan is then empty. `--format json` prints `target`, `drifted`,
+`changes`, `skipped`, `plan`, `sql`, `unsupported` and `history` (`dir`, `revisions_table`,
+`current`, `replayed`, `partial`, `pending`, `issues` with `kind`, `version`, `message` and `hint`;
+null with `--to`). It exits `3` on drift and `0` without; it only reads the database.
+
 Exit codes: `0` success; `1` error (including `validate` finding errors); `2` usage (bad flags, or `apply` with no way to approve);
 `3` with `--exit-code` (`diff`, or `apply --dry-run`) when the plan is not empty (skipped changes
-do not count: a diff with only skipped changes exits `0`).
+do not count: a diff with only skipped changes exits `0`), and from `drift check` (always) when the
+database drifted.
 
 ## Layout
 

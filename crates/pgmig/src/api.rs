@@ -11,9 +11,9 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ApplyOptions, ApplyReport, Change, ChecksumError, Error, Guard, Kept, MigrateApplyReport, MigrateEdit, MigrateLs, MigrateRebase,
-    MigrateRm, MigrateSet, MigrateShow, MigrateStatus, MigrationOutcome, Model, Options, Plan, SetOptions, ShadowSpec, Skipped, Source,
-    SumFile, filter::PatternError,
+    ApplyOptions, ApplyReport, Change, ChecksumError, DriftCheck, Error, Expected, Guard, Kept, MigrateApplyReport, MigrateEdit, MigrateLs,
+    MigrateRebase, MigrateRm, MigrateSet, MigrateShow, MigrateStatus, MigrationOutcome, Model, Options, Plan, SetOptions, ShadowSpec,
+    Skipped, Source, SumFile, filter::PatternError,
 };
 
 /// `schema diff`.
@@ -477,6 +477,38 @@ pub struct MigrateSetRequest {
 }
 
 pub type MigrateSetResponse = MigrateSet;
+
+/// `drift check`: `target` compared with exactly one of `dir` (the migration directory at the
+/// version the target's revisions table records, in `options.revisions_schema`) and `to` (any
+/// state).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DriftCheckRequest {
+    /// The database to check (only read).
+    pub target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<Source>,
+    #[serde(default)]
+    pub shadow: ShadowSpec,
+    #[serde(default)]
+    pub options: Options,
+}
+
+impl DriftCheckRequest {
+    /// What the target is compared with: exactly one of `dir` and `to`.
+    pub fn expected(&self) -> Result<Expected, Error> {
+        match (&self.dir, &self.to) {
+            (Some(dir), None) => Ok(Expected::Applied(dir.clone())),
+            (None, Some(to)) => Ok(Expected::Source(to.clone())),
+            (Some(_), Some(_)) => Err(Error::Options("drift check takes a migration directory (dir) or a state (to), not both".into())),
+            (None, None) => Err(Error::Options("drift check needs a migration directory (dir) or a state (to) to compare with".into())),
+        }
+    }
+}
+
+pub type DriftCheckResponse = DriftCheck;
 
 /// `config validate`. `Debug` shows the `vars` names only: their values may be secrets.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1163,6 +1195,11 @@ pub fn migrate_status(req: &MigrateStatusRequest) -> Result<MigrateStatusRespons
 /// [`crate::migrate_set`].
 pub fn migrate_set(req: &MigrateSetRequest) -> Result<MigrateSetResponse, ApiError> {
     Ok(crate::migrate_set(&req.target, &req.dir, &req.version, &req.options)?)
+}
+
+/// [`crate::drift_check`].
+pub fn drift_check(req: &DriftCheckRequest) -> Result<DriftCheckResponse, ApiError> {
+    Ok(crate::drift_check(&req.target, &req.expected()?, &req.shadow, &req.options)?)
 }
 
 /// [`crate::config::validate`]: problems with the file are diagnostics; an `Err` means it could

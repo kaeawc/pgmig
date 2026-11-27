@@ -4,6 +4,7 @@ mod apply_report;
 mod clean;
 mod concurrent_indexes;
 mod config;
+mod drift;
 #[cfg(unix)]
 mod edit;
 mod filters;
