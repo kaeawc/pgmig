@@ -9,7 +9,10 @@
 //!   table's `drop_table` keeps its schema's `drop_schema` out, and skipping a foreign key's
 //!   `drop_constraint` keeps the drop of the table it references out;
 //! - `c` creates an object `s` drops (a constraint dropped and added again with a new definition:
-//!   the add would find the old one), or drops an object `s` creates (the old one would be lost);
+//!   the add would find the old one), or drops an object `s` creates (the old one would be lost):
+//!   a replacement, the drop and the add or create of one constraint (by table and name) or index
+//!   (by name), is kept or skipped as a pair. A foreign key dropped and added again around the
+//!   index it uses is skipped with that index's replacement, so it is never dropped and left out;
 //! - `c` requires or alters an object `s` creates (a column added by a skipped `add_column`);
 //!
 //! and, for what the graph does not record:
@@ -18,7 +21,8 @@
 //!   drop a sequence implicitly (one the column or table owns, an identity's) is skipped, reported
 //!   with that sequence's `drop_sequence` as the cause;
 //! - a column whose type change is skipped keeps its old type: a constraint added or altered over
-//!   the column, and a change ordered against its type (a foreign key referencing it), is skipped;
+//!   the column, an index created over it, and a change ordered against its type (a foreign key
+//!   referencing it), is skipped;
 //! - an enum value whose `add_enum_value` (or `rename_enum_value`, by the new label) is skipped
 //!   does not exist: a change whose statement names it as a literal of that type
 //!   (`'label'::type`, as the server prints a default or a check) is skipped. The match is on
@@ -152,7 +156,7 @@ fn depends(c: &Change, cd: &Deps, statement: Option<&str>, s: &Change, sd: &Deps
             let column_type = Object::ColumnType(table.clone(), column.clone());
             let col = Object::Column(table.clone(), column.clone());
             let uses = |o: &Object| cd.alters.contains(o) || cd.requires.contains(o);
-            let constraint = matches!(c, Change::AddConstraint { .. } | Change::AlterConstraint { .. });
+            let constraint = matches!(c, Change::AddConstraint { .. } | Change::AlterConstraint { .. } | Change::CreateIndex { .. });
             if (!matches!(c, Change::DropConstraint { .. }) && uses(&column_type)) || (constraint && uses(&col)) {
                 return true;
             }
@@ -243,7 +247,7 @@ mod tests {
     }
 
     fn table(schema: &str, name: &str) -> Table {
-        Table { name: QualName::new(schema, name), columns: vec![col("id")], comment: None, constraints: vec![] }
+        Table { name: QualName::new(schema, name), columns: vec![col("id")], comment: None, constraints: vec![], indexes: vec![] }
     }
 
     fn kinds(k: &[ChangeKind]) -> BTreeSet<ChangeKind> {
@@ -355,5 +359,70 @@ mod tests {
                 "drop_not_null public.t.id (because drop_identity public.t.id is skipped)",
             ]
         );
+    }
+    #[test]
+    fn a_skipped_drop_index_keeps_its_replacement_and_the_columns_it_uses() {
+        let t = QualName::new("public", "t");
+        let index = |definition: &str| pgmig_model::Index {
+            name: "t_idx".into(),
+            definition: definition.into(),
+            unique: false,
+            columns: vec!["x".into()],
+            comment: None,
+        };
+        let changes = vec![
+            Change::DropIndex { table: t.clone(), index: index("CREATE INDEX t_idx ON public.t USING btree (x)") },
+            Change::CreateIndex { table: t.clone(), index: index("CREATE INDEX t_idx ON public.t USING hash (x)") },
+            Change::DropColumn { table: t.clone(), column: "x".into(), type_ref: None, sequences: vec![], owned_sequences: vec![] },
+            Change::DropColumn { table: t, column: "y".into(), type_ref: None, sequences: vec![], owned_sequences: vec![] },
+        ];
+        let (kept, skipped) = skip(&changes, &kinds(&[ChangeKind::DropIndex]), &PlanOptions::default());
+        assert_eq!(kept, changes[3..]);
+        let shown: Vec<String> = skipped.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            shown,
+            [
+                "drop_index public.t_idx (policy)",
+                "create_index public.t_idx (because drop_index public.t_idx is skipped)",
+                "drop_column public.t.x (because drop_index public.t_idx is skipped)",
+            ]
+        );
+        assert_eq!(skipped[0].statement.as_deref(), Some("DROP INDEX public.t_idx"));
+    }
+
+    #[test]
+    fn a_foreign_key_around_a_replaced_index_is_kept_with_it() {
+        let p = QualName::new("public", "p");
+        let c = QualName::new("public", "c");
+        let index = |definition: &str| pgmig_model::Index {
+            name: "p_id_idx".into(),
+            definition: definition.into(),
+            unique: true,
+            columns: vec!["id".into()],
+            comment: None,
+        };
+        let fkey = Constraint {
+            name: "c_pid_fkey".into(),
+            kind: ConstraintKind::ForeignKey,
+            definition: "FOREIGN KEY (pid) REFERENCES public.p(id)".into(),
+            columns: vec!["pid".into()],
+            references: Some(pgmig_model::References { table: p.clone(), columns: vec!["id".into()], constraint: Some("p_id_idx".into()) }),
+            deferrable: false,
+            deferred: false,
+            validated: true,
+            comment: None,
+        };
+        let changes = vec![
+            Change::DropConstraint { table: c.clone(), constraint: fkey.clone() },
+            Change::DropIndex { table: p.clone(), index: index("CREATE UNIQUE INDEX p_id_idx ON public.p USING btree (id)") },
+            Change::CreateIndex { table: p, index: index("CREATE UNIQUE INDEX p_id_idx ON public.p USING btree (id) NULLS NOT DISTINCT") },
+            Change::AddConstraint { table: c, constraint: fkey },
+        ];
+        for kind in [ChangeKind::DropIndex, ChangeKind::CreateIndex, ChangeKind::DropConstraint, ChangeKind::AddConstraint] {
+            let (kept, skipped) = skip(&changes, &kinds(&[kind]), &PlanOptions::default());
+            assert!(kept.is_empty(), "{kind}: {kept:?}");
+            assert_eq!(skipped.len(), 4, "{kind}");
+            assert!(skipped.iter().filter(|s| s.because.is_none()).all(|s| s.kind == kind), "{kind}: {skipped:?}");
+        }
     }
 }

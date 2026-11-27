@@ -56,3 +56,41 @@ fn constraints_outside_public_inspect_with_their_tables_schema() {
     );
     assert_eq!(lines.constraint("lines_qty_check").map(|c| c.columns.clone()), Some(vec!["qty".to_owned()]));
 }
+
+#[test]
+fn indexes_inspect_without_those_constraints_own() {
+    use pgmig_model::QualName;
+
+    let db = TestDb::new();
+    let mut conn = db.connect();
+    conn.batch(
+        "CREATE SCHEMA app; \
+         CREATE TABLE app.items (id int PRIMARY KEY, code text UNIQUE, n int, note text); \
+         CREATE UNIQUE INDEX items_n_idx ON app.items (n); \
+         CREATE INDEX items_lower_note_idx ON app.items (lower(note)) WHERE n > 0; \
+         COMMENT ON INDEX app.items_n_idx IS 'by n'; \
+         CREATE TABLE app.lines (n int REFERENCES app.items (n));",
+    )
+    .expect("load");
+    let model = pgmig::inspect(&mut conn).expect("inspect");
+    let items = &model.tables[&QualName::new("app", "items")];
+    let names: Vec<&str> = items.indexes.iter().map(|i| i.name.as_str()).collect();
+    // The primary key's and the unique constraint's indexes are the constraints'.
+    assert_eq!(names, ["items_lower_note_idx", "items_n_idx"]);
+    let n = items.index("items_n_idx").expect("items_n_idx");
+    assert_eq!(n.definition, "CREATE UNIQUE INDEX items_n_idx ON app.items USING btree (n)");
+    assert!(n.unique);
+    assert_eq!(n.columns, ["n"]);
+    assert_eq!(n.comment.as_deref(), Some("by n"));
+    let lower = items.index("items_lower_note_idx").expect("items_lower_note_idx");
+    assert_eq!(lower.definition, "CREATE INDEX items_lower_note_idx ON app.items USING btree (lower(note)) WHERE (n > 0)");
+    assert!(!lower.unique);
+    // pgmem records no pg_depend rows for index expressions (kaeawc/pgmem#155) and leaves these
+    // columns out; indkey has none of them.
+    if postgres_dsn().is_some() {
+        assert_eq!(lower.columns, ["n", "note"]);
+    }
+    // A foreign key's referenced index is the unique index, which stays an index.
+    let fk = &model.tables[&QualName::new("app", "lines")].constraints[0];
+    assert_eq!(fk.references.as_ref().and_then(|r| r.constraint.as_deref()), Some("items_n_idx"));
+}

@@ -18,8 +18,8 @@
 //! of a diff, so unmanaged objects are never created, changed or dropped. A managed object may
 //! still refer to an unmanaged one (a foreign key to an excluded table, a column of an excluded
 //! enum type, a default using an excluded sequence): the reference is kept by name, and the plan
-//! assumes the object exists. A constraint on an excluded column goes with the column, and so does
-//! a sequence `OWNED BY` it (a `serial`'s): owned sequences are managed exactly when their column
+//! assumes the object exists. A constraint or index on an excluded column goes with the column
+//! (indexes otherwise follow their table), and so does a sequence `OWNED BY` it (a `serial`'s): owned sequences are managed exactly when their column
 //! is, whatever patterns name the sequence itself.
 //!
 //! A [`Filter`] serializes as `{"include": [...], "exclude": [...]}`, each pattern as the string it
@@ -194,6 +194,7 @@ pub fn filter_model(model: &Model, filter: &Filter) -> Model {
         }
         t.columns.retain(|c| !gone.contains(&c.name));
         t.constraints.retain(|c| !c.columns.iter().any(|col| gone.contains(col)));
+        t.indexes.retain(|i| !i.columns.iter().any(|col| gone.contains(col)));
     }
     m
 }
@@ -247,7 +248,7 @@ pub fn glob(pattern: &str, name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pgmig_model::{Column, Constraint, ConstraintKind, Enum, Schema, Table};
+    use pgmig_model::{Column, Constraint, ConstraintKind, Enum, Index, Schema, Table};
 
     #[test]
     fn filters_serialize_as_pattern_strings() {
@@ -369,9 +370,22 @@ mod tests {
             references: None,
             comment: None,
         };
-        let t = Table { name: q("public", "t"), columns: vec![column("id"), column("legacy")], comment: None, constraints: vec![check] };
+        let index = |name: &str, col: &str| Index {
+            name: name.into(),
+            definition: format!("CREATE INDEX {name} ON public.t USING btree ({col})"),
+            unique: false,
+            columns: vec![col.into()],
+            comment: None,
+        };
+        let t = Table {
+            name: q("public", "t"),
+            columns: vec![column("id"), column("legacy")],
+            comment: None,
+            constraints: vec![check],
+            indexes: vec![index("t_id_idx", "id"), index("t_legacy_idx", "legacy")],
+        };
         m.tables.insert(t.name.clone(), t);
-        let tmp = Table { name: q("public", "tmp_x"), columns: vec![], comment: None, constraints: vec![] };
+        let tmp = Table { name: q("public", "tmp_x"), columns: vec![], comment: None, constraints: vec![], indexes: vec![] };
         m.tables.insert(tmp.name.clone(), tmp);
         m.enums.insert(q("app", "mood"), Enum { name: q("app", "mood"), labels: vec![], comment: None });
 
@@ -382,6 +396,7 @@ mod tests {
         let t = &out.tables[&q("public", "t")];
         assert_eq!(t.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["id"]);
         assert!(t.constraints.is_empty());
+        assert_eq!(t.indexes.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(), ["t_id_idx"]);
         assert!(out.enums.is_empty());
         assert_eq!(filter_model(&m, &Filter::default()), m);
 
