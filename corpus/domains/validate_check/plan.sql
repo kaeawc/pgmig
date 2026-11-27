@@ -1,0 +1,1 @@
+ALTER DOMAIN public.score VALIDATE CONSTRAINT score_min;

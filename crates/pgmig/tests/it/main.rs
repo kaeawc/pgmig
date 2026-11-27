@@ -20,4 +20,5 @@ mod quoting;
 mod revisions;
 mod search_path;
 mod support;
+mod types;
 mod validate;

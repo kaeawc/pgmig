@@ -52,7 +52,7 @@ use pgmig_model::{ConstraintKind, QualName, quote_ident, quote_literal};
 use serde::{Deserialize, Serialize};
 
 use crate::graph::{Deps, Object};
-use crate::{PlanOptions, deps, statement};
+use crate::{PlanOptions, deps, is_unsupported, statement};
 
 /// A change the policy left out. Serialized as `{"kind", "object", "statement", "because"}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,7 +62,7 @@ pub struct Skipped {
     /// The object, as [`Change::object`] names it.
     pub object: String,
     /// The statement the change would have run; `None` for a change that has none (an
-    /// unsupported enum change).
+    /// unsupported change).
     pub statement: Option<String>,
     /// `None` when the kind is skipped; otherwise the skipped change this one depends on.
     pub because: Option<Cause>,
@@ -94,8 +94,7 @@ pub fn skip(changes: &[Change], kinds: &BTreeSet<ChangeKind>, opts: &PlanOptions
         return (changes.to_vec(), Vec::new());
     }
     let deps: Vec<Deps> = changes.iter().map(deps).collect();
-    let statements: Vec<Option<String>> =
-        changes.iter().map(|c| (!matches!(c, Change::UnsupportedEnumChange { .. })).then(|| statement(c, opts))).collect();
+    let statements: Vec<Option<String>> = changes.iter().map(|c| (!is_unsupported(c)).then(|| statement(c, opts))).collect();
     let cause = |j: usize| Cause { kind: changes[j].kind(), object: changes[j].object() };
     // For each change: None (kept), or Some(None) (skipped by kind), or Some(Some(cause)).
     let mut skipped: Vec<Option<Option<Cause>>> = changes.iter().map(|c| kinds.contains(&c.kind()).then_some(None)).collect();

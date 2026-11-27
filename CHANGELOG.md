@@ -8,6 +8,14 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
 
 ### Added
 
+- Domains and composite types: inspected (base type, collation, default, `NOT NULL`, named checks
+  with `NOT VALID`, attributes, comments) and planned in dependency order with the tables, enums,
+  domains and composites that use them: create, drop, `ALTER DOMAIN` defaults, `NOT NULL`, checks
+  (`NOT VALID` / `VALIDATE`), `ALTER TYPE` add, drop and retype attributes. A domain's new base
+  type is a drop and recreate while nothing uses it; changes Postgres cannot make in place are
+  refused with the objects in the way. Filter kinds `domain:` and `composite:`; new skip kinds; the
+  JSON model gains `domains` and `composites`.
+
 - `schema clean` warns before cleaning a database that is not on this machine (the target names a
   host other than a Unix socket, `localhost` or a loopback address, and the server does not report
   a loopback address); the JSON response carries `local` and `server_address`.

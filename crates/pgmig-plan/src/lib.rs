@@ -49,8 +49,15 @@
 //! left alone, or one pgmig does not manage (filtered out, or outside the schema in scope). Such a
 //! reference orders nothing; the plan assumes the object exists.
 //!
-//! Changes Postgres cannot make in place (removing or reordering enum values) fail the plan with
-//! [`Error::Unsupported`].
+//! Changes Postgres cannot make in place (removing or reordering enum values, a new base type for a
+//! domain something keeps using, a new attribute type for a composite type a table column uses)
+//! fail the plan with [`Error::Unsupported`].
+//!
+//! # Domains and composite types
+//!
+//! A domain or composite type is created after the types it is over or its attributes use, and
+//! before the tables, columns, domains and composite types that use it; it is dropped after them.
+//! `CREATE DOMAIN` carries the validated checks, and `NOT VALID` ones are added after it.
 //!
 //! # Policy
 //!
@@ -65,7 +72,8 @@ pub use policy::{Cause, Skipped, skip};
 use graph::{Deps, Node, Object};
 use pgmig_diff::{Change, CommentTarget, EnumPosition};
 use pgmig_model::{
-    Column, Constraint, ConstraintKind, Generated, Identity, OwnedBy, QualName, SequenceOptions, quote_ident, quote_literal,
+    Column, Constraint, ConstraintKind, DomainConstraint, Generated, Identity, OwnedBy, QualName, SequenceOptions, quote_ident,
+    quote_literal,
 };
 use serde::{Deserialize, Serialize};
 
@@ -161,14 +169,34 @@ fn sorted(changes: &[&Change], opts: &PlanOptions) -> Result<Vec<String>, Error>
     }
 }
 
+/// Whether `change` is one the planner refuses ([`Error::Unsupported`]): it has no statement.
+pub(crate) fn is_unsupported(change: &Change) -> bool {
+    unsupported(change).is_some()
+}
+
 fn unsupported(change: &Change) -> Option<String> {
-    let Change::UnsupportedEnumChange { name, from, to } = change else { return None };
-    let list = |labels: &[String]| labels.iter().map(|l| quote_literal(l)).collect::<Vec<_>>().join(", ");
-    Some(format!(
-        "enum {name}: values ({}) cannot become ({}); only adding values and renaming one value in place are supported, not removing or reordering values",
-        list(from),
-        list(to)
-    ))
+    match change {
+        Change::UnsupportedEnumChange { name, from, to } => {
+            let list = |labels: &[String]| labels.iter().map(|l| quote_literal(l)).collect::<Vec<_>>().join(", ");
+            Some(format!(
+                "enum {name}: values ({}) cannot become ({}); only adding values and renaming one value in place are supported, not removing or reordering values",
+                list(from),
+                list(to)
+            ))
+        }
+        Change::UnsupportedDomainChange { name, from, to, used_by } => Some(format!(
+            "domain {name}: the base type cannot change from {from} to {to}; Postgres cannot change it in place, and the domain cannot be dropped and created again while {} {} it",
+            used_by.join(", "),
+            if used_by.len() == 1 { "uses" } else { "use" }
+        )),
+        Change::UnsupportedCompositeChange { name, attribute, from, to, used_by } => Some(format!(
+            "composite type {name}: attribute {} cannot change type from {from} to {to} while {} {} the type",
+            quote_ident(attribute),
+            used_by.join(", "),
+            if used_by.len() == 1 { "uses" } else { "use" }
+        )),
+        _ => None,
+    }
 }
 
 /// The tie-break between statements the graph does not order.
@@ -176,18 +204,24 @@ fn phase(change: &Change) -> u8 {
     match change {
         // Planned on their own, before everything else (see the module doc).
         Change::AddEnumValue { .. } | Change::UnsupportedEnumChange { .. } => 0,
+        Change::UnsupportedDomainChange { .. } | Change::UnsupportedCompositeChange { .. } => 0,
         Change::CreateSchema(_) => 0,
-        Change::CreateEnum(_) | Change::CreateSequence(_) => 1,
+        Change::CreateEnum(_) | Change::CreateSequence(_) | Change::CreateDomain(_) | Change::CreateCompositeType(_) => 1,
         // Before defaults that print the new name are set.
         Change::RenameEnumValue { .. } | Change::AlterSequence { .. } => 2,
         Change::CreateTable(_) => 3,
-        Change::AddColumn { .. } => 4,
+        Change::AddColumn { .. } | Change::AddAttribute { .. } => 4,
         // A column cannot have a default and an identity at once. A constraint goes before the
         // columns it uses change (a primary key column cannot drop NOT NULL).
-        Change::DropIdentity { .. } | Change::DropDefault { .. } | Change::DropConstraint { .. } | Change::DropIndex { .. } => 5,
-        Change::AlterColumnType { .. } => 6,
-        Change::SetDefault { .. } => 7,
-        Change::DropNotNull { .. } | Change::SetNotNull { .. } => 8,
+        Change::DropIdentity { .. }
+        | Change::DropDefault { .. }
+        | Change::DropConstraint { .. }
+        | Change::DropIndex { .. }
+        | Change::DropDomainDefault { .. }
+        | Change::DropDomainConstraint { .. } => 5,
+        Change::AlterColumnType { .. } | Change::AlterAttributeType { .. } => 6,
+        Change::SetDefault { .. } | Change::SetDomainDefault { .. } => 7,
+        Change::DropNotNull { .. } | Change::SetNotNull { .. } | Change::DropDomainNotNull { .. } | Change::SetDomainNotNull { .. } => 8,
         // After the type, the dropped default and NOT NULL that adding an identity needs.
         Change::AddIdentity { .. } | Change::AlterIdentity { .. } => 9,
         // After the columns they use have settled.
@@ -195,11 +229,13 @@ fn phase(change: &Change) -> u8 {
         | Change::AddConstraint { .. }
         | Change::RenameConstraint { .. }
         | Change::AlterConstraint { .. }
-        | Change::CreateIndex { .. } => 10,
-        Change::DropColumn { .. } => 11,
+        | Change::CreateIndex { .. }
+        | Change::AddDomainConstraint { .. }
+        | Change::ValidateDomainConstraint { .. } => 10,
+        Change::DropColumn { .. } | Change::DropAttribute { .. } => 11,
         Change::DropTable { .. } => 12,
         Change::DropSequence(_) => 13,
-        Change::DropEnum(_) => 14,
+        Change::DropEnum(_) | Change::DropDomain(_) | Change::DropCompositeType(_) => 14,
         Change::DropSchema(_) => 15,
         // After the object it describes exists and has settled.
         Change::SetComment { .. } => 16,
@@ -234,6 +270,7 @@ fn object_deps(change: &Change) -> Deps {
             let mut requires = vec![Object::Schema(t.name.schema.clone())];
             requires.extend(types(t.columns.iter().map(|c| &c.type_ref)));
             requires.extend(sequences(t.columns.iter().flat_map(|c| &c.default_sequences)));
+            requires.extend(new_values(t.columns.iter().map(|c| &c.type_ref)));
             let mut creates = vec![Object::Table(t.name.clone()), Object::Type(t.name.clone())];
             creates.extend(t.columns.iter().filter_map(|c| Some(identity_sequence(&t.name, &c.name, c.identity.as_ref()?))));
             creates.extend(t.constraints.iter().map(|c| constraint(&t.name, &c.name)));
@@ -244,6 +281,7 @@ fn object_deps(change: &Change) -> Deps {
             let mut releases = vec![Object::Schema(t.name.schema.clone())];
             releases.extend(types(t.columns.iter().map(|c| &c.type_ref)));
             releases.extend(sequences(t.columns.iter().flat_map(|c| &c.default_sequences)));
+            releases.extend(old_values(t.columns.iter().map(|c| &c.type_ref)));
             // With the table go the sequences its columns own and its identity sequences.
             let mut drops = vec![Object::Table(t.name.clone()), Object::Type(t.name.clone())];
             drops.extend(sequences(owned_sequences));
@@ -299,11 +337,105 @@ fn object_deps(change: &Change) -> Deps {
         Change::AddEnumValue { name, .. } | Change::RenameEnumValue { name, .. } => {
             Deps { alters: vec![Object::Type(name.clone())], ..Deps::default() }
         }
-        Change::UnsupportedEnumChange { .. } => Deps::default(),
+        Change::UnsupportedEnumChange { .. } | Change::UnsupportedDomainChange { .. } | Change::UnsupportedCompositeChange { .. } => {
+            Deps::default()
+        }
+        Change::CreateDomain(d) => {
+            let mut creates = vec![Object::Type(d.name.clone())];
+            creates.extend(d.constraints.iter().map(|c| constraint(&d.name, &c.name)));
+            let mut requires = vec![Object::Schema(d.name.schema.clone())];
+            requires.extend(types([&d.base_ref]));
+            requires.extend(new_values([&d.base_ref]));
+            Deps { creates, requires, ..Deps::default() }
+        }
+        Change::DropDomain(d) => {
+            let mut drops = vec![Object::Type(d.name.clone())];
+            drops.extend(d.constraints.iter().map(|c| constraint(&d.name, &c.name)));
+            let mut releases = vec![Object::Schema(d.name.schema.clone())];
+            releases.extend(types([&d.base_ref]));
+            releases.extend(old_values([&d.base_ref]));
+            Deps { drops, releases, ..Deps::default() }
+        }
+        Change::SetDomainDefault { name, .. }
+        | Change::DropDomainDefault { name }
+        | Change::SetDomainNotNull { name }
+        | Change::DropDomainNotNull { name } => {
+            Deps { alters: vec![Object::Type(name.clone())], requires: vec![Object::Type(name.clone())], ..Deps::default() }
+        }
+        Change::AddDomainConstraint { domain, constraint: c } => Deps {
+            creates: vec![constraint(domain, &c.name)],
+            alters: vec![Object::Type(domain.clone())],
+            requires: vec![Object::Type(domain.clone())],
+            ..Deps::default()
+        },
+        Change::DropDomainConstraint { domain, constraint: c } => {
+            Deps { drops: vec![constraint(domain, &c.name)], alters: vec![Object::Type(domain.clone())], ..Deps::default() }
+        }
+        Change::ValidateDomainConstraint { domain, name } => Deps {
+            alters: vec![Object::Type(domain.clone())],
+            requires: vec![Object::Type(domain.clone()), constraint(domain, name)],
+            ..Deps::default()
+        },
+        Change::CreateCompositeType(c) => {
+            // A composite type has a relation of its name too (`pg_class.relkind = 'c'`).
+            let mut creates = vec![Object::Type(c.name.clone()), Object::Relation(c.name.clone())];
+            creates.extend(c.attributes.iter().map(|a| column(&c.name, &a.name)));
+            let mut requires = vec![Object::Schema(c.name.schema.clone())];
+            requires.extend(types(c.attributes.iter().map(|a| &a.type_ref)));
+            requires.extend(new_values(c.attributes.iter().map(|a| &a.type_ref)));
+            Deps { creates, requires, ..Deps::default() }
+        }
+        Change::DropCompositeType(c) => {
+            let mut drops = vec![Object::Type(c.name.clone()), Object::Relation(c.name.clone())];
+            drops.extend(c.attributes.iter().map(|a| column(&c.name, &a.name)));
+            let mut releases = vec![Object::Schema(c.name.schema.clone())];
+            releases.extend(types(c.attributes.iter().map(|a| &a.type_ref)));
+            releases.extend(old_values(c.attributes.iter().map(|a| &a.type_ref)));
+            Deps { drops, releases, ..Deps::default() }
+        }
+        Change::AddAttribute { composite, attribute } => {
+            let mut requires = vec![Object::Type(composite.clone())];
+            requires.extend(types([&attribute.type_ref]));
+            requires.extend(new_values([&attribute.type_ref]));
+            Deps {
+                creates: vec![column(composite, &attribute.name)],
+                alters: vec![Object::Type(composite.clone())],
+                requires,
+                ..Deps::default()
+            }
+        }
+        Change::DropAttribute { composite, attribute, type_ref } => Deps {
+            drops: vec![column(composite, attribute)],
+            alters: vec![Object::Type(composite.clone())],
+            requires: vec![Object::Type(composite.clone())],
+            releases: [types([type_ref]), old_values([type_ref])].concat(),
+            ..Deps::default()
+        },
+        Change::AlterAttributeType { composite, attribute, type_ref, old_type_ref, holders, .. } => {
+            let mut requires = vec![Object::Type(composite.clone())];
+            requires.extend(types([type_ref]));
+            let mut releases = Vec::new();
+            if type_ref != old_type_ref {
+                requires.extend(new_values([type_ref]));
+                releases.extend(types([old_type_ref]));
+                releases.extend(old_values([old_type_ref]));
+            }
+            // Postgres refuses the change while a table column uses the composite type, directly
+            // or through what holds it: the uses that end go first, the ones that start after.
+            let held = std::iter::once(composite).chain(holders);
+            Deps {
+                creates: held.clone().map(|t| Object::NewValues(t.clone())).collect(),
+                drops: held.map(|t| Object::OldValues(t.clone())).collect(),
+                alters: vec![Object::Type(composite.clone()), column(composite, attribute)],
+                requires,
+                releases,
+            }
+        }
         Change::AddColumn { table, column: c } => {
             let mut requires = vec![in_table(table)];
             requires.extend(types([&c.type_ref]));
             requires.extend(sequences(&c.default_sequences));
+            requires.extend(new_values([&c.type_ref]));
             let mut creates = vec![column(table, &c.name)];
             if let Some(identity) = &c.identity {
                 creates.push(identity_sequence(table, &c.name, identity));
@@ -312,6 +444,7 @@ fn object_deps(change: &Change) -> Deps {
         }
         Change::DropColumn { table, column: c, type_ref, sequences: used, owned_sequences } => {
             let mut releases = types([type_ref]);
+            releases.extend(old_values([type_ref]));
             releases.extend(sequences(used));
             // Postgres drops the sequences the column owns with it.
             let drops = [vec![column(table, c)], sequences(owned_sequences)].concat();
@@ -320,7 +453,12 @@ fn object_deps(change: &Change) -> Deps {
         Change::AlterColumnType { table, column: c, type_ref, old_type_ref, .. } => {
             let mut requires = vec![in_table(table)];
             requires.extend(types([type_ref]));
-            let releases = if type_ref == old_type_ref { Vec::new() } else { types([old_type_ref]) };
+            let mut releases = Vec::new();
+            if type_ref != old_type_ref {
+                requires.extend(new_values([type_ref]));
+                releases.extend(types([old_type_ref]));
+                releases.extend(old_values([old_type_ref]));
+            }
             Deps { alters: vec![column(table, c), Object::ColumnType(table.clone(), c.clone())], requires, releases, ..Deps::default() }
         }
         Change::AddConstraint { table, constraint: c } => {
@@ -380,6 +518,8 @@ fn object_deps(change: &Change) -> Deps {
                 CommentTarget::Sequence(s) => vec![Object::Sequence(s.clone())],
                 CommentTarget::Constraint { table: t, name: c } => vec![in_table(t), constraint(t, c)],
                 CommentTarget::Index { table: t, name: i } => vec![in_table(t), index_object(t, i)],
+                CommentTarget::DomainConstraint { domain: d, name: c } => vec![Object::Type(d.clone()), constraint(d, c)],
+                CommentTarget::Attribute { composite: t, attribute: a } => vec![Object::Type(t.clone()), column(t, a)],
             };
             Deps { requires, ..Deps::default() }
         }
@@ -398,6 +538,8 @@ fn object_deps(change: &Change) -> Deps {
     }
 }
 
+/// A table's or domain's constraint (a domain and a table never share a name: the table's row type
+/// has it).
 fn constraint(table: &QualName, name: &str) -> Object {
     Object::Constraint(table.clone(), name.to_owned())
 }
@@ -451,6 +593,18 @@ fn is_of_table(o: &Object, table: &QualName) -> bool {
 /// The user-defined types among column type references.
 fn types<'a>(refs: impl IntoIterator<Item = &'a Option<QualName>>) -> Vec<Object> {
     refs.into_iter().flatten().map(|t| Object::Type(t.clone())).collect()
+}
+
+/// The values of the user-defined types among type references, as they were (see
+/// [`Object::OldValues`]).
+fn old_values<'a>(refs: impl IntoIterator<Item = &'a Option<QualName>>) -> Vec<Object> {
+    refs.into_iter().flatten().map(|t| Object::OldValues(t.clone())).collect()
+}
+
+/// The values of the user-defined types among type references, as they become (see
+/// [`Object::NewValues`]).
+fn new_values<'a>(refs: impl IntoIterator<Item = &'a Option<QualName>>) -> Vec<Object> {
+    refs.into_iter().flatten().map(|t| Object::NewValues(t.clone())).collect()
 }
 
 fn sequences<'a>(names: impl IntoIterator<Item = &'a QualName>) -> Vec<Object> {
@@ -618,6 +772,57 @@ fn statement(change: &Change, opts: &PlanOptions) -> String {
             )
         }
         Change::UnsupportedEnumChange { name, .. } => format!("-- unsupported change to enum {}", n(name)),
+        Change::UnsupportedDomainChange { name, .. } => format!("-- unsupported change to domain {}", n(name)),
+        Change::UnsupportedCompositeChange { name, .. } => format!("-- unsupported change to composite type {}", n(name)),
+        Change::CreateDomain(d) => {
+            let mut s = format!("CREATE DOMAIN {} AS {}", n(&d.name), d.base_type_clause());
+            // NOT NULL before DEFAULT: pgmem reads `DEFAULT <expr> NOT NULL` as a default of
+            // `<expr> IS NOT NULL` (kaeawc/pgmem#261); Postgres takes either order.
+            if d.not_null {
+                s.push_str(" NOT NULL");
+            }
+            if let Some(default) = &d.default {
+                s.push_str(&format!(" DEFAULT {default}"));
+            }
+            for c in &d.constraints {
+                s.push_str(&format!(" {}", domain_constraint_def(c)));
+            }
+            s
+        }
+        Change::DropDomain(d) => format!("DROP DOMAIN {}", n(&d.name)),
+        Change::SetDomainDefault { name, default } => format!("ALTER DOMAIN {} SET DEFAULT {default}", n(name)),
+        Change::DropDomainDefault { name } => format!("ALTER DOMAIN {} DROP DEFAULT", n(name)),
+        Change::SetDomainNotNull { name } => format!("ALTER DOMAIN {} SET NOT NULL", n(name)),
+        Change::DropDomainNotNull { name } => format!("ALTER DOMAIN {} DROP NOT NULL", n(name)),
+        Change::AddDomainConstraint { domain, constraint } => {
+            format!("ALTER DOMAIN {} ADD {}", n(domain), domain_constraint_def(constraint))
+        }
+        Change::DropDomainConstraint { domain, constraint } => {
+            format!("ALTER DOMAIN {} DROP CONSTRAINT {}", n(domain), quote_ident(&constraint.name))
+        }
+        Change::ValidateDomainConstraint { domain, name } => {
+            format!("ALTER DOMAIN {} VALIDATE CONSTRAINT {}", n(domain), quote_ident(name))
+        }
+        Change::CreateCompositeType(c) => {
+            let attributes: Vec<String> =
+                c.attributes.iter().map(|a| format!("    {} {}", quote_ident(&a.name), a.type_clause())).collect();
+            if attributes.is_empty() {
+                format!("CREATE TYPE {} AS ()", n(&c.name))
+            } else {
+                format!("CREATE TYPE {} AS (\n{}\n)", n(&c.name), attributes.join(",\n"))
+            }
+        }
+        Change::DropCompositeType(c) => format!("DROP TYPE {}", n(&c.name)),
+        Change::AddAttribute { composite, attribute } => {
+            format!("ALTER TYPE {} ADD ATTRIBUTE {} {}", n(composite), quote_ident(&attribute.name), attribute.type_clause())
+        }
+        Change::DropAttribute { composite, attribute, .. } => {
+            format!("ALTER TYPE {} DROP ATTRIBUTE {}", n(composite), quote_ident(attribute))
+        }
+        Change::AlterAttributeType { composite, attribute, type_name, collation, .. } => {
+            let collate = collation.as_ref().map(|c| format!(" COLLATE {c}")).unwrap_or_default();
+            format!("ALTER TYPE {} ALTER ATTRIBUTE {} TYPE {type_name}{collate}", n(composite), quote_ident(attribute))
+        }
         Change::AddColumn { table, column } => format!("ALTER TABLE {} ADD COLUMN {}", n(table), column_def(column)),
         Change::DropColumn { table, column, .. } => format!("ALTER TABLE {} DROP COLUMN {}", n(table), quote_ident(column)),
         Change::AlterColumnType { table, column, type_name, using, .. } => {
@@ -656,10 +861,20 @@ fn statement(change: &Change, opts: &PlanOptions) -> String {
                 CommentTarget::Sequence(s) => format!("SEQUENCE {}", n(s)),
                 CommentTarget::Constraint { table: t, name: c } => format!("CONSTRAINT {} ON {}", quote_ident(c), n(t)),
                 CommentTarget::Index { table: t, name: i } => format!("INDEX {}", n(&QualName::new(t.schema.clone(), i.clone()))),
+                CommentTarget::DomainConstraint { domain: d, name: c } => format!("CONSTRAINT {} ON DOMAIN {}", quote_ident(c), n(d)),
+                CommentTarget::Attribute { composite: t, attribute: a } => format!("COLUMN {}.{}", n(t), quote_ident(a)),
             };
             format!("COMMENT ON {object} IS {}", comment.as_deref().map_or("NULL".to_owned(), quote_literal))
         }
     }
+}
+
+/// `CONSTRAINT <name> <check>`, with `NOT VALID` when the constraint is not validated, as written
+/// in `CREATE DOMAIN` (which only carries validated ones) and `ADD`. Postgres prints `NOT VALID` in
+/// the definition, pgmem does not (kaeawc/pgmem#266): it is written from the flag either way.
+fn domain_constraint_def(c: &DomainConstraint) -> String {
+    let not_valid = if c.validated { "" } else { " NOT VALID" };
+    format!("CONSTRAINT {} {}{not_valid}", quote_ident(&c.name), c.body())
 }
 
 /// `CONSTRAINT <name> <definition>`, as written in `CREATE TABLE` and `ADD`.
@@ -1529,5 +1744,279 @@ mod tests {
         // Another schema's name is another relation.
         let other = Change::CreateTable(table("app", "foo", vec![col("id", None)]));
         assert_eq!(sql(&[other, drop_index()])[0], "CREATE TABLE app.foo (\n    id integer\n)");
+    }
+
+    fn domain(schema: &str, name: &str, base: &str, base_ref: Option<QualName>) -> pgmig_model::Domain {
+        pgmig_model::Domain {
+            name: QualName::new(schema, name),
+            base_type: base.into(),
+            base_ref,
+            collation: None,
+            default: None,
+            not_null: false,
+            constraints: vec![],
+            comment: None,
+        }
+    }
+
+    fn check(name: &str, definition: &str, validated: bool) -> DomainConstraint {
+        DomainConstraint { name: name.into(), definition: definition.into(), validated, comment: None }
+    }
+
+    #[test]
+    fn domains_and_composite_types_are_created_before_their_users_and_dropped_after_them() {
+        let mood_type = row_type("app", "mood");
+        // Name order is the wrong one: a domain over a domain over the enum, a composite type over
+        // the outer domain, a table column of an array of the composite type.
+        let inner = domain("public", "z_inner", "app.mood", mood_type);
+        let outer = domain("public", "a_outer", "public.z_inner", row_type("public", "z_inner"));
+        let attribute = pgmig_model::Attribute {
+            name: "d".into(),
+            type_name: "public.a_outer".into(),
+            type_ref: row_type("public", "a_outer"),
+            collation: None,
+            comment: None,
+        };
+        let pair = pgmig_model::Composite { name: QualName::new("public", "b_pair"), attributes: vec![attribute], comment: None };
+        let users =
+            table("public", "a_users", vec![Column { type_name: "public.b_pair[]".into(), ..col("ps", row_type("public", "b_pair")) }]);
+        let created = sql(&[
+            Change::CreateTable(users.clone()),
+            Change::CreateCompositeType(pair.clone()),
+            Change::CreateDomain(outer.clone()),
+            Change::CreateDomain(inner.clone()),
+            Change::CreateEnum(mood(&["a"])),
+        ]);
+        assert_eq!(
+            created,
+            [
+                "CREATE TYPE app.mood AS ENUM ('a')",
+                "CREATE DOMAIN public.z_inner AS app.mood",
+                "CREATE DOMAIN public.a_outer AS public.z_inner",
+                "CREATE TYPE public.b_pair AS (\n    d public.a_outer\n)",
+                "CREATE TABLE public.a_users (\n    ps public.b_pair[]\n)",
+            ]
+        );
+        let dropped = sql(&[
+            Change::DropEnum(mood(&["a"])),
+            Change::DropDomain(inner),
+            Change::DropDomain(outer),
+            Change::DropCompositeType(pair),
+            drop_table(users),
+        ]);
+        assert_eq!(
+            dropped,
+            [
+                "DROP TABLE public.a_users",
+                "DROP TYPE public.b_pair",
+                "DROP DOMAIN public.a_outer",
+                "DROP DOMAIN public.z_inner",
+                "DROP TYPE app.mood"
+            ]
+        );
+    }
+
+    #[test]
+    fn domain_statements_write_checks_and_not_valid_from_the_flag() {
+        let mut d = domain("public", "posint", "integer", None);
+        d.not_null = true;
+        d.default = Some("1".into());
+        d.collation = Some(QualName::new("pg_catalog", "C"));
+        d.constraints = vec![check("posint_check", "CHECK ((VALUE > 0))", true)];
+        let name = d.name.clone();
+        let changes = [
+            Change::AddDomainConstraint { domain: name.clone(), constraint: check("posint_small", "CHECK ((VALUE < 9)) NOT VALID", false) },
+            // As pgmem prints it.
+            Change::AddDomainConstraint { domain: name.clone(), constraint: check("posint_tiny", "CHECK ((VALUE < 5))", false) },
+            Change::CreateDomain(d),
+            Change::ValidateDomainConstraint { domain: name.clone(), name: "posint_small".into() },
+        ];
+        assert_eq!(
+            sql(&changes),
+            [
+                "CREATE DOMAIN public.posint AS integer COLLATE pg_catalog.\"C\" NOT NULL DEFAULT 1 CONSTRAINT posint_check CHECK ((VALUE > 0))",
+                "ALTER DOMAIN public.posint ADD CONSTRAINT posint_small CHECK ((VALUE < 9)) NOT VALID",
+                "ALTER DOMAIN public.posint ADD CONSTRAINT posint_tiny CHECK ((VALUE < 5)) NOT VALID",
+                "ALTER DOMAIN public.posint VALIDATE CONSTRAINT posint_small",
+            ]
+        );
+        let opts = PlanOptions { unqualified_schema: Some("public".into()) };
+        let comment =
+            Change::SetComment { target: CommentTarget::DomainConstraint { domain: name, name: "posint_check".into() }, comment: None };
+        assert_eq!(plan_with(&[comment], &opts).expect("plan").statements, ["COMMENT ON CONSTRAINT posint_check ON DOMAIN posint IS NULL"]);
+    }
+
+    #[test]
+    fn a_replaced_domain_check_is_dropped_before_it_is_added() {
+        let name = QualName::new("public", "d");
+        let changes = [
+            Change::AddDomainConstraint { domain: name.clone(), constraint: check("d_check", "CHECK ((VALUE > 1))", true) },
+            Change::DropDomainConstraint { domain: name, constraint: check("d_check", "CHECK ((VALUE > 0))", true) },
+        ];
+        assert_eq!(
+            sql(&changes),
+            ["ALTER DOMAIN public.d DROP CONSTRAINT d_check", "ALTER DOMAIN public.d ADD CONSTRAINT d_check CHECK ((VALUE > 1))"]
+        );
+    }
+
+    #[test]
+    fn attribute_changes_add_before_they_alter_and_drop_last() {
+        let p = QualName::new("public", "pair");
+        let attribute =
+            pgmig_model::Attribute { name: "c".into(), type_name: "text".into(), type_ref: None, collation: None, comment: None };
+        let changes = [
+            Change::DropAttribute { composite: p.clone(), attribute: "b".into(), type_ref: row_type("public", "gone") },
+            Change::DropDomain(domain("public", "gone", "integer", None)),
+            Change::AlterAttributeType {
+                composite: p.clone(),
+                attribute: "a".into(),
+                type_name: "text".into(),
+                collation: Some(QualName::new("pg_catalog", "C")),
+                type_ref: None,
+                old_type_ref: None,
+                holders: Vec::new(),
+            },
+            Change::AddAttribute { composite: p.clone(), attribute },
+            Change::SetComment { target: CommentTarget::Attribute { composite: p, attribute: "c".into() }, comment: Some("c".into()) },
+        ];
+        assert_eq!(
+            sql(&changes),
+            [
+                "ALTER TYPE public.pair ADD ATTRIBUTE c text",
+                "ALTER TYPE public.pair ALTER ATTRIBUTE a TYPE text COLLATE pg_catalog.\"C\"",
+                "ALTER TYPE public.pair DROP ATTRIBUTE b",
+                "DROP DOMAIN public.gone",
+                "COMMENT ON COLUMN public.pair.c IS 'c'",
+            ]
+        );
+    }
+
+    fn retype_pair(holders: Vec<QualName>) -> Change {
+        Change::AlterAttributeType {
+            composite: QualName::new("public", "pair"),
+            attribute: "a".into(),
+            type_name: "bigint".into(),
+            collation: None,
+            type_ref: None,
+            old_type_ref: None,
+            holders,
+        }
+    }
+
+    const RETYPE_PAIR: &str = "ALTER TYPE public.pair ALTER ATTRIBUTE a TYPE bigint";
+
+    #[test]
+    fn a_column_using_a_composite_type_is_dropped_before_its_attribute_type_changes() {
+        let t = table("public", "t", vec![col("p", row_type("public", "pair"))]);
+        assert_eq!(sql(&[retype_pair(vec![]), drop_table(t)]), ["DROP TABLE public.t", RETYPE_PAIR]);
+        let dropped = Change::DropColumn {
+            table: QualName::new("public", "t"),
+            column: "p".into(),
+            type_ref: row_type("public", "pair"),
+            sequences: vec![],
+            owned_sequences: vec![],
+        };
+        assert_eq!(sql(&[retype_pair(vec![]), dropped]), ["ALTER TABLE public.t DROP COLUMN p", RETYPE_PAIR]);
+    }
+
+    #[test]
+    fn a_column_using_a_composite_type_is_created_after_its_attribute_type_changes() {
+        let mut p = col("p", row_type("public", "pair"));
+        p.type_name = "public.pair[]".into();
+        let t = table("public", "t", vec![p.clone()]);
+        assert_eq!(sql(&[retype_pair(vec![]), Change::CreateTable(t)]), [RETYPE_PAIR, "CREATE TABLE public.t (\n    p public.pair[]\n)"]);
+        let retyped = Change::AlterColumnType {
+            table: QualName::new("public", "u"),
+            column: "p".into(),
+            type_name: "public.pair[]".into(),
+            type_ref: row_type("public", "pair"),
+            old_type_ref: None,
+            using: None,
+        };
+        assert_eq!(sql(&[retyped, retype_pair(vec![])]), [RETYPE_PAIR, "ALTER TABLE public.u ALTER COLUMN p TYPE public.pair[]"]);
+    }
+
+    #[test]
+    fn uses_through_a_domain_or_a_nesting_composite_end_before_the_attribute_type_change_and_start_after() {
+        let (d, outer) = (QualName::new("public", "d"), QualName::new("public", "nest"));
+        let t = QualName::new("public", "t");
+        let mut new = col("new", Some(d.clone()));
+        new.type_name = "public.d[]".into();
+        let held = pgmig_model::Attribute {
+            name: "p".into(),
+            type_name: "public.pair".into(),
+            type_ref: row_type("public", "pair"),
+            collation: None,
+            comment: None,
+        };
+        let changes = [
+            Change::AddColumn { table: t.clone(), column: new },
+            Change::AddColumn { table: t.clone(), column: col("o", Some(outer.clone())) },
+            Change::AddAttribute { composite: outer.clone(), attribute: held },
+            Change::DropColumn { table: t, column: "old".into(), type_ref: Some(d.clone()), sequences: vec![], owned_sequences: vec![] },
+            retype_pair(vec![d, outer]),
+        ];
+        assert_eq!(
+            sql(&changes),
+            [
+                "ALTER TABLE public.t DROP COLUMN old",
+                RETYPE_PAIR,
+                "ALTER TABLE public.t ADD COLUMN new public.d[]",
+                "ALTER TABLE public.t ADD COLUMN o nest",
+                "ALTER TYPE public.nest ADD ATTRIBUTE p public.pair",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_skipped_drop_of_a_composite_types_user_skips_the_attribute_type_change() {
+        let t = table("public", "t", vec![col("p", row_type("public", "pair"))]);
+        let changes = vec![retype_pair(vec![]), drop_table(t)];
+        let kinds = [pgmig_diff::ChangeKind::DropTable].into_iter().collect();
+        let (kept, skipped) = skip(&changes, &kinds, &PlanOptions::default());
+        assert!(kept.is_empty());
+        let shown: Vec<String> = skipped.iter().map(ToString::to_string).collect();
+        assert_eq!(shown, ["alter_attribute_type public.pair.a (because drop_table public.t is skipped)", "drop_table public.t (policy)"]);
+    }
+
+    #[test]
+    fn domain_and_composite_changes_postgres_cannot_make_are_unsupported_change_errors() {
+        let err = plan(&[
+            Change::UnsupportedDomainChange {
+                name: QualName::new("public", "d"),
+                from: "integer".into(),
+                to: "bigint".into(),
+                used_by: vec!["column public.t.a".into(), "domain public.e".into()],
+            },
+            Change::UnsupportedCompositeChange {
+                name: QualName::new("public", "p"),
+                attribute: "x".into(),
+                from: "integer".into(),
+                to: "text".into(),
+                used_by: vec!["column public.t.p".into()],
+            },
+        ])
+        .expect_err("unsupported");
+        assert_eq!(
+            err.to_string(),
+            "unsupported changes: domain public.d: the base type cannot change from integer to bigint; Postgres cannot change it in place, \
+             and the domain cannot be dropped and created again while column public.t.a, domain public.e use it; \
+             composite type public.p: attribute x cannot change type from integer to text while column public.t.p uses the type"
+        );
+    }
+
+    #[test]
+    fn a_skipped_create_domain_skips_what_uses_it() {
+        let d = domain("public", "posint", "integer", None);
+        let t = table("public", "t", vec![col("n", row_type("public", "posint"))]);
+        let changes = vec![Change::CreateDomain(d), Change::CreateTable(t)];
+        let kinds = [pgmig_diff::ChangeKind::CreateDomain].into_iter().collect();
+        let (kept, skipped) = skip(&changes, &kinds, &PlanOptions::default());
+        assert!(kept.is_empty());
+        let shown: Vec<String> = skipped.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            shown,
+            ["create_domain public.posint (policy)", "create_table public.t (because create_domain public.posint is skipped)"]
+        );
     }
 }

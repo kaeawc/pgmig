@@ -7,3 +7,12 @@ indexes/access_methods  # kaeawc/pgmem#192
 indexes/covering  # kaeawc/pgmem#148
 indexes/key_options  # kaeawc/pgmem#248
 indexes/storage_parameters  # kaeawc/pgmem#152
+composites/alter_attribute_type  # kaeawc/pgmem#263
+composites/alter_attribute_type_drop_user  # kaeawc/pgmem#263
+composites/alter_attribute_type_new_user  # kaeawc/pgmem#263
+composites/alter_attribute_type_through_domain  # kaeawc/pgmem#263
+composites/attribute_comments  # kaeawc/pgmem#264
+composites/collation  # kaeawc/pgmem#262, kaeawc/pgmem#263
+domains/collation  # kaeawc/pgmem#262
+domains/comments  # kaeawc/pgmem#264
+domains/over_enum  # kaeawc/pgmem#269

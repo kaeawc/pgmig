@@ -48,6 +48,15 @@ pub enum Object {
     /// creates or drops the relation of its name too, so dropping index `foo` runs before creating
     /// table `foo`.
     Relation(QualName),
+    /// A type's values as they hold a composite type whose attribute types change (the composite
+    /// type itself, or a domain or composite type holding it): a step that stops a column or
+    /// attribute using the type releases it, and the attribute type change drops it, so the use
+    /// ends first. Postgres refuses the change while a table column uses the composite type.
+    /// Nothing creates it.
+    OldValues(QualName),
+    /// The counterpart of [`Object::OldValues`]: the attribute type change creates it and a step
+    /// starting a use of the type requires it, so the use starts after the change. Nothing drops it.
+    NewValues(QualName),
 }
 
 /// What one step does to which objects.

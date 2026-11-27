@@ -522,7 +522,7 @@ impl ShadowArg {
 #[derive(clap::Args)]
 struct ScopeArgs {
     /// Manage only objects matching this pattern (repeatable): `[kind:]schema[.object[.column]]`,
-    /// kind one of schema, table, enum, sequence; `*` and `?` match unquoted names.
+    /// kind one of schema, table, enum, domain, composite, sequence; `*` and `?` match unquoted names.
     #[arg(long, value_name = "PATTERN")]
     include: Vec<String>,
     /// Leave objects matching this pattern alone (repeatable; same syntax as --include).

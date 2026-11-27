@@ -67,7 +67,9 @@ fn inspect_prints_the_model() {
       }
     ],
     "enums": [],
-    "sequences": []
+    "sequences": [],
+    "domains": [],
+    "composites": []
   },
   "sql": "CREATE TABLE public.t (\n    id integer NOT NULL\n);\n"
 }
