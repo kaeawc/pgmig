@@ -98,7 +98,7 @@ fn diff_writes_the_next_migration_then_reports_no_changes() {
 
     // The directory does not exist yet: an empty state, created when the file is written.
     let res = diff(&t, "Create Tables", &to, &spec).expect("diff");
-    let written = res.written.expect("a file");
+    let written = res.written.into_iter().next().expect("a file");
     let name = written.path.file_name().and_then(|n| n.to_str()).expect("name").to_owned();
     assert_eq!(name, format!("{}_create_tables.sql", written.version));
     assert_eq!(written.version.len(), 14, "{}", written.version);
@@ -111,18 +111,18 @@ fn diff_writes_the_next_migration_then_reports_no_changes() {
     // A second run finds nothing to do and writes nothing.
     let sum = std::fs::read(t.dir().join(SUM_FILE)).expect("sum");
     let again = diff(&t, "again", &to, &spec).expect("diff again");
-    assert!(again.written.is_none() && again.plan.is_empty() && again.changes.is_empty(), "{again:?}");
+    assert!(again.written.is_empty() && again.plan.is_empty() && again.changes.is_empty(), "{again:?}");
     assert_eq!(t.files(), std::slice::from_ref(&name));
     assert_eq!(std::fs::read(t.dir().join(SUM_FILE)).expect("sum"), sum);
 
     // A change to the desired state is the next file.
     let to = t.desired(&format!("{SCHEMA}ALTER TABLE orders ADD COLUMN note text;\nCREATE INDEX orders_user ON orders (user_id);\n"));
-    let next = diff(&t, "order_note", &to, &spec).expect("diff").written.expect("a second file");
+    let next = diff(&t, "order_note", &to, &spec).expect("diff").written.into_iter().next().expect("a second file");
     assert!(pgmig_version_gt(&next.version, &written.version), "{} after {}", next.version, written.version);
     assert_eq!(t.files().len(), 2);
     pgmig::migrate_validate(&t.dir(), Some(&spec)).expect("valid and replays");
     assert_replay_matches(&t, &to, &spec);
-    assert!(diff(&t, "x", &to, &spec).expect("diff").written.is_none());
+    assert!(diff(&t, "x", &to, &spec).expect("diff").written.is_empty());
 }
 
 fn pgmig_version_gt(a: &str, b: &str) -> bool {
@@ -137,9 +137,9 @@ fn commit_points_are_written_and_replay() {
     let t = Tmp::new();
     let (spec, _db) = shadow();
     let to = t.desired("CREATE TYPE mood AS ENUM ('sad', 'happy');\nCREATE TABLE people (id int, mood mood DEFAULT 'sad');\n");
-    diff(&t, "mood", &to, &spec).expect("diff").written.expect("first");
+    diff(&t, "mood", &to, &spec).expect("diff").written.into_iter().next().expect("first");
     let to = t.desired("CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy');\nCREATE TABLE people (id int, mood mood DEFAULT 'ok');\n");
-    let w = diff(&t, "ok mood", &to, &spec).expect("diff").written.expect("second");
+    let w = diff(&t, "ok mood", &to, &spec).expect("diff").written.into_iter().next().expect("second");
     let name = w.path.file_name().and_then(|n| n.to_str()).expect("name").to_owned();
     assert!(t.read(&name).contains("\n-- pgmig:commit\n"), "{}", t.read(&name));
     pgmig::migrate_validate(&t.dir(), Some(&spec)).expect("replays");
@@ -153,7 +153,7 @@ fn versions_follow_files_from_the_future() {
     t.migration("99990101000000_users.sql", "CREATE TABLE users (id int PRIMARY KEY);\n");
     pgmig::migrate_hash(&t.dir()).expect("hash");
     let to = t.desired("CREATE TABLE users (id int PRIMARY KEY, name text);\n");
-    let w = diff(&t, "name", &to, &spec).expect("diff").written.expect("a file");
+    let w = diff(&t, "name", &to, &spec).expect("diff").written.into_iter().next().expect("a file");
     assert_eq!(w.version, "99990101000001");
     assert_eq!(t.files(), ["99990101000000_users.sql", "99990101000001_name.sql"]);
     // `migrate new` right after, in the same second or not, still sorts last.

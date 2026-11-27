@@ -72,6 +72,21 @@ drop_table app.t is skipped)`), and since the difference stays, every later diff
 The JSON responses of `schema diff`, `schema apply` and `migrate diff` carry `skipped` (empty
 without a policy); `changes` and the plan leave those changes out.
 
+`--concurrent-indexes` (same three commands; config: `[diff] concurrent_indexes = true`;
+`--no-concurrent-indexes` overrides the config) creates and drops indexes with `CREATE [UNIQUE] INDEX
+CONCURRENTLY` and `DROP INDEX CONCURRENTLY`, so writes to the table are not blocked. Postgres refuses
+these statements inside a transaction, so a plan becomes an ordered list of *units*: runs of statements
+that share a transaction, and each concurrent statement on its own outside one (the plan's
+`non_transactional` JSON field lists their statement indexes; the text of a plan marks each with
+`-- pgmig:notx`). Indexes on a table the plan creates or drops, indexes a constraint owns and indexes
+on partitioned tables keep the plain statement. `schema apply` commits each unit before the next, so a
+failure leaves the earlier units applied; a failed `CONCURRENTLY` build can leave an `INVALID` index,
+and the error names it and says to remove it with `DROP INDEX CONCURRENTLY`. `migrate diff` writes a
+plan with such statements as one file per unit with consecutive versions (`<name>.sql`,
+`<name>_2.sql`, ...), a concurrent statement's file starting with `-- pgmig:txmode none`, all hashed
+into the sum file together; its JSON response lists them in `files` (`file` and `version` are the
+first). Such a plan cannot be combined with `--edit`.
+
 `--edit` (on `schema apply` and `migrate diff`) opens the planned SQL in `$VISUAL`, else `$EDITOR`,
 else `vi` (split on whitespace, run without a shell) on a private temp file, removed afterwards.
 What you save is what runs or is written, with no new diff: drop statements, add your own, or keep

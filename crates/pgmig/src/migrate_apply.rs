@@ -1092,7 +1092,11 @@ mod tests {
     /// The planner's marker is the directive the engine commits at.
     #[test]
     fn the_planner_marker_is_a_commit_point() {
-        let plan = pgmig_plan::Plan { statements: vec!["SELECT 1".into(), "SELECT 2".into(), "SELECT 3".into()], commit_after: Some(0) };
+        let plan = pgmig_plan::Plan {
+            statements: vec!["SELECT 1".into(), "SELECT 2".into(), "SELECT 3".into()],
+            commit_after: Some(0),
+            ..Default::default()
+        };
         assert_eq!(points(&plan.to_sql()), [1]);
         assert_eq!(points("SELECT 1;\n\n-- pgmig:commit\n\nSELECT 2;\n-- pgmig:commit\n-- pgmig:commit\nSELECT 3;\n"), [1, 2]);
         assert!(points("-- pgmig:commit\nSELECT 1;\n-- pgmig:commit\n").is_empty());

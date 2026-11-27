@@ -264,9 +264,9 @@ fn migrate_diff_verifies_before_writing() {
     let t = Tmp::new();
     let opts = Options::default();
     let first = pgmig::migrate_diff_with(&t.dir(), "init", &t.sql("a.sql", FROM), &spec, &opts, None, true).expect("first");
-    assert!(first.written.is_some());
+    assert!(!first.written.is_empty());
     let next = pgmig::migrate_diff_with(&t.dir(), "next", &t.sql("b.sql", TO), &spec, &opts, None, true).expect("next");
-    assert!(next.written.is_some());
+    assert!(!next.written.is_empty());
     assert_eq!(t.files().len(), 2);
 }
 
@@ -300,7 +300,7 @@ fn migrate_diff_verify_checks_the_edited_file_and_writes_nothing_on_failure() {
         "{ printf -- '-- pgmig:txmode none\\n'; cat \"$1\"; printf 'SELECT 1;\\n'; } > \"$1.new\"; cat \"$1.new\" > \"$1\"; rm \"$1.new\"",
     );
     let res = pgmig::migrate_diff_with(&t.dir(), "next", &to, &spec, &opts, Some(&no_tx), true).expect("verifies");
-    assert!(res.edited && res.written.is_some());
+    assert!(res.edited && !res.written.is_empty());
     assert_eq!(t.files().len(), 2);
 }
 

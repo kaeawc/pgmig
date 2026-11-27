@@ -290,7 +290,7 @@ fn inspect_indexes(conn: &mut Conn, model: &mut Model, attnames: &BTreeMap<(Qual
     let what = "indexes";
     let indexes = format!(
         "SELECT n.nspname, t.relname, i.relname, pg_get_indexdef(x.indexrelid), x.indisunique, x.indkey, \
-                obj_description(i.oid, 'pg_class'), x.indexrelid \
+                obj_description(i.oid, 'pg_class'), x.indexrelid, t.relkind = 'p' \
          FROM pg_index x \
          JOIN pg_class i ON i.oid = x.indexrelid \
          JOIN pg_class t ON t.oid = x.indrelid \
@@ -317,6 +317,7 @@ fn inspect_indexes(conn: &mut Conn, model: &mut Model, attnames: &BTreeMap<(Qual
             unique: text(&row, 4, what)? == "t",
             columns,
             comment: row.get(6).cloned().flatten(),
+            on_partitioned_table: text(&row, 8, what)? == "t",
         };
         if let Some(t) = model.tables.get_mut(&table) {
             by_oid.insert(text(&row, 7, what)?, (table, t.indexes.len()));

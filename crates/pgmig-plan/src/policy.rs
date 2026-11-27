@@ -368,6 +368,7 @@ mod tests {
             unique: false,
             columns: vec!["x".into()],
             comment: None,
+            on_partitioned_table: false,
         };
         let changes = vec![
             Change::DropIndex { table: t.clone(), index: index("CREATE INDEX t_idx ON public.t USING btree (x)") },
@@ -399,6 +400,7 @@ mod tests {
             unique: true,
             columns: vec!["id".into()],
             comment: None,
+            on_partitioned_table: false,
         };
         let fkey = Constraint {
             name: "c_pid_fkey".into(),

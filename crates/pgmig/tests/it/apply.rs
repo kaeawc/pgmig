@@ -78,11 +78,12 @@ fn failing_statement_rolls_back_its_batch() {
     assert!(plan.statements[..failing].iter().any(|s| s.contains("ADD COLUMN")), "ADD COLUMN runs first:\n{}", plan.to_sql());
 
     let err = apply(&db.conninfo, &plan).expect_err("apply must fail");
-    let Error::Apply { statement_index, statement, source, committed_batches } = &err else { panic!("{err}") };
+    let Error::Apply { statement_index, statement, source, committed_batches, outside_transaction } = &err else { panic!("{err}") };
     assert_eq!(*statement_index, Some(failing));
     assert_eq!(statement, &plan.statements[failing]);
     assert_eq!(source.code.as_deref(), Some("23502"), "{source}");
     assert_eq!(*committed_batches, 0);
+    assert!(!outside_transaction);
     let msg = err.to_string();
     assert!(msg.contains(&format!("statement {} failed", failing + 1)) && msg.contains("SQLSTATE 23502"), "{msg}");
     assert!(msg.contains("nothing was committed"), "{msg}");
@@ -99,7 +100,7 @@ fn enum_value_and_its_use_apply_in_two_batches() {
     let (shadow, _shadow_db) = shadow_spec();
 
     let plan = schema_plan_apply(&db.conninfo, &desired.source(), &shadow, &Options::default()).expect("plan");
-    assert_eq!(plan.batches().len(), 2, "{}", plan.to_sql());
+    assert_eq!(plan.units().len(), 2, "{}", plan.to_sql());
     let report = apply(&db.conninfo, &plan).expect("apply");
     assert_eq!(report.batches, 2);
 

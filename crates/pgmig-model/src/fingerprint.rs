@@ -27,7 +27,8 @@
 //! the schema: [`Column::type_ref`] and [`Column::default_sequences`] (read from the type and the
 //! default), [`Identity::sequence`] (whatever name Postgres picked), and a constraint's flags,
 //! columns and references (which say nothing its definition doesn't; the referenced index name
-//! is the catalog's), and an index's uniqueness and columns (its definition says them).
+//! is the catalog's), and an index's uniqueness and columns (its definition says them) and whether its
+//! table is partitioned (the table says that).
 //!
 //! Indexes, domains and composite types entered the fingerprint without a new [`FORMAT`]: a model
 //! without them writes no record of them, so its fingerprint is what it was. A schema with them
@@ -180,6 +181,8 @@ pub fn canonical(model: &Model) -> String {
                 // The definition already says these.
                 unique: _,
                 columns: _,
+                // Read from the table, which a diff never changes.
+                on_partitioned_table: _,
                 comment,
             } = i;
             w.tag("index").str(name).str(definition).opt(comment).end();
@@ -345,6 +348,7 @@ mod tests {
                 unique: false,
                 columns: vec!["team".into()],
                 comment: Some("by team".into()),
+                on_partitioned_table: false,
             },
             Index {
                 name: "users_n_key".into(),
@@ -352,6 +356,7 @@ mod tests {
                 unique: true,
                 columns: vec!["n".into()],
                 comment: None,
+                on_partitioned_table: false,
             },
         ];
         m.tables.insert(t(), Table { name: t(), columns, comment: Some("people".into()), constraints: vec![pk, fk], indexes });

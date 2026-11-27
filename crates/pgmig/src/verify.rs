@@ -17,8 +17,9 @@
 //!   (extensions, functions, views, ...) are not copied; a statement that needs one fails setup
 //!   ([`Error::VerifySetup`]).
 //!
-//! Then the plan under test runs as it would for real: a [`Plan`] batch by batch, each in its own
-//! transaction (as [`crate::apply`]); a migration file as `migrate apply` runs it, in one
+//! Then the plan under test runs as it would for real: a [`Plan`] unit by unit, a transactional one
+//! in its own transaction and a non-transactional statement (`CREATE INDEX CONCURRENTLY`) outside
+//! any (as [`crate::apply`]); a migration file as `migrate apply` runs it, in one
 //! transaction committed at each `-- pgmig:commit`, or statement by statement with
 //! `-- pgmig:txmode none`. The result, as the options manage it, is inspected and diffed against
 //! the desired state. Changes the policy skips ([`Options::skip`]) are expected to remain, with
@@ -54,11 +55,16 @@ struct Unit<'a> {
 /// Check that `plan`, applied to a copy of `current`, reaches `to` (the desired state's model, as
 /// `opts` manages it) but for the changes `opts` skips.
 pub fn verify_plan(current: Current, plan: &Plan, to: &Model, shadow: &ShadowSpec, opts: &Options) -> Result<()> {
-    let units: Vec<Unit> = crate::batch_ranges(plan)
-        .into_iter()
-        .map(|r| Unit { statements: r.map(|i| (i, plan.statements[i].as_str())).collect(), transaction: true })
-        .collect();
+    let units = plan_units(plan);
     verify_units(current, &units, to, shadow, opts)
+}
+
+/// The units of `plan` as verification runs them.
+fn plan_units(plan: &Plan) -> Vec<Unit<'_>> {
+    plan.units()
+        .into_iter()
+        .map(|u| Unit { statements: u.statements.map(|i| (i, plan.statements[i].as_str())).collect(), transaction: u.transactional })
+        .collect()
 }
 
 /// [`verify_plan`] for the text of a migration file (what `--edit` saved): split, and run as
@@ -105,10 +111,17 @@ fn copy(current: Current, shadow: &ShadowSpec) -> Result<Shadow> {
 fn recreate(conn: &mut Conn, from: &Model) -> Result<()> {
     let setup = |statement: &str, source| Error::VerifySetup { statement: statement.to_owned(), source };
     let plan = plan_with(&diff(&Model::empty_database(), from), &PlanOptions::default())?;
-    for range in crate::batch_ranges(&plan) {
-        let mut statements = std::iter::once("BEGIN").chain(range.map(|i| plan.statements[i].as_str())).chain(std::iter::once("COMMIT"));
+    for unit in plan_units(&plan) {
+        let transaction = unit.transaction;
+        let mut statements = transaction
+            .then_some("BEGIN")
+            .into_iter()
+            .chain(unit.statements.iter().map(|(_, s)| *s))
+            .chain(transaction.then_some("COMMIT"));
         if let Some((statement, e)) = statements.find_map(|s| conn.batch(s).err().map(|e| (s, e))) {
-            let _ = conn.batch("ROLLBACK");
+            if transaction {
+                let _ = conn.batch("ROLLBACK");
+            }
             return Err(setup(statement, e));
         }
     }

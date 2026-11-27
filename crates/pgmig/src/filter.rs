@@ -405,6 +405,7 @@ mod tests {
             unique: false,
             columns: vec![col.into()],
             comment: None,
+            on_partitioned_table: false,
         };
         let t = Table {
             name: q("public", "t"),

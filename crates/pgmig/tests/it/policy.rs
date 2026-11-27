@@ -298,16 +298,16 @@ fn migrate_diff_leaves_skipped_changes_out_of_the_file() {
     let first =
         pgmig::migrate_diff(&dir, "init", &t.sql("a.sql", "CREATE TABLE keep (id int); CREATE TABLE old (id int);"), &shadow, &opts)
             .expect("first");
-    assert!(first.written.is_some() && first.skipped.is_empty());
+    assert!(!first.written.is_empty() && first.skipped.is_empty());
     let to = t.sql("b.sql", "CREATE TABLE keep (id int, name text);");
     let res = pgmig::migrate_diff(&dir, "next", &to, &shadow, &opts).expect("second");
-    let file = res.written.expect("written").path;
+    let file = res.written.into_iter().next().expect("written").path;
     let sql = std::fs::read_to_string(&file).expect("read");
     assert_eq!(sql, "ALTER TABLE public.keep ADD COLUMN name text;\n");
     assert_eq!(shown(&res.skipped), ["drop_table public.old (policy)"]);
     // Only skipped changes left: nothing is written, and they are still reported.
     let res = pgmig::migrate_diff(&dir, "again", &to, &shadow, &opts).expect("third");
-    assert!(res.written.is_none() && res.plan.is_empty());
+    assert!(res.written.is_empty() && res.plan.is_empty());
     assert_eq!(shown(&res.skipped), ["drop_table public.old (policy)"]);
     // The response carries them too.
     let req = api::MigrateDiffRequest { dir, name: "again".into(), to, shadow, options: opts, editor: None, verify: false };

@@ -126,6 +126,10 @@ pub struct Index {
     pub columns: Vec<String>,
     /// `obj_description` of the index.
     pub comment: Option<String>,
+    /// The table is partitioned (`relkind = 'p'`): `CREATE INDEX CONCURRENTLY` is not allowed on it.
+    /// Absent from older JSON, and left out of it when false: not partitioned.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub on_partitioned_table: bool,
 }
 
 /// `pg_constraint.contype`.
@@ -818,6 +822,7 @@ mod tests {
             unique: false,
             columns: vec!["mood".into(), "team".into()],
             comment: Some("lookups".into()),
+            on_partitioned_table: false,
         };
         m.tables.insert(
             t.clone(),
@@ -948,6 +953,7 @@ mod tests {
             unique: true,
             columns: vec!["id".into()],
             comment: None,
+            on_partitioned_table: false,
         };
         m.tables.insert(t.clone(), Table { name: t, columns: vec![id], comment: None, constraints: vec![check], indexes: vec![index] });
         let want = r#"{

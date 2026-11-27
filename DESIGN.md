@@ -168,7 +168,9 @@ user confirms a rename interactively or marks it with `-- pgmig:rename` (`DIF-15
    reference, drops before what they reference is dropped. Cycles (for example mutually referencing
    foreign keys) are broken by creating the tables first and adding the constraints afterwards.
 3. **Rewrite for safety.** The diff policy turns risky steps into safe sequences (`DIF-8..12`):
-   - `CREATE INDEX` → `CREATE INDEX CONCURRENTLY` in its own non-transactional unit;
+   - `CREATE INDEX` → `CREATE INDEX CONCURRENTLY` in its own non-transactional unit (`--concurrent-indexes`;
+     indexes on tables the plan creates or drops, constraint-owned indexes and indexes on partitioned
+     tables stay plain);
    - `ADD CONSTRAINT ... CHECK/FOREIGN KEY` → `NOT VALID` then `VALIDATE CONSTRAINT`;
    - `SET NOT NULL` → validated `CHECK (col IS NOT NULL)`, `SET NOT NULL`, drop the check;
    - `ADD PRIMARY KEY / UNIQUE` → concurrent unique index, then `ADD CONSTRAINT ... USING INDEX`;
@@ -388,7 +390,7 @@ tx_mode = "file"
 
 [diff]
 skip = ["drop_table"]
-concurrent_index = true
+concurrent_indexes = true
 
 [lint.rules]
 "lock/*" = "error"

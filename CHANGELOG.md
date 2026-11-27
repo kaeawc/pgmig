@@ -8,6 +8,21 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
 
 ### Added
 
+- `--concurrent-indexes` on `schema diff`, `schema apply` and `migrate diff` (or `[diff]
+  concurrent_indexes = true`; `--no-concurrent-indexes` overrides): indexes are created and dropped
+  `CONCURRENTLY`, each such statement in a unit of its own that runs outside a transaction. Indexes on
+  a table the plan creates or drops, indexes a constraint owns and indexes on partitioned tables keep
+  the plain statement. A plan is now an ordered list of transactional and non-transactional units
+  (`Plan::units`); its JSON gains `non_transactional` (statement indexes, left out when empty, so
+  existing plans read and write as before) and the text of a plan marks each such statement with
+  `-- pgmig:notx`. `schema apply` and `--verify` run non-transactional statements one by one outside
+  a transaction; a failed `CONCURRENTLY` build says an `INVALID` index may be left behind and how to
+  remove it (`DROP INDEX CONCURRENTLY <name>`), with the server's SQLSTATE and message. `migrate
+  diff` writes such a plan as one file per unit with consecutive versions, a concurrent statement's
+  file starting with `-- pgmig:txmode none`, and lists every file it wrote (JSON: `files`; `file`
+  and `version` stay the first); combining it with `--edit` is a usage error. The apply report
+  gains `non_transactional`, and an apply error `outcome` `statement_failed`.
+
 - `--verify` on `schema apply` and `migrate diff` (or `[diff] verify = true`; `--no-verify`
   overrides): the plan, or the edited SQL, first runs in the shadow database on a copy of the
   current schema, and the result must equal the desired schema (changes the diff policy skips

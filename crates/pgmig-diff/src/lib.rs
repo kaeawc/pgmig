@@ -1942,6 +1942,7 @@ mod tests {
             unique: false,
             columns: vec!["n".into()],
             comment: None,
+            on_partitioned_table: false,
         }
     }
 
@@ -2008,6 +2009,7 @@ mod tests {
             unique: true,
             columns: vec!["id".into()],
             comment: None,
+            on_partitioned_table: false,
         };
         let with = |key: &str| {
             let mut m = tables(&[("p", vec![]), ("t", vec![f.clone()])]);
