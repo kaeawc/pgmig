@@ -38,9 +38,25 @@ impl From<postgres::Error> for Error {
                     _ => None,
                 },
             },
-            None => Error { code: None, message: e.to_string(), position: None },
+            None => Error { code: None, message: with_causes(&e), position: None },
         }
     }
+}
+
+/// `e` followed by each cause it does not already print, e.g. `error performing TLS handshake:
+/// invalid peer certificate: UnknownIssuer`.
+fn with_causes(e: &dyn std::error::Error) -> String {
+    let mut message = e.to_string();
+    let mut source = e.source();
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        if !message.contains(&text) {
+            message.push_str(": ");
+            message.push_str(&text);
+        }
+        source = cause.source();
+    }
+    message
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
