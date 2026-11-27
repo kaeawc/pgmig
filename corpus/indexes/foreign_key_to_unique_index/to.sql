@@ -1,0 +1,3 @@
+CREATE TABLE p (id int);
+CREATE UNIQUE INDEX p_id_idx ON p (id) NULLS NOT DISTINCT;
+CREATE TABLE c (pid int REFERENCES p (id));

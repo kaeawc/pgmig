@@ -81,6 +81,10 @@ pub struct Table {
     /// Primary key, unique, check, foreign key and exclusion constraints defined on the table
     /// itself (not inherited), by name. `NOT NULL` is [`Column::not_null`], not a constraint here.
     pub constraints: Vec<Constraint>,
+    /// The table's indexes that no constraint owns (a primary key, unique or exclusion
+    /// constraint's index is the constraint's), by name. Absent from older JSON: none.
+    #[serde(default)]
+    pub indexes: Vec<Index>,
 }
 
 impl Table {
@@ -91,6 +95,30 @@ impl Table {
     pub fn constraint(&self, name: &str) -> Option<&Constraint> {
         self.constraints.iter().find(|c| c.name == name)
     }
+
+    pub fn index(&self, name: &str) -> Option<&Index> {
+        self.indexes.iter().find(|i| i.name == name)
+    }
+}
+
+/// An index no constraint owns. Its body is [`Index::definition`], as the server prints it; the
+/// other fields are read from the catalog alongside it so the planner can order steps, and say
+/// nothing the definition doesn't.
+///
+/// An index always lives in its table's schema.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Index {
+    pub name: String,
+    /// `pg_get_indexdef`: the whole `CREATE [UNIQUE] INDEX <name> ON <schema>.<table> USING
+    /// <method> (...)` statement, with `INCLUDE`, `NULLS NOT DISTINCT`, `WITH (...)` and `WHERE`.
+    pub definition: String,
+    /// `indisunique`.
+    pub unique: bool,
+    /// The table columns the index uses: its key and `INCLUDE` columns (`indkey`), then those its
+    /// expressions and predicate use (`pg_depend`), each once.
+    pub columns: Vec<String>,
+    /// `obj_description` of the index.
+    pub comment: Option<String>,
 }
 
 /// `pg_constraint.contype`.
@@ -681,7 +709,17 @@ mod tests {
             Column { type_ref: Some(QualName::new("app", "mood")), comment: Some("how they feel".into()), ..column("mood", "app.mood[]") },
             column("team", "integer"),
         ];
-        m.tables.insert(t.clone(), Table { name: t.clone(), columns, comment: Some("people".into()), constraints: vec![pk, fk] });
+        let index = Index {
+            name: "users_lower_idx".into(),
+            definition: "CREATE INDEX users_lower_idx ON app.users USING btree (lower((mood)::text)) WHERE (team > 0)".into(),
+            unique: false,
+            columns: vec!["mood".into(), "team".into()],
+            comment: Some("lookups".into()),
+        };
+        m.tables.insert(
+            t.clone(),
+            Table { name: t.clone(), columns, comment: Some("people".into()), constraints: vec![pk, fk], indexes: vec![index] },
+        );
         let mood = QualName::new("app", "mood");
         m.enums.insert(mood.clone(), Enum { name: mood, labels: vec!["sad".into(), "ok".into()], comment: None });
         let seq = QualName::new("app", "users_n_seq");
@@ -706,6 +744,13 @@ mod tests {
         assert_eq!(back, m);
         // `Identity` equality ignores the sequence name; the JSON does not.
         assert_eq!(serde_json::to_string(&back).expect("serialize"), json);
+    }
+
+    #[test]
+    fn json_without_indexes_reads_as_none() {
+        let s = r#"{"schemas":[],"tables":[{"name":{"schema":"public","name":"t"},"columns":[],"comment":null,"constraints":[]}],"enums":[],"sequences":[]}"#;
+        let m: Model = serde_json::from_str(s).expect("deserialize");
+        assert!(m.tables[&QualName::new("public", "t")].indexes.is_empty());
     }
 
     #[test]
@@ -745,7 +790,14 @@ mod tests {
             references: None,
             comment: None,
         };
-        m.tables.insert(t.clone(), Table { name: t, columns: vec![id], comment: None, constraints: vec![check] });
+        let index = Index {
+            name: "t_id_idx".into(),
+            definition: "CREATE UNIQUE INDEX t_id_idx ON public.t USING btree (id) NULLS NOT DISTINCT".into(),
+            unique: true,
+            columns: vec!["id".into()],
+            comment: None,
+        };
+        m.tables.insert(t.clone(), Table { name: t, columns: vec![id], comment: None, constraints: vec![check], indexes: vec![index] });
         let want = r#"{
   "schemas": [
     {
@@ -795,6 +847,17 @@ mod tests {
             "id"
           ],
           "references": null,
+          "comment": null
+        }
+      ],
+      "indexes": [
+        {
+          "name": "t_id_idx",
+          "definition": "CREATE UNIQUE INDEX t_id_idx ON public.t USING btree (id) NULLS NOT DISTINCT",
+          "unique": true,
+          "columns": [
+            "id"
+          ],
           "comment": null
         }
       ]

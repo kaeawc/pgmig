@@ -35,6 +35,14 @@
 //! without a cycle. A foreign key is dropped before the table or constraint it references; a
 //! constraint is dropped before the columns it uses change or go, and added after they are set.
 //!
+//! # Indexes
+//!
+//! `CREATE INDEX` is the statement the server printed for the index (schema-qualified, whatever
+//! [`PlanOptions`] says), run after the table and the columns it uses exist and have settled.
+//! `DROP INDEX` runs before the columns it uses change or go, and before a constraint or index of
+//! the same name is created. A table's indexes are dropped with it. Indexes are created without
+//! `CONCURRENTLY`: the plan runs in a transaction.
+//!
 //! # Objects outside the changes
 //!
 //! A change may reference an object no change creates or drops: one that already exists and is
@@ -56,7 +64,9 @@ pub use policy::{Cause, Skipped, skip};
 
 use graph::{Deps, Node, Object};
 use pgmig_diff::{Change, CommentTarget, EnumPosition};
-use pgmig_model::{Column, Constraint, Generated, Identity, OwnedBy, QualName, SequenceOptions, quote_ident, quote_literal};
+use pgmig_model::{
+    Column, Constraint, ConstraintKind, Generated, Identity, OwnedBy, QualName, SequenceOptions, quote_ident, quote_literal,
+};
 use serde::{Deserialize, Serialize};
 
 /// Serialized as `{"statements": [...], "commit_after": <index or null>}`.
@@ -174,7 +184,7 @@ fn phase(change: &Change) -> u8 {
         Change::AddColumn { .. } => 4,
         // A column cannot have a default and an identity at once. A constraint goes before the
         // columns it uses change (a primary key column cannot drop NOT NULL).
-        Change::DropIdentity { .. } | Change::DropDefault { .. } | Change::DropConstraint { .. } => 5,
+        Change::DropIdentity { .. } | Change::DropDefault { .. } | Change::DropConstraint { .. } | Change::DropIndex { .. } => 5,
         Change::AlterColumnType { .. } => 6,
         Change::SetDefault { .. } => 7,
         Change::DropNotNull { .. } | Change::SetNotNull { .. } => 8,
@@ -184,7 +194,8 @@ fn phase(change: &Change) -> u8 {
         Change::SetSequenceOwner { .. }
         | Change::AddConstraint { .. }
         | Change::RenameConstraint { .. }
-        | Change::AlterConstraint { .. } => 10,
+        | Change::AlterConstraint { .. }
+        | Change::CreateIndex { .. } => 10,
         Change::DropColumn { .. } => 11,
         Change::DropTable { .. } => 12,
         Change::DropSequence(_) => 13,
@@ -196,6 +207,24 @@ fn phase(change: &Change) -> u8 {
 }
 
 fn deps(change: &Change) -> Deps {
+    let mut d = object_deps(change);
+    // Tables, sequences and indexes share the relation namespace (see [`Object::Relation`]).
+    let relations = |objects: &[Object]| -> Vec<Object> {
+        objects
+            .iter()
+            .filter_map(|o| match o {
+                Object::Table(q) | Object::Sequence(q) | Object::Index(q) => Some(Object::Relation(q.clone())),
+                _ => None,
+            })
+            .collect()
+    };
+    let (created, dropped) = (relations(&d.creates), relations(&d.drops));
+    d.creates.extend(created);
+    d.drops.extend(dropped);
+    d
+}
+
+fn object_deps(change: &Change) -> Deps {
     let column = |table: &QualName, column: &str| Object::Column(table.clone(), column.to_owned());
     let in_table = |table: &QualName| Object::Table(table.clone());
     match change {
@@ -208,6 +237,7 @@ fn deps(change: &Change) -> Deps {
             let mut creates = vec![Object::Table(t.name.clone()), Object::Type(t.name.clone())];
             creates.extend(t.columns.iter().filter_map(|c| Some(identity_sequence(&t.name, &c.name, c.identity.as_ref()?))));
             creates.extend(t.constraints.iter().map(|c| constraint(&t.name, &c.name)));
+            creates.extend(table_indexes(t));
             Deps { creates, requires, ..Deps::default() }
         }
         Change::DropTable { table: t, owned_sequences } => {
@@ -219,6 +249,7 @@ fn deps(change: &Change) -> Deps {
             drops.extend(sequences(owned_sequences));
             // With the table go its constraints, and its foreign keys stop using what they reference.
             drops.extend(t.constraints.iter().map(|c| constraint(&t.name, &c.name)));
+            drops.extend(table_indexes(t));
             releases.extend(t.constraints.iter().flat_map(referenced).filter(|o| !is_of_table(o, &t.name)));
             Deps { drops, releases, ..Deps::default() }
         }
@@ -295,7 +326,7 @@ fn deps(change: &Change) -> Deps {
         Change::AddConstraint { table, constraint: c } => {
             let columns: Vec<Object> = c.columns.iter().map(|col| column(table, col)).collect();
             Deps {
-                creates: vec![constraint(table, &c.name)],
+                creates: [vec![constraint(table, &c.name)], constraint_index(table, c, &c.name)].concat(),
                 // Added once its columns, and those a foreign key references, have their final type
                 // and nullability.
                 alters: [columns.clone(), referenced_column_types(c)].concat(),
@@ -306,7 +337,7 @@ fn deps(change: &Change) -> Deps {
         Change::DropConstraint { table, constraint: c } => {
             let columns: Vec<Object> = c.columns.iter().map(|col| column(table, col)).collect();
             Deps {
-                drops: vec![constraint(table, &c.name)],
+                drops: [vec![constraint(table, &c.name)], constraint_index(table, c, &c.name)].concat(),
                 // Dropped before the columns it uses, or a foreign key references, change type.
                 alters: [columns.clone(), referenced_column_types(c)].concat(),
                 releases: [vec![in_table(table)], columns, referenced(c)].concat(),
@@ -314,13 +345,30 @@ fn deps(change: &Change) -> Deps {
             }
         }
         Change::RenameConstraint { table, from, to } => Deps {
-            drops: vec![constraint(table, from)],
-            creates: vec![constraint(table, &to.name)],
+            // The constraint's index is renamed with it.
+            drops: [vec![constraint(table, from)], constraint_index(table, to, from)].concat(),
+            creates: [vec![constraint(table, &to.name)], constraint_index(table, to, &to.name)].concat(),
             requires: vec![in_table(table)],
             ..Deps::default()
         },
         Change::AlterConstraint { table, to } => {
             Deps { alters: vec![constraint(table, &to.name)], requires: vec![in_table(table)], ..Deps::default() }
+        }
+        Change::CreateIndex { table, index } => {
+            let columns = index.columns.iter().map(|col| column(table, col));
+            Deps {
+                creates: vec![index_object(table, &index.name)],
+                requires: std::iter::once(in_table(table)).chain(columns).collect(),
+                ..Deps::default()
+            }
+        }
+        Change::DropIndex { table, index } => {
+            let columns = index.columns.iter().map(|col| column(table, col));
+            Deps {
+                drops: vec![index_object(table, &index.name)],
+                releases: std::iter::once(in_table(table)).chain(columns).collect(),
+                ..Deps::default()
+            }
         }
         Change::SetComment { target, .. } => {
             // A comment only waits for the object (and a column's table) to exist.
@@ -331,6 +379,7 @@ fn deps(change: &Change) -> Deps {
                 CommentTarget::Type(t) => vec![Object::Type(t.clone())],
                 CommentTarget::Sequence(s) => vec![Object::Sequence(s.clone())],
                 CommentTarget::Constraint { table: t, name: c } => vec![in_table(t), constraint(t, c)],
+                CommentTarget::Index { table: t, name: i } => vec![in_table(t), index_object(t, i)],
             };
             Deps { requires, ..Deps::default() }
         }
@@ -353,13 +402,34 @@ fn constraint(table: &QualName, name: &str) -> Object {
     Object::Constraint(table.clone(), name.to_owned())
 }
 
-/// What a foreign key references: the table, its columns and the constraint whose index it uses.
-/// Empty for other constraints.
+/// An index in `table`'s schema.
+fn index_object(table: &QualName, name: &str) -> Object {
+    Object::Index(QualName::new(table.schema.clone(), name))
+}
+
+/// The index a primary key, unique or exclusion constraint owns, under `name`; none for others.
+fn constraint_index(table: &QualName, c: &Constraint, name: &str) -> Vec<Object> {
+    match c.kind {
+        ConstraintKind::PrimaryKey | ConstraintKind::Unique | ConstraintKind::Exclusion => vec![index_object(table, name)],
+        ConstraintKind::Check | ConstraintKind::ForeignKey => Vec::new(),
+    }
+}
+
+/// A table's indexes: its own and its constraints'.
+fn table_indexes(t: &pgmig_model::Table) -> Vec<Object> {
+    let mut out: Vec<Object> = t.constraints.iter().flat_map(|c| constraint_index(&t.name, c, &c.name)).collect();
+    out.extend(t.indexes.iter().map(|i| index_object(&t.name, &i.name)));
+    out
+}
+
+/// What a foreign key references: the table, its columns and the constraint or index whose index
+/// it uses (by name, both). Empty for other constraints.
 fn referenced(c: &Constraint) -> Vec<Object> {
     let Some(r) = &c.references else { return Vec::new() };
     let mut out = vec![Object::Table(r.table.clone())];
     out.extend(r.columns.iter().map(|col| Object::Column(r.table.clone(), col.clone())));
     out.extend(r.constraint.iter().map(|name| constraint(&r.table, name)));
+    out.extend(r.constraint.iter().map(|name| index_object(&r.table, name)));
     out
 }
 
@@ -575,6 +645,8 @@ fn statement(change: &Change, opts: &PlanOptions) -> String {
             };
             format!("ALTER TABLE {} ALTER CONSTRAINT {} {timing}", n(table), quote_ident(&to.name))
         }
+        Change::CreateIndex { index, .. } => index.definition.clone(),
+        Change::DropIndex { table, index } => format!("DROP INDEX {}", n(&QualName::new(table.schema.clone(), index.name.clone()))),
         Change::SetComment { target, comment } => {
             let object = match target {
                 CommentTarget::Schema(s) => format!("SCHEMA {}", quote_ident(s)),
@@ -583,6 +655,7 @@ fn statement(change: &Change, opts: &PlanOptions) -> String {
                 CommentTarget::Type(t) => format!("TYPE {}", n(t)),
                 CommentTarget::Sequence(s) => format!("SEQUENCE {}", n(s)),
                 CommentTarget::Constraint { table: t, name: c } => format!("CONSTRAINT {} ON {}", quote_ident(c), n(t)),
+                CommentTarget::Index { table: t, name: i } => format!("INDEX {}", n(&QualName::new(t.schema.clone(), i.clone()))),
             };
             format!("COMMENT ON {object} IS {}", comment.as_deref().map_or("NULL".to_owned(), quote_literal))
         }
@@ -642,7 +715,7 @@ mod tests {
     }
 
     fn table(schema: &str, name: &str, columns: Vec<Column>) -> Table {
-        Table { name: QualName::new(schema, name), columns, comment: None, constraints: vec![] }
+        Table { name: QualName::new(schema, name), columns, comment: None, constraints: vec![], indexes: vec![] }
     }
 
     fn row_type(schema: &str, name: &str) -> Option<QualName> {
@@ -1332,5 +1405,129 @@ mod tests {
             renamed,
             ["ALTER TABLE \"App\".t RENAME CONSTRAINT old TO \"Odd\"", "COMMENT ON CONSTRAINT \"Odd\" ON \"App\".t IS 'it''s'"]
         );
+    }
+    fn index(table: &str, name: &str, key: &str, columns: &[&str]) -> pgmig_model::Index {
+        pgmig_model::Index {
+            name: name.into(),
+            definition: format!("CREATE INDEX {name} ON public.{table} USING btree {key}"),
+            unique: false,
+            columns: columns.iter().map(|c| c.to_string()).collect(),
+            comment: None,
+        }
+    }
+
+    #[test]
+    fn an_index_is_created_after_its_table_and_columns_and_commented_after_that() {
+        let t = QualName::new("public", "t");
+        let i = index("t", "t_x_idx", "(lower(x))", &["x"]);
+        let changes = [
+            Change::SetComment { target: CommentTarget::Index { table: t.clone(), name: i.name.clone() }, comment: Some("it's".into()) },
+            Change::CreateIndex { table: t.clone(), index: i },
+            Change::AddColumn { table: t.clone(), column: col("x", None) },
+            Change::CreateIndex { table: QualName::new("public", "n"), index: index("n", "n_idx", "(id)", &["id"]) },
+            Change::CreateTable(table("public", "n", vec![col("id", None)])),
+        ];
+        assert_eq!(
+            sql(&changes),
+            [
+                "CREATE TABLE public.n (\n    id integer\n)",
+                "ALTER TABLE public.t ADD COLUMN x integer",
+                "CREATE INDEX t_x_idx ON public.t USING btree (lower(x))",
+                "CREATE INDEX n_idx ON public.n USING btree (id)",
+                "COMMENT ON INDEX public.t_x_idx IS 'it''s'",
+            ]
+        );
+        let opts = PlanOptions { unqualified_schema: Some("public".into()) };
+        let drop = Change::DropIndex { table: t.clone(), index: index("t", "Odd", "(x)", &["x"]) };
+        assert_eq!(plan_with(std::slice::from_ref(&drop), &opts).expect("plan").statements, ["DROP INDEX \"Odd\""]);
+        assert_eq!(sql(&[drop]), ["DROP INDEX public.\"Odd\""]);
+    }
+
+    #[test]
+    fn an_index_is_dropped_before_its_columns_change_or_go_and_before_its_name_is_reused() {
+        let t = QualName::new("public", "t");
+        let changes = [
+            Change::CreateIndex { table: t.clone(), index: index("t", "t_idx", "(y)", &["y"]) },
+            Change::DropColumn { table: t.clone(), column: "x".into(), type_ref: None, sequences: vec![], owned_sequences: vec![] },
+            Change::AlterColumnType {
+                table: t.clone(),
+                column: "y".into(),
+                type_name: "bigint".into(),
+                type_ref: None,
+                old_type_ref: None,
+                using: None,
+            },
+            // A constraint taking the index's name waits for the drop too.
+            Change::AddConstraint {
+                table: t.clone(),
+                constraint: constraint("t_x_key", pgmig_model::ConstraintKind::Unique, "UNIQUE (y)", &["y"]),
+            },
+            Change::DropIndex { table: t.clone(), index: index("t", "t_x_key", "(x)", &["x"]) },
+            Change::DropIndex { table: t.clone(), index: index("t", "t_idx", "(x, y)", &["x", "y"]) },
+        ];
+        assert_eq!(
+            sql(&changes),
+            [
+                "DROP INDEX public.t_x_key",
+                "DROP INDEX public.t_idx",
+                "ALTER TABLE public.t ALTER COLUMN y TYPE bigint",
+                "CREATE INDEX t_idx ON public.t USING btree (y)",
+                "ALTER TABLE public.t ADD CONSTRAINT t_x_key UNIQUE (y)",
+                "ALTER TABLE public.t DROP COLUMN x",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_foreign_key_using_a_unique_index_is_dropped_before_it_and_added_after_it() {
+        let mut f = fkey("t", "pid", "p");
+        f.references.as_mut().expect("references").constraint = Some("p_id_idx".into());
+        let t = QualName::new("public", "t");
+        let p = QualName::new("public", "p");
+        let unique = pgmig_model::Index { unique: true, ..index("p", "p_id_idx", "(id)", &["id"]) };
+        let changes = [
+            Change::DropIndex { table: p.clone(), index: unique.clone() },
+            Change::CreateIndex { table: p, index: unique },
+            Change::AddConstraint { table: t.clone(), constraint: f.clone() },
+            Change::DropConstraint { table: t, constraint: f },
+        ];
+        assert_eq!(
+            sql(&changes),
+            [
+                "ALTER TABLE public.t DROP CONSTRAINT t_pid_fkey",
+                "DROP INDEX public.p_id_idx",
+                "CREATE INDEX p_id_idx ON public.p USING btree (id)",
+                "ALTER TABLE public.t ADD CONSTRAINT t_pid_fkey FOREIGN KEY (pid) REFERENCES p(id)",
+            ]
+        );
+    }
+
+    #[test]
+    fn tables_sequences_and_indexes_reuse_each_others_names_after_the_drop() {
+        let t = QualName::new("public", "t");
+        let foo = || index("t", "foo", "(id)", &["id"]);
+        let drop_index = || Change::DropIndex { table: t.clone(), index: foo() };
+        let create_index = || Change::CreateIndex { table: t.clone(), index: foo() };
+        // Index `foo` dropped, a table or sequence `foo` created.
+        assert_eq!(
+            sql(&[drop_index(), Change::CreateTable(table("public", "foo", vec![col("id", None)]))]),
+            ["DROP INDEX public.foo", "CREATE TABLE public.foo (\n    id integer\n)"]
+        );
+        assert_eq!(
+            sql(&[drop_index(), Change::CreateSequence(sequence("foo", "bigint", opts("bigint", 1)))]),
+            ["DROP INDEX public.foo", "CREATE SEQUENCE public.foo"]
+        );
+        // A table or sequence `foo` dropped, index `foo` created.
+        assert_eq!(
+            sql(&[create_index(), drop_table(table("public", "foo", vec![col("id", None)]))]),
+            ["DROP TABLE public.foo", "CREATE INDEX foo ON public.t USING btree (id)"]
+        );
+        assert_eq!(
+            sql(&[create_index(), Change::DropSequence(sequence("foo", "bigint", opts("bigint", 1)))]),
+            ["DROP SEQUENCE public.foo", "CREATE INDEX foo ON public.t USING btree (id)"]
+        );
+        // Another schema's name is another relation.
+        let other = Change::CreateTable(table("app", "foo", vec![col("id", None)]));
+        assert_eq!(sql(&[other, drop_index()])[0], "CREATE TABLE app.foo (\n    id integer\n)");
     }
 }

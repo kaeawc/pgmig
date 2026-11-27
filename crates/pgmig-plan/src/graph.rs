@@ -39,6 +39,15 @@ pub enum Object {
     /// A table constraint by its table and name. A foreign key requires the constraint whose
     /// index it uses; a table's drop drops its constraints.
     Constraint(QualName, String),
+    /// An index by its schema-qualified name: one no constraint owns, or a primary key, unique or
+    /// exclusion constraint's (named like the constraint). A foreign key requires the index it
+    /// uses; a table's drop drops its indexes.
+    Index(QualName),
+    /// A relation name (`pg_class`): tables, sequences and indexes share one namespace per schema.
+    /// A step creating or dropping a [`Object::Table`], [`Object::Sequence`] or [`Object::Index`]
+    /// creates or drops the relation of its name too, so dropping index `foo` runs before creating
+    /// table `foo`.
+    Relation(QualName),
 }
 
 /// What one step does to which objects.

@@ -49,6 +49,19 @@
 //! through others), which are dropped first ([`Change::DropConstraint`]) so the drops don't
 //! depend on each other in a cycle.
 //!
+//! # Indexes
+//!
+//! Indexes no constraint owns are compared by their printed definition (`pg_get_indexdef`) and
+//! matched by name within their table. A changed index is dropped and created again
+//! ([`Change::DropIndex`], [`Change::CreateIndex`]); the catalog cannot tell a renamed index from
+//! one dropped and another created, so that is what a rename is too. An index whose column
+//! changes type is rebuilt by Postgres and is not a change unless its definition prints
+//! differently. A new table's indexes are created after it; a dropped table's go with it, and
+//! [`Change::DropTable`] lists them. An index removed from a kept table is always dropped
+//! explicitly, also when a column it uses is dropped (which would drop it implicitly): the drop
+//! runs first. A foreign key that stays the same but references a unique index that is dropped
+//! (or dropped and created again) is dropped first and added again after, as for a constraint.
+//!
 //! # Type changes
 //!
 //! [`diff`] knows types only by their printed names, so it cannot tell whether Postgres converts
@@ -68,7 +81,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use pgmig_model::{Column, Constraint, ConstraintKind, Enum, Identity, Model, OwnedBy, QualName, Sequence, Table, quote_ident};
+use pgmig_model::{Column, Constraint, ConstraintKind, Enum, Identity, Index, Model, OwnedBy, QualName, Sequence, Table, quote_ident};
 
 /// An object that can carry a comment. New kinds (constraints, indexes) add a variant here, a
 /// matching `Object` in the planner, and a comparison in [`diff`].
@@ -86,6 +99,11 @@ pub enum CommentTarget {
     Sequence(QualName),
     /// A table constraint by its table and name.
     Constraint {
+        table: QualName,
+        name: String,
+    },
+    /// An index by its table and name (it is in the table's schema).
+    Index {
         table: QualName,
         name: String,
     },
@@ -240,6 +258,16 @@ pub enum Change {
         table: QualName,
         to: Constraint,
     },
+    /// `CREATE INDEX` as the server printed it ([`Index::definition`]).
+    CreateIndex {
+        table: QualName,
+        index: Index,
+    },
+    /// `DROP INDEX`; `index` is the index as it was.
+    DropIndex {
+        table: QualName,
+        index: Index,
+    },
     /// `COMMENT ON ... IS <comment>`; `None` removes the comment. Never emitted for an object
     /// that is being dropped.
     SetComment {
@@ -308,6 +336,8 @@ change_kinds! {
     DropConstraint => "drop_constraint",
     RenameConstraint => "rename_constraint",
     AlterConstraint => "alter_constraint",
+    CreateIndex => "create_index",
+    DropIndex => "drop_index",
     SetComment => "set_comment",
 }
 
@@ -367,6 +397,9 @@ impl Change {
             Change::AddConstraint { table, constraint } | Change::DropConstraint { table, constraint } => col(table, &constraint.name),
             Change::RenameConstraint { table, from, .. } => col(table, from),
             Change::AlterConstraint { table, to } => col(table, &to.name),
+            Change::CreateIndex { table, index } | Change::DropIndex { table, index } => {
+                QualName::new(table.schema.clone(), index.name.clone()).to_string()
+            }
             Change::SetComment { target, .. } => match target {
                 CommentTarget::Schema(s) => format!("schema {}", quote_ident(s)),
                 CommentTarget::Table(t) => format!("table {t}"),
@@ -374,6 +407,7 @@ impl Change {
                 CommentTarget::Type(t) => format!("type {t}"),
                 CommentTarget::Sequence(s) => format!("sequence {s}"),
                 CommentTarget::Constraint { table, name } => format!("constraint {}", col(table, name)),
+                CommentTarget::Index { table, name } => format!("index {}", QualName::new(table.schema.clone(), name.clone())),
             },
         }
     }
@@ -489,6 +523,7 @@ pub fn diff(a: &Model, b: &Model) -> Vec<Change> {
             None => {
                 let mut created = table.clone();
                 created.constraints.retain(created_with_table);
+                created.indexes.clear();
                 changes.push(Change::CreateTable(created));
                 set_comment(CommentTarget::Table(name.clone()), None, table.comment.as_ref(), &mut changes);
                 for col in &table.columns {
@@ -498,6 +533,10 @@ pub fn diff(a: &Model, b: &Model) -> Vec<Change> {
                         col.comment.as_ref(),
                         &mut changes,
                     );
+                }
+                for i in &table.indexes {
+                    changes.push(Change::CreateIndex { table: name.clone(), index: i.clone() });
+                    set_comment(index_target(name, i), None, i.comment.as_ref(), &mut changes);
                 }
             }
             Some(old) => diff_table(old, table, &|c| owned(name, Some(c)), &mut changes),
@@ -603,8 +642,9 @@ fn diff_constraints(a: &Model, b: &Model, changes: &mut Vec<Change>) {
     let target = |t: &QualName, c: &Constraint| CommentTarget::Constraint { table: t.clone(), name: c.name.clone() };
     let kept: Vec<(&Table, &Table)> = b.tables.values().filter_map(|t| Some((a.tables.get(&t.name)?, t))).collect();
     let steps: Vec<(&QualName, Vec<Step>)> = kept.iter().map(|(old, new)| (&new.name, constraint_steps(old, new))).collect();
-    // Constraints of `a` that stop existing under their name: a foreign key using one must go too.
-    let mut removed = BTreeSet::new();
+    // Constraints and indexes of `a` that stop existing under their name: a foreign key using one
+    // must go too.
+    let mut removed = removed_indexes(a, b);
     for (table, steps) in &steps {
         for step in steps {
             if let Step::Replace(o, _) | Step::Drop(o) = step {
@@ -802,6 +842,42 @@ fn diff_table(a: &Table, b: &Table, owned: &dyn Fn(&str) -> Vec<QualName>, chang
             owned_sequences: owned(&old.name),
         });
     }
+    for i in &b.indexes {
+        match a.index(&i.name) {
+            Some(o) if o.definition == i.definition => set_comment(index_target(table, i), o.comment.as_ref(), i.comment.as_ref(), changes),
+            Some(o) => {
+                changes.push(Change::DropIndex { table: table.clone(), index: o.clone() });
+                changes.push(Change::CreateIndex { table: table.clone(), index: i.clone() });
+                set_comment(index_target(table, i), None, i.comment.as_ref(), changes);
+            }
+            None => {
+                changes.push(Change::CreateIndex { table: table.clone(), index: i.clone() });
+                set_comment(index_target(table, i), None, i.comment.as_ref(), changes);
+            }
+        }
+    }
+    for o in a.indexes.iter().filter(|o| b.index(&o.name).is_none()) {
+        changes.push(Change::DropIndex { table: table.clone(), index: o.clone() });
+    }
+}
+
+fn index_target(table: &QualName, i: &Index) -> CommentTarget {
+    CommentTarget::Index { table: table.clone(), name: i.name.clone() }
+}
+
+/// The indexes of tables both models have that stop existing under their name: dropped, or
+/// dropped and created again.
+fn removed_indexes(a: &Model, b: &Model) -> BTreeSet<(QualName, String)> {
+    let mut out = BTreeSet::new();
+    for new in b.tables.values() {
+        let Some(old) = a.tables.get(&new.name) else { continue };
+        for o in &old.indexes {
+            if new.index(&o.name).is_none_or(|i| i.definition != o.definition) {
+                out.insert((new.name.clone(), o.name.clone()));
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -849,7 +925,7 @@ mod tests {
     fn model(columns: Vec<Column>) -> Model {
         let mut m = Model::empty_database();
         let name = QualName::new("public", "t");
-        m.tables.insert(name.clone(), Table { name, columns, comment: None, constraints: vec![] });
+        m.tables.insert(name.clone(), Table { name, columns, comment: None, constraints: vec![], indexes: vec![] });
         m
     }
 
@@ -940,7 +1016,8 @@ mod tests {
         let mut c = col("id", "integer");
         c.comment = comment.map(Into::into);
         let name = QualName::new("public", "t");
-        m.tables.insert(name.clone(), Table { name, columns: vec![c], comment: comment.map(Into::into), constraints: vec![] });
+        m.tables
+            .insert(name.clone(), Table { name, columns: vec![c], comment: comment.map(Into::into), constraints: vec![], indexes: vec![] });
         m
     }
 
@@ -1276,8 +1353,10 @@ mod tests {
         let mut m = Model::empty_database();
         for (name, constraints) in tables {
             let name = QualName::new("public", *name);
-            m.tables
-                .insert(name.clone(), Table { name, columns: vec![col("id", "integer")], comment: None, constraints: constraints.clone() });
+            m.tables.insert(
+                name.clone(),
+                Table { name, columns: vec![col("id", "integer")], comment: None, constraints: constraints.clone(), indexes: vec![] },
+            );
         }
         m
     }
@@ -1460,6 +1539,97 @@ mod tests {
         );
     }
 
+    /// An index on `public.t` with the key `(n)` as printed.
+    fn idx(name: &str, key: &str) -> Index {
+        Index {
+            name: name.into(),
+            definition: format!("CREATE INDEX {name} ON public.t USING btree {key}"),
+            unique: false,
+            columns: vec!["n".into()],
+            comment: None,
+        }
+    }
+
+    fn with_indexes(indexes: Vec<Index>) -> Model {
+        let mut m = model(vec![col("n", "integer")]);
+        m.tables.get_mut(&t("t")).expect("t").indexes = indexes;
+        m
+    }
+
+    #[test]
+    fn indexes_are_created_replaced_and_dropped_by_name() {
+        let commented = |i: Index, c: &str| Index { comment: Some(c.into()), ..i };
+        let a =
+            with_indexes(vec![idx("same", "(n)"), commented(idx("changed", "(n)"), "kept"), idx("gone", "(n)"), idx("old_name", "(n)")]);
+        let b = with_indexes(vec![
+            commented(idx("same", "(n)"), "new"),
+            commented(idx("changed", "(n DESC)"), "kept"),
+            idx("added", "(n)"),
+            idx("new_name", "(n)"),
+        ]);
+        let target = |name: &str| CommentTarget::Index { table: t("t"), name: name.into() };
+        assert_eq!(
+            diff(&a, &b),
+            vec![
+                set(target("same"), Some("new")),
+                Change::DropIndex { table: t("t"), index: commented(idx("changed", "(n)"), "kept") },
+                Change::CreateIndex { table: t("t"), index: commented(idx("changed", "(n DESC)"), "kept") },
+                set(target("changed"), Some("kept")),
+                Change::CreateIndex { table: t("t"), index: idx("added", "(n)") },
+                // A rename is a drop and a create: the catalog cannot tell them apart.
+                Change::CreateIndex { table: t("t"), index: idx("new_name", "(n)") },
+                Change::DropIndex { table: t("t"), index: idx("gone", "(n)") },
+                Change::DropIndex { table: t("t"), index: idx("old_name", "(n)") },
+            ]
+        );
+        assert!(diff(&b, &b).is_empty());
+    }
+
+    #[test]
+    fn a_new_tables_indexes_follow_it_and_a_dropped_tables_go_with_it() {
+        let b = with_indexes(vec![Index { comment: Some("c".into()), ..idx("i", "(n)") }]);
+        let mut empty = Model::empty_database();
+        empty.tables.clear();
+        let created = diff(&empty, &b);
+        let Some(Change::CreateTable(table)) = created.first() else { panic!("{created:?}") };
+        assert!(table.indexes.is_empty());
+        assert_eq!(
+            created[1..],
+            [
+                Change::CreateIndex { table: t("t"), index: Index { comment: Some("c".into()), ..idx("i", "(n)") } },
+                set(CommentTarget::Index { table: t("t"), name: "i".into() }, Some("c")),
+            ]
+        );
+        let dropped = diff(&b, &empty);
+        assert!(matches!(&dropped[..], [Change::DropTable { table, .. }] if table.indexes.len() == 1), "{dropped:?}");
+    }
+
+    #[test]
+    fn a_foreign_key_using_a_replaced_unique_index_is_added_again() {
+        let f = fk("f", "p", "p_id_idx", "");
+        let unique_index = |key: &str| Index {
+            name: "p_id_idx".into(),
+            definition: format!("CREATE UNIQUE INDEX p_id_idx ON public.p USING btree {key}"),
+            unique: true,
+            columns: vec!["id".into()],
+            comment: None,
+        };
+        let with = |key: &str| {
+            let mut m = tables(&[("p", vec![]), ("t", vec![f.clone()])]);
+            m.tables.get_mut(&t("p")).expect("p").indexes = vec![unique_index(key)];
+            m
+        };
+        assert_eq!(
+            diff(&with("(id)"), &with("(id) NULLS NOT DISTINCT")),
+            vec![
+                Change::DropIndex { table: t("p"), index: unique_index("(id)") },
+                Change::CreateIndex { table: t("p"), index: unique_index("(id) NULLS NOT DISTINCT") },
+                Change::DropConstraint { table: t("t"), constraint: f.clone() },
+                Change::AddConstraint { table: t("t"), constraint: f },
+            ]
+        );
+    }
+
     /// One change of every variant; [`variant`] fails to compile when a variant is added.
     fn every_change() -> Vec<Change> {
         use pgmig_model::{Generated, SequenceOptions};
@@ -1484,6 +1654,7 @@ mod tests {
             columns: vec![col("id", "integer")],
             comment: Some("t".into()),
             constraints: vec![constraint.clone()],
+            indexes: vec![idx("t_n_idx", "(n)")],
         };
         let owned = OwnedBy { table: t.clone(), column: "id".into() };
         let sequence =
@@ -1540,12 +1711,15 @@ mod tests {
             Change::DropConstraint { table: t.clone(), constraint: constraint.clone() },
             Change::RenameConstraint { table: t.clone(), from: "old".into(), to: constraint.clone() },
             Change::AlterConstraint { table: t.clone(), to: constraint },
+            Change::CreateIndex { table: t.clone(), index: idx("t_n_idx", "(n)") },
+            Change::DropIndex { table: t.clone(), index: idx("t_n_idx", "(n)") },
             Change::SetComment { target: CommentTarget::Schema("app".into()), comment: Some("x".into()) },
             Change::SetComment { target: CommentTarget::Table(t.clone()), comment: None },
             Change::SetComment { target: CommentTarget::Column { table: t.clone(), column: id() }, comment: Some("c".into()) },
             Change::SetComment { target: CommentTarget::Type(e), comment: None },
             Change::SetComment { target: CommentTarget::Sequence(s), comment: None },
-            Change::SetComment { target: CommentTarget::Constraint { table: t, name: "t_pkey".into() }, comment: None },
+            Change::SetComment { target: CommentTarget::Constraint { table: t.clone(), name: "t_pkey".into() }, comment: None },
+            Change::SetComment { target: CommentTarget::Index { table: t, name: "t_n_idx".into() }, comment: Some("i".into()) },
         ]
     }
 
@@ -1579,7 +1753,9 @@ mod tests {
             Change::DropConstraint { .. } => 24,
             Change::RenameConstraint { .. } => 25,
             Change::AlterConstraint { .. } => 26,
-            Change::SetComment { .. } => 27,
+            Change::CreateIndex { .. } => 27,
+            Change::DropIndex { .. } => 28,
+            Change::SetComment { .. } => 29,
         }
     }
 
@@ -1587,7 +1763,7 @@ mod tests {
     fn every_change_round_trips_through_json() {
         let changes = every_change();
         let covered: BTreeSet<usize> = changes.iter().map(variant).collect();
-        assert_eq!(covered, (0..28).collect(), "a sample for every variant");
+        assert_eq!(covered, (0..30).collect(), "a sample for every variant");
         for c in &changes {
             let json = serde_json::to_string(c).expect("serialize");
             let back: Change = serde_json::from_str(&json).expect(&json);

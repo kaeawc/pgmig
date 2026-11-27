@@ -7,7 +7,8 @@
 //! needs, or dropping it would fail (`2BP01`) or take the unmanaged object with it: the schema
 //! holding it, the enum or table row type a column uses, the sequence a default takes values from
 //! or that owns a sequence, the table, columns and key a foreign key references, the columns a
-//! constraint uses. Each is reported as [`Kept`].
+//! constraint or index uses. Each is reported as [`Kept`]. A table that stays keeps its unmanaged
+//! indexes; managed indexes go (with their table, or alone when the table stays).
 //!
 //! The revisions schema is never managed, so it stays with the migration history it records.
 //! Objects pgmig does not model (extensions, views, functions) are not dropped; one that depends on
@@ -82,7 +83,8 @@ pub fn clean_desired(full: &Model, opts: &Options) -> (Model, Vec<Kept>) {
                 return None;
             }
             let constraints = t.constraints.iter().filter(|c| mt.constraint(&c.name).is_none()).cloned().collect();
-            Some(Table { columns, constraints, ..t.clone() })
+            let indexes = t.indexes.iter().filter(|i| mt.index(&i.name).is_none()).cloned().collect();
+            Some(Table { columns, constraints, indexes, ..t.clone() })
         })
         .map(|t| (t.name.clone(), t))
         .collect();
@@ -146,6 +148,12 @@ fn needs(full: &Model, d: &Model) -> Vec<(Need, String)> {
                 }
             }
         }
+        for i in &t.indexes {
+            let index = format!("index {}", QualName::new(t.name.schema.clone(), i.name.clone()));
+            for c in &i.columns {
+                out.push((Need::Column(t.name.clone(), c.clone()), format!("{index} uses it")));
+            }
+        }
     }
     for e in d.enums.values() {
         out.push((Need::Schema(e.name.schema.clone()), format!("enum {} is in it", e.name)));
@@ -203,8 +211,18 @@ fn restore(full: &Model, d: &mut Model, need: &Need) -> Option<String> {
             if t.constraint(k).is_some() {
                 return None;
             }
-            t.constraints.push(full.tables.get(n)?.constraint(k)?.clone());
-            Some(format!("constraint {} on {n}", pgmig_model::quote_ident(k)))
+            if t.index(k).is_some() {
+                return None;
+            }
+            // A foreign key's index is a constraint's or, failing that, a unique index.
+            let ft = full.tables.get(n)?;
+            if let Some(c) = ft.constraint(k) {
+                t.constraints.push(c.clone());
+                return Some(format!("constraint {} on {n}", pgmig_model::quote_ident(k)));
+            }
+            t.indexes.push(ft.index(k)?.clone());
+            t.indexes.sort_by(|x, y| x.name.cmp(&y.name));
+            Some(format!("index {}", QualName::new(n.schema.clone(), k.clone())))
         }
     }
 }
@@ -243,7 +261,7 @@ mod tests {
         m.enums.insert(mood.clone(), Enum { name: mood.clone(), labels: vec!["a".into()], comment: None });
         for (name, cols) in [("keep", vec![col("m", Some(mood.clone()))]), ("gone", vec![col("id", None)])] {
             let n = QualName::new("public", name);
-            m.tables.insert(n.clone(), Table { name: n, columns: cols, comment: None, constraints: vec![] });
+            m.tables.insert(n.clone(), Table { name: n, columns: cols, comment: None, constraints: vec![], indexes: vec![] });
         }
         m
     }
@@ -277,5 +295,38 @@ mod tests {
         let objects: Vec<&str> = kept.iter().map(|k| k.object.as_str()).collect();
         assert_eq!(objects, ["enum app.mood", "schema app"]);
         assert_eq!(kept[0].because, "column public.keep.m uses it");
+    }
+    #[test]
+    fn indexes_follow_their_table_and_keep_the_columns_they_use() {
+        let index = |table: &str, name: &str, columns: &[&str]| pgmig_model::Index {
+            name: name.into(),
+            definition: format!("CREATE INDEX {name} ON public.{table} USING btree ({})", columns.join(", ")),
+            unique: false,
+            columns: columns.iter().map(|c| c.to_string()).collect(),
+            comment: None,
+        };
+        let mut full = model();
+        let gone = QualName::new("public", "gone");
+        full.tables.get_mut(&gone).expect("gone").columns.push(col("secret", None));
+        full.tables.get_mut(&gone).expect("gone").indexes =
+            vec![index("gone", "gone_id_idx", &["id"]), index("gone", "gone_both_idx", &["id", "secret"])];
+        full.tables.get_mut(&QualName::new("public", "keep")).expect("keep").indexes = vec![index("keep", "keep_m_idx", &["m"])];
+        let opts = Options {
+            filter: Filter::parse::<&str, _>(&[], &["table:public.keep", "public.gone.secret"]).expect("filter"),
+            ..Options::default()
+        };
+        let (d, kept) = clean_desired(&full, &opts);
+        // The excluded table keeps its index.
+        assert_eq!(d.tables[&QualName::new("public", "keep")].indexes, [index("keep", "keep_m_idx", &["m"])]);
+        // The index over the excluded column is not managed: it stays, and so does the column it uses.
+        let g = &d.tables[&gone];
+        assert_eq!(g.indexes, [index("gone", "gone_both_idx", &["id", "secret"])]);
+        assert_eq!(g.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["id", "secret"]);
+        assert!(
+            kept.contains(&Kept { object: "column public.gone.id".into(), because: "index public.gone_both_idx uses it".into() }),
+            "{kept:?}"
+        );
+        let changes = diff(&opts.managed(&full), &opts.managed(&d));
+        assert_eq!(changes, [Change::DropIndex { table: gone, index: index("gone", "gone_id_idx", &["id"]) }]);
     }
 }

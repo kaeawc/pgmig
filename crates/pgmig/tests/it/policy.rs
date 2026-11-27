@@ -197,6 +197,30 @@ fn plans_with_skipped_changes_apply() {
             &[ChangeKind::RenameEnumValue],
             &["rename_enum_value public.mood (policy)", "set_default public.t.m (because rename_enum_value public.mood is skipped)"],
         ),
+        (
+            "replaced index under a kept foreign key",
+            "CREATE TABLE p (id int); CREATE UNIQUE INDEX p_id_idx ON p (id); CREATE TABLE c (pid int REFERENCES p (id));",
+            "CREATE TABLE p (id int); CREATE UNIQUE INDEX p_id_idx ON p (id) NULLS NOT DISTINCT; CREATE TABLE c (pid int REFERENCES p (id));",
+            &[ChangeKind::DropIndex],
+            &[
+                "drop_index public.p_id_idx (policy)",
+                "create_index public.p_id_idx (because drop_index public.p_id_idx is skipped)",
+                "add_constraint public.c.c_pid_fkey (because create_index public.p_id_idx is skipped)",
+                "drop_constraint public.c.c_pid_fkey (because add_constraint public.c.c_pid_fkey is skipped)",
+            ],
+        ),
+        (
+            "replaced unique constraint under a kept foreign key",
+            "CREATE TABLE p (id int CONSTRAINT p_id_key UNIQUE); CREATE TABLE c (pid int REFERENCES p (id));",
+            "CREATE TABLE p (id int CONSTRAINT p_id_key UNIQUE NULLS NOT DISTINCT); CREATE TABLE c (pid int REFERENCES p (id));",
+            &[ChangeKind::DropConstraint],
+            &[
+                "drop_constraint public.p.p_id_key (policy)",
+                "add_constraint public.p.p_id_key (because drop_constraint public.p.p_id_key is skipped)",
+                "drop_constraint public.c.c_pid_fkey (policy)",
+                "add_constraint public.c.c_pid_fkey (because add_constraint public.p.p_id_key is skipped)",
+            ],
+        ),
     ];
     for (name, from, to, kinds, want) in cases {
         let t = Tmp::new();
@@ -221,6 +245,40 @@ fn plans_with_skipped_changes_apply() {
         assert!(again.plan.is_empty(), "{name}: left to change: {:?}", again.plan.statements);
         assert!(!again.skipped.is_empty(), "{name}: the skipped difference stays and is reported again");
         assert!(again.skipped.iter().all(|s| res.skipped.contains(s)), "{name}: {:?}", again.skipped);
+    }
+}
+
+/// A foreign key dropped to replace the index it uses is kept with that index: a skipped
+/// `drop_index` (or `drop_constraint`) keeps the foreign key's drop out with its re-add.
+#[test]
+fn a_kept_replacement_keeps_the_foreign_key_using_it() {
+    let cases: &[(&str, &str, ChangeKind)] = &[
+        (
+            "CREATE TABLE p (id int); CREATE UNIQUE INDEX p_id_idx ON p (id); CREATE TABLE c (pid int REFERENCES p (id));",
+            "CREATE TABLE p (id int); CREATE UNIQUE INDEX p_id_idx ON p (id) NULLS NOT DISTINCT; CREATE TABLE c (pid int REFERENCES p (id));",
+            ChangeKind::DropIndex,
+        ),
+        (
+            "CREATE TABLE p (id int CONSTRAINT p_id_key UNIQUE); CREATE TABLE c (pid int REFERENCES p (id));",
+            "CREATE TABLE p (id int CONSTRAINT p_id_key UNIQUE NULLS NOT DISTINCT); CREATE TABLE c (pid int REFERENCES p (id));",
+            ChangeKind::DropConstraint,
+        ),
+    ];
+    for (from, to, kind) in cases {
+        let t = Tmp::new();
+        let db = TestDb::new();
+        db.connect().batch(from).expect("load target");
+        let (shadow, _keep) = shadow();
+        let req = PlanApplyRequest { target: db.conninfo.clone(), desired: t.sql("to.sql", to), shadow, options: skipping(&[*kind]) };
+        let res = api::schema_plan_apply(&req).expect("plan");
+        assert!(
+            res.plan.statements.iter().all(|s| !s.contains("c_pid_fkey")),
+            "{kind}: the foreign key is dropped or added: {:?}",
+            res.plan.statements
+        );
+        api::apply(&api::ApplyRequest { target: db.conninfo.clone(), plan: res.plan.clone() }).expect("apply");
+        let rows = db.connect().query("SELECT count(*) FROM pg_constraint WHERE conname = 'c_pid_fkey' AND contype = 'f'").expect("query");
+        assert_eq!(rows[0][0].as_deref(), Some("1"), "{kind}: the foreign key is gone");
     }
 }
 

@@ -8,6 +8,10 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
 
 ### Added
 
+- Indexes: inspected with `pg_get_indexdef` (access methods, expressions, partial, covering,
+  operator classes, collation, sort order, `NULLS NOT DISTINCT`, storage parameters) and planned as
+  drop and create, with comments; indexes owned by constraints are left to the constraints. Skip
+  kinds `create_index` and `drop_index`.
 - `pgmig schema clean --url <db>` drops every managed object in a database (for local
   development), leaving it equal to a new one: `public` stays with its standard comment, the
   revisions schema is never touched, and extensions are not dropped (tables an extension created,
@@ -112,7 +116,7 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
   created after that table and dropped before it.
 - Breaking library changes: `pgmig_plan::plan` returns `Result<Plan, Error>` (an error names a
   dependency cycle); `Change::DropTable` carries the dropped `Table`; `DropColumn` and
-  `AlterColumnType` carry the referenced types; `Column` has a new `type_ref` field; `DropTable` and `DropColumn` carry the sequences they drop; `Table` has a new `constraints` field; `AlterColumnType` has a new `using` field; `schema_diff`, `schema_inspect` and `schema_plan_apply` take `&Options`; `Plan` has a new `commit_after` field and `plan` can fail
+  `AlterColumnType` carry the referenced types; `Column` has a new `type_ref` field; `DropTable` and `DropColumn` carry the sequences they drop; `Table` has new `constraints` and `indexes` fields; `AlterColumnType` has a new `using` field; `schema_diff`, `schema_inspect` and `schema_plan_apply` take `&Options`; `Plan` has a new `commit_after` field and `plan` can fail
   with `Error::Unsupported`.
 
 ## [0.1.0] - 2026-11-26
