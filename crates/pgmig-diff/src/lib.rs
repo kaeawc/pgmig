@@ -2744,6 +2744,34 @@ mod tests {
     }
 
     #[test]
+    fn two_indexes_for_one_parent_index_refuse_the_attach_and_one_is_adopted() {
+        let index = |table: &str, name: &str| Index {
+            name: name.into(),
+            definition: format!("CREATE INDEX {name} ON public.{table} USING btree (v)"),
+            unique: false,
+            columns: vec!["v".into()],
+            comment: None,
+            on_partitioned_table: false,
+        };
+        let mut to = partitioned(vec![], &[("c", LOW)]);
+        to.tables.get_mut(&QualName::new("public", "p")).expect("table").indexes.push(index("p", "p_v_idx"));
+        let mut from = partitioned(vec![], &[]);
+        from.tables.get_mut(&QualName::new("public", "p")).expect("table").indexes.push(index("p", "p_v_idx"));
+        standalone(&mut from, "c", vec![Column { not_null: true, ..col("id", "integer") }, col("v", "text")]);
+        let c = from.tables.get_mut(&QualName::new("public", "c")).expect("table");
+        c.indexes.push(index("c", "c_a"));
+        let changes = diff(&from, &to);
+        assert!(matches!(&changes[..], [Change::AttachPartition { .. }]), "{changes:?}");
+        from.tables.get_mut(&QualName::new("public", "c")).expect("table").indexes.push(index("c", "c_b"));
+        let changes = diff(&from, &to);
+        assert!(
+            changes.iter().any(|c| matches!(c, Change::UnsupportedPartitionChange { detail, .. }
+                if detail.contains("more than one index defined like p_v_idx of public.p (c_a, c_b)"))),
+            "{changes:?}"
+        );
+    }
+
+    #[test]
     fn partition_key_changes_and_moves_between_parents_are_unsupported() {
         let mut to = partitioned(vec![], &[]);
         to.tables.values_mut().for_each(|t| t.partition_key = Some("LIST (id)".into()));

@@ -155,3 +155,25 @@ fn a_partitions_own_index_and_key_defined_like_its_parents_stay_its_own() {
         assert!(statements.is_empty(), "{statements:?}");
     }
 }
+
+#[test]
+fn attaching_a_table_with_two_indexes_for_one_parent_index_is_refused_naming_them() {
+    let parent = "CREATE TABLE t (id int NOT NULL, v text) PARTITION BY RANGE (id); CREATE INDEX t_v_idx ON t (v);";
+    let from = model(&format!(
+        "{parent} CREATE TABLE t_2 (id int NOT NULL, v text); CREATE INDEX t_2_a ON t_2 (v); CREATE INDEX t_2_b ON t_2 (v);"
+    ));
+    let (mut sh, _db) = shadow();
+    sh.load(&format!("{parent} CREATE TABLE t_2 PARTITION OF t FOR VALUES FROM (1) TO (10);")).expect("load");
+    let to = inspect(sh.conn()).expect("inspect");
+    let err = plan(&diff(&from, &to)).expect_err("refused");
+    let pgmig_plan::Error::Unsupported(messages) = &err else { panic!("{err:?}") };
+    assert_eq!(messages.len(), 1, "{messages:?}");
+    assert!(
+        messages[0].starts_with("table public.t_2: it has more than one index defined like t_v_idx of public.t (t_2_a, t_2_b)"),
+        "{messages:?}"
+    );
+    // One matching index is adopted: the attach is planned, and nothing is left to change after it.
+    let one = model(&format!("{parent} CREATE TABLE t_2 (id int NOT NULL, v text); CREATE INDEX t_2_a ON t_2 (v);"));
+    let statements = plan(&diff(&one, &to)).expect("plan").statements;
+    assert_eq!(statements, ["ALTER TABLE public.t ATTACH PARTITION public.t_2 FOR VALUES FROM (1) TO (10)"]);
+}
