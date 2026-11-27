@@ -453,10 +453,15 @@ pub enum Change {
         from: QualName,
         to: String,
     },
-    /// `ALTER SEQUENCE ... RENAME TO`.
+    /// `ALTER SEQUENCE ... RENAME TO`. `follows` is set when no `rename sequence` hint asks for it:
+    /// the sequence is renamed because the table or column that owns it is (see [`rename`]), and
+    /// it is the owner as the desired state names it. A policy that skips that rename skips this
+    /// one with it.
     RenameSequence {
         from: QualName,
         to: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        follows: Option<OwnedBy>,
     },
     /// `ALTER DOMAIN ... RENAME TO`.
     RenameDomain {
@@ -2324,7 +2329,7 @@ mod tests {
             Change::RenameTable { from: QualName::new("public", "t"), to: "u".into() },
             Change::RenameColumn { table: QualName::new("public", "t"), from: "a".into(), to: "b".into() },
             Change::RenameEnum { from: QualName::new("public", "e"), to: "f".into() },
-            Change::RenameSequence { from: QualName::new("public", "s"), to: "r".into() },
+            Change::RenameSequence { from: QualName::new("public", "s"), to: "r".into(), follows: None },
             Change::RenameDomain { from: QualName::new("public", "d"), to: "e".into() },
             Change::RenameCompositeType { from: QualName::new("public", "p"), to: "q".into() },
             Change::RenameIndex { table: QualName::new("public", "t"), from: "i".into(), to: "j".into() },

@@ -998,7 +998,7 @@ fn object_deps(change: &Change) -> Deps {
                 ..Deps::default()
             }
         }
-        Change::RenameSequence { from, to } => Deps {
+        Change::RenameSequence { from, to, .. } => Deps {
             creates: vec![Object::Sequence(QualName::new(from.schema.clone(), to.clone()))],
             drops: vec![Object::Sequence(from.clone())],
             ..Deps::default()
@@ -1248,7 +1248,7 @@ fn statement(change: &Change, opts: &PlanOptions) -> String {
             format!("ALTER TYPE {} RENAME TO {}", n(from), quote_ident(to))
         }
         Change::RenameDomain { from, to } => format!("ALTER DOMAIN {} RENAME TO {}", n(from), quote_ident(to)),
-        Change::RenameSequence { from, to } => format!("ALTER SEQUENCE {} RENAME TO {}", n(from), quote_ident(to)),
+        Change::RenameSequence { from, to, .. } => format!("ALTER SEQUENCE {} RENAME TO {}", n(from), quote_ident(to)),
         Change::RenameIndex { table, from, to } => {
             format!("ALTER INDEX {} RENAME TO {}", n(&QualName::new(table.schema.clone(), from.clone())), quote_ident(to))
         }
@@ -1733,7 +1733,7 @@ mod tests {
             Change::RenameEnum { from: QualName::new("app", "mood"), to: "feeling".into() },
             Change::RenameDomain { from: QualName::new("public", "d"), to: "e".into() },
             Change::RenameCompositeType { from: QualName::new("public", "p"), to: "q".into() },
-            Change::RenameSequence { from: QualName::new("public", "s"), to: "r".into() },
+            Change::RenameSequence { from: QualName::new("public", "s"), to: "r".into(), follows: None },
         ]
     }
 
