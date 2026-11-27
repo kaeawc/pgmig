@@ -48,10 +48,31 @@
 //! transaction (see [Units](#units)). Four kinds of index keep the plain statement, in the
 //! transaction with the rest: one on a table the plan creates (the table is new and empty, so
 //! there is nothing to wait for), one on a table the plan drops, one a constraint owns (the
-//! constraint creates and drops it, as without the policy), and one on a partitioned table
-//! (Postgres does not allow `CONCURRENTLY` there; see [`pgmig_model::Index::on_partitioned_table`]).
-//! A `CONCURRENTLY` build that fails leaves an `INVALID` index behind; `DROP INDEX CONCURRENTLY`
-//! removes it.
+//! constraint drops it, as without the policy, and creates it as below), and one on a partitioned
+//! table (Postgres does not allow `CONCURRENTLY` there; see
+//! [`pgmig_model::Index::on_partitioned_table`]). A `CONCURRENTLY` build that fails leaves an
+//! `INVALID` index behind; `DROP INDEX CONCURRENTLY` removes it.
+//!
+//! The policy also adds a primary key or unique constraint to a table that exists before the plan
+//! in two steps: `CREATE UNIQUE INDEX CONCURRENTLY` builds its index under the constraint's name,
+//! in a unit of its own outside a transaction (the statement is
+//! [`pgmig_model::Constraint::index_definition`], what the server printed for the index), then
+//! `ALTER TABLE ... ADD CONSTRAINT <name> {PRIMARY KEY | UNIQUE} USING INDEX <name>` (with the
+//! constraint's `DEFERRABLE` and `INITIALLY DEFERRED`) attaches it in a transaction, under a brief
+//! lock instead of one held for the whole build. The two steps take the constraint's place in the
+//! order: after the columns it uses are added and set (those statements commit before the build
+//! starts), and before the foreign keys that reference it. The plain `ADD CONSTRAINT` stays for a
+//! constraint on a table the plan creates or drops, on a table that loses a primary key or unique
+//! constraint in the same plan (a replaced key stays in one transaction, so the table never goes
+//! without it, or without the foreign keys to it, while an index builds), for a key in a
+//! tablespace (`pg_get_indexdef` leaves the tablespace out), on a partitioned table (Postgres allows neither
+//! `CONCURRENTLY` nor `USING INDEX` there; [`pgmig_model::Constraint::on_partitioned_table`]), for
+//! an exclusion constraint, and for an index `USING INDEX` cannot take (not a b-tree, such as a key
+//! `WITHOUT OVERLAPS`). A primary key needs its columns `NOT NULL`, and `USING INDEX` sets what is
+//! not set with a scan under an `ACCESS EXCLUSIVE` lock; the diff already sets them before the key
+//! (`SET NOT NULL`, which takes that scan itself), so the attach finds them set. A failed build
+//! leaves an `INVALID` index under the constraint's name; a failed attach leaves a valid index
+//! that the next diff drops before planning the constraint again.
 //!
 //! # Units
 //!
@@ -239,8 +260,9 @@ pub struct PlanOptions {
     /// SQL the server printed (types, defaults, constraint definitions), are left as they are:
     /// inspection prints those schema-qualified (`'a'::public.mood`, `REFERENCES public.b(id)`).
     pub unqualified_schema: Option<String>,
-    /// Create and drop indexes `CONCURRENTLY`, each such statement in a unit outside a transaction
-    /// (see the module doc). Absent from older JSON: false.
+    /// Create and drop indexes `CONCURRENTLY`, each such statement in a unit outside a transaction,
+    /// and add primary keys and unique constraints by building their index that way and attaching
+    /// it with `USING INDEX` (see the module doc). Absent from older JSON: false.
     #[serde(default)]
     pub concurrent_indexes: bool,
 }
@@ -272,19 +294,42 @@ pub fn plan_with(changes: &[Change], opts: &PlanOptions) -> Result<Plan, Error> 
             _ => None,
         })
         .collect();
+    // Tables that lose a primary key or unique constraint in the plan: a key added there keeps the
+    // plain `ADD CONSTRAINT`, so the old key is replaced in one transaction instead of the table
+    // going without it (and without foreign keys to it) while a new index builds.
+    let rekeyed: BTreeSet<&QualName> = changes
+        .iter()
+        .filter_map(|c| match c {
+            Change::DropConstraint { table, constraint }
+                if matches!(constraint.kind, ConstraintKind::PrimaryKey | ConstraintKind::Unique) =>
+            {
+                Some(table)
+            }
+            _ => None,
+        })
+        .collect();
+    let tables = Tables { whole, rekeyed };
     let (adds, rest): (Vec<&Change>, Vec<&Change>) = changes.iter().partition(|c| matches!(c, Change::AddEnumValue { .. }));
     let mut plan = Plan::default();
-    for step in sorted(&adds, opts, &whole)? {
+    for step in sorted(&adds, opts, &tables)?.into_iter().flatten() {
         plan.statements.push(step.sql);
     }
     plan.commit_after = (!plan.statements.is_empty() && !rest.is_empty()).then(|| plan.statements.len() - 1);
-    for step in sorted(&rest, opts, &whole)? {
+    for step in sorted(&rest, opts, &tables)?.into_iter().flatten() {
         if step.non_transactional {
             plan.non_transactional.push(plan.statements.len());
         }
         plan.statements.push(step.sql);
     }
     Ok(plan)
+}
+
+/// What the plan does to whole tables, which decides where the concurrent-index policy applies.
+struct Tables<'a> {
+    /// Tables the plan creates or drops: their indexes are not built or dropped concurrently.
+    whole: BTreeSet<&'a QualName>,
+    /// Tables that lose a primary key or unique constraint (see [`plan_with`]).
+    rekeyed: BTreeSet<&'a QualName>,
 }
 
 /// A planned statement.
@@ -294,29 +339,29 @@ struct Step {
     non_transactional: bool,
 }
 
-/// `change` as a step. `whole` holds the tables the plan creates or drops, whose indexes are not
-/// built or dropped concurrently.
-fn step(change: &Change, opts: &PlanOptions, whole: &BTreeSet<&QualName>) -> Step {
+/// `change` as steps: one statement, or with the policy, two for a key built concurrently (see
+/// [`using_index`]).
+fn steps(change: &Change, opts: &PlanOptions, tables: &Tables) -> Vec<Step> {
+    let whole = &tables.whole;
+    if opts.concurrent_indexes
+        && let Some(pair) = using_index(change, opts, tables)
+    {
+        return Vec::from(pair);
+    }
     let sql = statement(change, opts);
     if opts.concurrent_indexes
         && let Some(sql) = concurrently(change, &sql, whole)
     {
-        return Step { sql, non_transactional: true };
+        return vec![Step { sql, non_transactional: true }];
     }
-    Step { sql, non_transactional: false }
+    vec![Step { sql, non_transactional: false }]
 }
 
 /// The `CONCURRENTLY` form of `sql`, the statement for `change`, when the policy applies to it
 /// (see the module doc).
 fn concurrently(change: &Change, sql: &str, whole: &BTreeSet<&QualName>) -> Option<String> {
     match change {
-        Change::CreateIndex { table, index } if !index.on_partitioned_table && !whole.contains(table) => {
-            // The server prints `CREATE [UNIQUE] INDEX <name> ON ...`; a definition that is not in
-            // that form is left as it is.
-            let rest = sql.strip_prefix("CREATE UNIQUE INDEX ").map(|r| ("CREATE UNIQUE INDEX", r));
-            let (head, rest) = rest.or_else(|| sql.strip_prefix("CREATE INDEX ").map(|r| ("CREATE INDEX", r)))?;
-            Some(format!("{head} CONCURRENTLY {rest}"))
-        }
+        Change::CreateIndex { table, index } if !index.on_partitioned_table && !whole.contains(table) => concurrent_create(sql),
         Change::DropIndex { table, index } if !index.on_partitioned_table && !whole.contains(table) => {
             sql.strip_prefix("DROP INDEX ").map(|rest| format!("DROP INDEX CONCURRENTLY {rest}"))
         }
@@ -324,10 +369,62 @@ fn concurrently(change: &Change, sql: &str, whole: &BTreeSet<&QualName>) -> Opti
     }
 }
 
-fn sorted(changes: &[&Change], opts: &PlanOptions, whole: &BTreeSet<&QualName>) -> Result<Vec<Step>, Error> {
+/// `CREATE [UNIQUE] INDEX CONCURRENTLY ...` for a `CREATE [UNIQUE] INDEX ...` statement in the form
+/// the server prints; `None` for one that is not in that form.
+fn concurrent_create(sql: &str) -> Option<String> {
+    let rest = sql.strip_prefix("CREATE UNIQUE INDEX ").map(|r| ("CREATE UNIQUE INDEX", r));
+    let (head, rest) = rest.or_else(|| sql.strip_prefix("CREATE INDEX ").map(|r| ("CREATE INDEX", r)))?;
+    Some(format!("{head} CONCURRENTLY {rest}"))
+}
+
+/// A primary key or unique constraint added to a table that exists before the plan, as two steps:
+/// its index built `CONCURRENTLY` under the constraint's name, outside a transaction, then `ADD
+/// CONSTRAINT ... USING INDEX` (see the module doc). `None` when the constraint keeps the plain
+/// `ADD CONSTRAINT`: another kind, a table the plan creates or drops, a table that loses a primary
+/// key or unique constraint in the plan (the replacement stays in one transaction), a key in a
+/// tablespace (`USING INDEX TABLESPACE`), a partitioned table, or an
+/// index `USING INDEX` cannot take (not a b-tree, as a key `WITHOUT OVERLAPS` is) or not in the form
+/// the server prints.
+fn using_index(change: &Change, opts: &PlanOptions, tables: &Tables) -> Option<[Step; 2]> {
+    let Change::AddConstraint { table, constraint: c } = change else { return None };
+    let kind = match c.kind {
+        ConstraintKind::PrimaryKey => "PRIMARY KEY",
+        ConstraintKind::Unique => "UNIQUE",
+        ConstraintKind::Check | ConstraintKind::ForeignKey | ConstraintKind::Exclusion => return None,
+    };
+    if c.on_partitioned_table || tables.whole.contains(table) || tables.rekeyed.contains(table) {
+        return None;
+    }
+    // `pg_get_indexdef` leaves out the tablespace a key's index is in, so the index built from it
+    // would not match the constraint.
+    if c.definition.contains(" USING INDEX TABLESPACE ") {
+        return None;
+    }
+    let index = c.index_definition.as_deref()?;
+    let name = quote_ident(&c.name);
+    // The index carries the constraint's name, so the constraint that adopts it keeps it.
+    let on = index.strip_prefix("CREATE UNIQUE INDEX ")?.strip_prefix(name.as_str())?.strip_prefix(" ON ")?;
+    if !on.contains(" USING btree (") {
+        return None;
+    }
+    let timing = match (c.deferrable, c.deferred) {
+        (false, _) => "",
+        (true, false) => " DEFERRABLE",
+        (true, true) => " DEFERRABLE INITIALLY DEFERRED",
+    };
+    Some([
+        Step { sql: concurrent_create(index)?, non_transactional: true },
+        Step {
+            sql: format!("ALTER TABLE {} ADD CONSTRAINT {name} {kind} USING INDEX {name}{timing}", opts.name(table)),
+            non_transactional: false,
+        },
+    ])
+}
+
+fn sorted(changes: &[&Change], opts: &PlanOptions, tables: &Tables) -> Result<Vec<Vec<Step>>, Error> {
     let nodes: Vec<Node> = changes.iter().map(|c| Node { phase: phase(c), deps: deps(c) }).collect();
     match graph::sort(&nodes) {
-        Ok(order) => Ok(order.into_iter().map(|i| step(changes[i], opts, whole)).collect()),
+        Ok(order) => Ok(order.into_iter().map(|i| steps(changes[i], opts, tables)).collect()),
         Err(graph::Cycle(steps)) => Err(Error::Cycle(steps.into_iter().map(|i| statement(changes[i], opts)).collect())),
     }
 }
@@ -1587,6 +1684,8 @@ mod tests {
             columns: columns.iter().map(|c| c.to_string()).collect(),
             references: None,
             comment: None,
+            index_definition: None,
+            on_partitioned_table: false,
         }
     }
 
@@ -2288,6 +2387,179 @@ mod tests {
         let planned = plan_with(&changes, &concurrent()).expect("plan");
         assert!(planned.non_transactional.is_empty());
         assert!(planned.statements.iter().all(|s| !s.contains("CONCURRENTLY")), "{:?}", planned.statements);
+    }
+
+    /// A unique constraint `<table>_x_key` on `x`, with the index the server prints for it.
+    fn unique_key(table: &str) -> Constraint {
+        let mut c = constraint(&format!("{table}_x_key"), pgmig_model::ConstraintKind::Unique, "UNIQUE (x)", &["x"]);
+        c.index_definition = Some(format!("CREATE UNIQUE INDEX {table}_x_key ON public.{table} USING btree (x)"));
+        c
+    }
+
+    fn add_constraint(table: &str, constraint: Constraint) -> Change {
+        Change::AddConstraint { table: QualName::new("public", table), constraint }
+    }
+
+    #[test]
+    fn a_key_on_an_existing_table_is_built_concurrently_then_attached_with_using_index() {
+        let mut pk = pkey("t");
+        pk.index_definition = Some("CREATE UNIQUE INDEX t_pkey ON public.t USING btree (id)".into());
+        let changes = [add_constraint("t", pk), add_constraint("t", unique_key("t"))];
+        assert_eq!(
+            plan(&changes).expect("plan").statements,
+            ["ALTER TABLE public.t ADD CONSTRAINT t_pkey PRIMARY KEY (id)", "ALTER TABLE public.t ADD CONSTRAINT t_x_key UNIQUE (x)"]
+        );
+
+        let planned = plan_with(&changes, &concurrent()).expect("plan");
+        assert_eq!(
+            planned.statements,
+            [
+                "CREATE UNIQUE INDEX CONCURRENTLY t_pkey ON public.t USING btree (id)",
+                "ALTER TABLE public.t ADD CONSTRAINT t_pkey PRIMARY KEY USING INDEX t_pkey",
+                "CREATE UNIQUE INDEX CONCURRENTLY t_x_key ON public.t USING btree (x)",
+                "ALTER TABLE public.t ADD CONSTRAINT t_x_key UNIQUE USING INDEX t_x_key",
+            ]
+        );
+        assert_eq!(planned.non_transactional, [0, 2]);
+        let units: Vec<bool> = planned.units().iter().map(|u| u.transactional).collect();
+        assert_eq!(units, [false, true, false, true]);
+    }
+
+    #[test]
+    fn a_key_built_concurrently_waits_for_its_column_and_goes_before_the_foreign_keys_using_it() {
+        let mut fk = fkey("c", "tx", "t");
+        fk.definition = "FOREIGN KEY (tx) REFERENCES public.t(x)".into();
+        fk.references = Some(pgmig_model::References {
+            table: QualName::new("public", "t"),
+            columns: vec!["x".into()],
+            constraint: Some("t_x_key".into()),
+        });
+        // In the diff's order, the foreign key first: the graph orders them.
+        let changes = [
+            add_constraint("c", fk),
+            add_constraint("t", unique_key("t")),
+            Change::AddColumn { table: QualName::new("public", "t"), column: col("x", None) },
+        ];
+        let planned = plan_with(&changes, &concurrent()).expect("plan");
+        assert_eq!(
+            planned.statements,
+            [
+                "ALTER TABLE public.t ADD COLUMN x integer",
+                "CREATE UNIQUE INDEX CONCURRENTLY t_x_key ON public.t USING btree (x)",
+                "ALTER TABLE public.t ADD CONSTRAINT t_x_key UNIQUE USING INDEX t_x_key",
+                "ALTER TABLE public.c ADD CONSTRAINT c_tx_fkey FOREIGN KEY (tx) REFERENCES public.t(x)",
+            ]
+        );
+        // The column commits before the build; the attach and the foreign key share a transaction.
+        assert_eq!(
+            planned.units(),
+            [
+                Unit { statements: 0..1, transactional: true },
+                Unit { statements: 1..2, transactional: false },
+                Unit { statements: 2..4, transactional: true },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_deferrable_key_is_attached_deferrable() {
+        let mut c = unique_key("t");
+        c.definition = "UNIQUE (x) DEFERRABLE INITIALLY DEFERRED".into();
+        (c.deferrable, c.deferred) = (true, true);
+        let planned = plan_with(&[add_constraint("t", c.clone())], &concurrent()).expect("plan");
+        assert_eq!(
+            planned.statements[1],
+            "ALTER TABLE public.t ADD CONSTRAINT t_x_key UNIQUE USING INDEX t_x_key DEFERRABLE INITIALLY DEFERRED"
+        );
+        c.deferred = false;
+        let planned = plan_with(&[add_constraint("t", c)], &concurrent()).expect("plan");
+        assert_eq!(planned.statements[1], "ALTER TABLE public.t ADD CONSTRAINT t_x_key UNIQUE USING INDEX t_x_key DEFERRABLE");
+    }
+
+    #[test]
+    fn keys_using_index_cannot_take_keep_the_plain_add_constraint() {
+        let plain = |change: Change| {
+            let planned = plan_with(&[change], &concurrent()).expect("plan");
+            assert!(planned.non_transactional.is_empty(), "{:?}", planned.statements);
+            assert_eq!(planned.statements.len(), 1, "{:?}", planned.statements);
+        };
+        // On a partitioned table.
+        plain(add_constraint("t", Constraint { on_partitioned_table: true, ..unique_key("t") }));
+        // Not a b-tree (a key `WITHOUT OVERLAPS` is a GiST index).
+        plain(add_constraint(
+            "t",
+            Constraint {
+                index_definition: Some("CREATE UNIQUE INDEX t_x_key ON public.t USING gist (x, during)".into()),
+                ..unique_key("t")
+            },
+        ));
+        // No index definition (older JSON), or one under another name.
+        plain(add_constraint("t", Constraint { index_definition: None, ..unique_key("t") }));
+        plain(add_constraint(
+            "t",
+            Constraint { index_definition: Some("CREATE UNIQUE INDEX other ON public.t USING btree (x)".into()), ..unique_key("t") },
+        ));
+        // Not a key.
+        let mut exclusion = constraint("t_x_excl", pgmig_model::ConstraintKind::Exclusion, "EXCLUDE USING gist (x WITH =)", &["x"]);
+        exclusion.index_definition = None;
+        plain(add_constraint("t", exclusion));
+        // In a tablespace, which `pg_get_indexdef` leaves out.
+        plain(add_constraint("t", Constraint { definition: "UNIQUE (x) USING INDEX TABLESPACE ts".into(), ..unique_key("t") }));
+    }
+
+    #[test]
+    fn a_key_replacing_another_on_the_same_table_stays_in_one_transaction() {
+        let old = Constraint { definition: "UNIQUE (y)".into(), ..unique_key("t") };
+        let changes =
+            [Change::DropConstraint { table: QualName::new("public", "t"), constraint: old }, add_constraint("t", unique_key("t"))];
+        let planned = plan_with(&changes, &concurrent()).expect("plan");
+        assert!(planned.non_transactional.is_empty(), "{:?}", planned.statements);
+        assert_eq!(planned.statements.last().map(String::as_str), Some("ALTER TABLE public.t ADD CONSTRAINT t_x_key UNIQUE (x)"));
+    }
+
+    #[test]
+    fn a_key_on_a_table_created_in_the_plan_stays_plain() {
+        // The diff writes a new table's keys in its `CREATE TABLE`; a caller may pass them apart.
+        let t = table("public", "t", vec![col("x", None)]);
+        let planned = plan_with(&[Change::CreateTable(t), add_constraint("t", unique_key("t"))], &concurrent()).expect("plan");
+        assert!(planned.non_transactional.is_empty(), "{:?}", planned.statements);
+        assert_eq!(planned.statements[1], "ALTER TABLE public.t ADD CONSTRAINT t_x_key UNIQUE (x)");
+    }
+
+    #[test]
+    fn the_index_of_a_key_built_concurrently_is_skipped_with_the_key_not_with_create_index() {
+        use pgmig_diff::ChangeKind;
+        let changes = [add_constraint("t", unique_key("t")), create_index("t", "t_idx")];
+        let (kept, skipped) = skip(&changes, &[ChangeKind::CreateIndex].into(), &concurrent());
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(
+            plan_with(&kept, &concurrent()).expect("plan").statements,
+            [
+                "CREATE UNIQUE INDEX CONCURRENTLY t_x_key ON public.t USING btree (x)",
+                "ALTER TABLE public.t ADD CONSTRAINT t_x_key UNIQUE USING INDEX t_x_key",
+            ]
+        );
+        let (kept, skipped) = skip(&changes, &[ChangeKind::AddConstraint].into(), &concurrent());
+        assert_eq!(skipped.iter().map(ToString::to_string).collect::<Vec<_>>(), ["add_constraint public.t.t_x_key (policy)"]);
+        assert_eq!(
+            plan_with(&kept, &concurrent()).expect("plan").statements,
+            ["CREATE INDEX CONCURRENTLY t_idx ON public.t USING btree (x)"]
+        );
+    }
+
+    #[test]
+    fn a_quoted_key_name_is_matched_and_kept() {
+        let mut c = constraint("T key", pgmig_model::ConstraintKind::Unique, "UNIQUE (x)", &["x"]);
+        c.index_definition = Some("CREATE UNIQUE INDEX \"T key\" ON public.t USING btree (x) INCLUDE (y) NULLS NOT DISTINCT".into());
+        let opts = PlanOptions { unqualified_schema: Some("public".into()), concurrent_indexes: true };
+        let planned = plan_with(&[add_constraint("t", c)], &opts).expect("plan");
+        assert_eq!(
+            planned.statements,
+            [
+                "CREATE UNIQUE INDEX CONCURRENTLY \"T key\" ON public.t USING btree (x) INCLUDE (y) NULLS NOT DISTINCT",
+                "ALTER TABLE t ADD CONSTRAINT \"T key\" UNIQUE USING INDEX \"T key\"",
+            ]
+        );
     }
 
     #[test]

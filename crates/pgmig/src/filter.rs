@@ -398,6 +398,8 @@ mod tests {
             columns: vec!["legacy".into()],
             references: None,
             comment: None,
+            index_definition: None,
+            on_partitioned_table: false,
         };
         let index = |name: &str, col: &str| Index {
             name: name.into(),

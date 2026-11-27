@@ -1721,6 +1721,8 @@ mod tests {
             columns: vec!["id".into()],
             references: None,
             comment: None,
+            index_definition: None,
+            on_partitioned_table: false,
         }
     }
 
@@ -2045,6 +2047,8 @@ mod tests {
             columns: vec!["id".into()],
             references: None,
             comment: None,
+            index_definition: None,
+            on_partitioned_table: false,
         };
         let table = Table {
             name: t.clone(),

@@ -26,6 +26,20 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
   while building an index `CONCURRENTLY` says how to remove the `INVALID` index it may have left. The apply report
   gains `non_transactional`, and an apply error `outcome` `statement_failed`.
 
+- Under the same `concurrent_indexes` policy, a primary key or unique constraint added to a table
+  that exists before the plan is built in two steps: `CREATE UNIQUE INDEX CONCURRENTLY` under the
+  constraint's name, in a unit of its own outside a transaction, then `ALTER TABLE ... ADD
+  CONSTRAINT <name> {PRIMARY KEY | UNIQUE} USING INDEX <name>` (keeping `DEFERRABLE` and `INITIALLY
+  DEFERRED`) in a transaction. The build runs after the columns the key uses are added and set, and
+  the foreign keys that reference the key are added after it is attached. Keys on tables the plan
+  creates, on tables that lose a key in the same plan (a replaced key stays in one transaction),
+  keys `USING INDEX TABLESPACE`, keys on partitioned tables, and exclusion constraints keep the
+  plain `ADD CONSTRAINT`. A
+  failed build says how to remove the `INVALID` index it may leave, as for other concurrent builds.
+  Skipping `add_constraint` skips both steps; skipping `create_index` does not touch them. The
+  inspected `Constraint` gains `index_definition` (`pg_get_indexdef` of the index a primary key or
+  unique constraint owns) and `on_partitioned_table`, both left out of the JSON when empty.
+
 - `--verify` on `schema apply` and `migrate diff` (or `[diff] verify = true`; `--no-verify`
   overrides): the plan, or the edited SQL, first runs in the shadow database on a copy of the
   current schema, and the result must equal the desired schema (changes the diff policy skips
@@ -158,7 +172,11 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
   transaction is a unit of its own. A `Plan` literal needs the new `non_transactional` field (use
   `..Plan::default()`), `migrate_diff`'s `written` is a list of the files written,
   `Error::Apply` carries `committed_outside_transaction` and `outside_transaction`, and the `apply`
-  report's JSON has `non_transactional` when some statement ran outside a transaction.
+  report's JSON has `non_transactional` when some statement ran outside a transaction. An apply
+  error's JSON `apply` object gains `committed_outside_transaction` (left out when zero), from the
+  new pub field `api::ApplyFailure::committed_outside_transaction`, so an `ApplyFailure` literal
+  needs it. A `pgmig_model::Constraint` literal needs the new `index_definition` and
+  `on_partitioned_table` fields.
 
 - Replaying a migration directory in the shadow (`migrate diff`, `--verify`, fingerprints and
   other `migrate` sources) runs each file as `migrate apply` does: one transaction per stretch

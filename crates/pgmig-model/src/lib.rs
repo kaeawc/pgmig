@@ -166,6 +166,18 @@ pub struct Constraint {
     pub references: Option<References>,
     /// `obj_description` of the constraint.
     pub comment: Option<String>,
+    /// `pg_get_indexdef` of the index a primary key or unique constraint owns (`conindid`): the
+    /// `CREATE UNIQUE INDEX <name> ON <schema>.<table> USING <method> (...)` that builds it on its
+    /// own, which a plan can run `CONCURRENTLY` and then attach with `USING INDEX`. It says nothing
+    /// [`Constraint::definition`] doesn't. `None` for other constraints; absent from older JSON, and
+    /// left out of it when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_definition: Option<String>,
+    /// The table is partitioned (`relkind = 'p'`): `USING INDEX` and `CREATE INDEX CONCURRENTLY`
+    /// are not allowed on it. Absent from older JSON, and left out of it when false: not
+    /// partitioned.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub on_partitioned_table: bool,
 }
 
 /// The referenced side of a foreign key.
@@ -724,6 +736,8 @@ mod tests {
             columns: vec![],
             references: None,
             comment: None,
+            index_definition: None,
+            on_partitioned_table: false,
         };
         let base = "FOREIGN KEY (a) REFERENCES p(id) ON DELETE CASCADE";
         assert_eq!(fk(base, false, false).definition_without_deferrability(), base);
@@ -771,6 +785,8 @@ mod tests {
             columns: vec!["id".into()],
             references: None,
             comment: Some("the key".into()),
+            index_definition: None,
+            on_partitioned_table: false,
         };
         let fk = Constraint {
             name: "users_team_fkey".into(),
@@ -786,6 +802,8 @@ mod tests {
                 constraint: Some("teams_pkey".into()),
             }),
             comment: None,
+            index_definition: None,
+            on_partitioned_table: false,
         };
         let column = |name: &str, type_name: &str| Column {
             name: name.into(),
@@ -946,6 +964,8 @@ mod tests {
             columns: vec!["id".into()],
             references: None,
             comment: None,
+            index_definition: None,
+            on_partitioned_table: false,
         };
         let index = Index {
             name: "t_id_idx".into(),

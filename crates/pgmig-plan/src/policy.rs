@@ -289,6 +289,8 @@ mod tests {
             deferred: false,
             validated: true,
             comment: None,
+            index_definition: None,
+            on_partitioned_table: false,
         };
         let changes = vec![
             Change::DropConstraint { table: t.clone(), constraint: check("CHECK (id > 0)") },
@@ -412,6 +414,8 @@ mod tests {
             deferred: false,
             validated: true,
             comment: None,
+            index_definition: None,
+            on_partitioned_table: false,
         };
         let changes = vec![
             Change::DropConstraint { table: c.clone(), constraint: fkey.clone() },

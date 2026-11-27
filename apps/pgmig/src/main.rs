@@ -569,9 +569,10 @@ struct PolicyArg {
     /// refuses these statements in a transaction, so each runs on its own outside one: `schema
     /// apply` commits the statements before it first, and `migrate diff` writes one file per such
     /// statement (`-- pgmig:txmode none`) and cannot be combined with --edit. A failed build leaves
-    /// an INVALID index to drop (DROP INDEX CONCURRENTLY). Indexes on tables the plan creates or
-    /// drops, and on partitioned tables, keep the plain statement (config: `[diff]
-    /// concurrent_indexes`).
+    /// an INVALID index to drop (DROP INDEX CONCURRENTLY). A primary key or unique constraint is
+    /// added by building its index that way and then attaching it (ADD CONSTRAINT ... USING
+    /// INDEX). Indexes and keys on tables the plan creates or drops, and on partitioned tables,
+    /// keep the plain statement (config: `[diff] concurrent_indexes`).
     #[arg(long, overrides_with = "no_concurrent_indexes")]
     concurrent_indexes: bool,
     /// Plain CREATE INDEX and DROP INDEX, whatever `[diff] concurrent_indexes` says.
