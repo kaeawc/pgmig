@@ -270,6 +270,7 @@ fn object_deps(change: &Change) -> Deps {
             let mut requires = vec![Object::Schema(t.name.schema.clone())];
             requires.extend(types(t.columns.iter().map(|c| &c.type_ref)));
             requires.extend(sequences(t.columns.iter().flat_map(|c| &c.default_sequences)));
+            requires.extend(new_values(t.columns.iter().map(|c| &c.type_ref)));
             let mut creates = vec![Object::Table(t.name.clone()), Object::Type(t.name.clone())];
             creates.extend(t.columns.iter().filter_map(|c| Some(identity_sequence(&t.name, &c.name, c.identity.as_ref()?))));
             creates.extend(t.constraints.iter().map(|c| constraint(&t.name, &c.name)));
@@ -280,6 +281,7 @@ fn object_deps(change: &Change) -> Deps {
             let mut releases = vec![Object::Schema(t.name.schema.clone())];
             releases.extend(types(t.columns.iter().map(|c| &c.type_ref)));
             releases.extend(sequences(t.columns.iter().flat_map(|c| &c.default_sequences)));
+            releases.extend(old_values(t.columns.iter().map(|c| &c.type_ref)));
             // With the table go the sequences its columns own and its identity sequences.
             let mut drops = vec![Object::Table(t.name.clone()), Object::Type(t.name.clone())];
             drops.extend(sequences(owned_sequences));
@@ -343,6 +345,7 @@ fn object_deps(change: &Change) -> Deps {
             creates.extend(d.constraints.iter().map(|c| constraint(&d.name, &c.name)));
             let mut requires = vec![Object::Schema(d.name.schema.clone())];
             requires.extend(types([&d.base_ref]));
+            requires.extend(new_values([&d.base_ref]));
             Deps { creates, requires, ..Deps::default() }
         }
         Change::DropDomain(d) => {
@@ -350,6 +353,7 @@ fn object_deps(change: &Change) -> Deps {
             drops.extend(d.constraints.iter().map(|c| constraint(&d.name, &c.name)));
             let mut releases = vec![Object::Schema(d.name.schema.clone())];
             releases.extend(types([&d.base_ref]));
+            releases.extend(old_values([&d.base_ref]));
             Deps { drops, releases, ..Deps::default() }
         }
         Change::SetDomainDefault { name, .. }
@@ -378,6 +382,7 @@ fn object_deps(change: &Change) -> Deps {
             creates.extend(c.attributes.iter().map(|a| column(&c.name, &a.name)));
             let mut requires = vec![Object::Schema(c.name.schema.clone())];
             requires.extend(types(c.attributes.iter().map(|a| &a.type_ref)));
+            requires.extend(new_values(c.attributes.iter().map(|a| &a.type_ref)));
             Deps { creates, requires, ..Deps::default() }
         }
         Change::DropCompositeType(c) => {
@@ -385,11 +390,13 @@ fn object_deps(change: &Change) -> Deps {
             drops.extend(c.attributes.iter().map(|a| column(&c.name, &a.name)));
             let mut releases = vec![Object::Schema(c.name.schema.clone())];
             releases.extend(types(c.attributes.iter().map(|a| &a.type_ref)));
+            releases.extend(old_values(c.attributes.iter().map(|a| &a.type_ref)));
             Deps { drops, releases, ..Deps::default() }
         }
         Change::AddAttribute { composite, attribute } => {
             let mut requires = vec![Object::Type(composite.clone())];
             requires.extend(types([&attribute.type_ref]));
+            requires.extend(new_values([&attribute.type_ref]));
             Deps {
                 creates: vec![column(composite, &attribute.name)],
                 alters: vec![Object::Type(composite.clone())],
@@ -401,19 +408,34 @@ fn object_deps(change: &Change) -> Deps {
             drops: vec![column(composite, attribute)],
             alters: vec![Object::Type(composite.clone())],
             requires: vec![Object::Type(composite.clone())],
-            releases: types([type_ref]),
+            releases: [types([type_ref]), old_values([type_ref])].concat(),
             ..Deps::default()
         },
-        Change::AlterAttributeType { composite, attribute, type_ref, old_type_ref, .. } => {
+        Change::AlterAttributeType { composite, attribute, type_ref, old_type_ref, holders, .. } => {
             let mut requires = vec![Object::Type(composite.clone())];
             requires.extend(types([type_ref]));
-            let releases = if type_ref == old_type_ref { Vec::new() } else { types([old_type_ref]) };
-            Deps { alters: vec![Object::Type(composite.clone()), column(composite, attribute)], requires, releases, ..Deps::default() }
+            let mut releases = Vec::new();
+            if type_ref != old_type_ref {
+                requires.extend(new_values([type_ref]));
+                releases.extend(types([old_type_ref]));
+                releases.extend(old_values([old_type_ref]));
+            }
+            // Postgres refuses the change while a table column uses the composite type, directly
+            // or through what holds it: the uses that end go first, the ones that start after.
+            let held = std::iter::once(composite).chain(holders);
+            Deps {
+                creates: held.clone().map(|t| Object::NewValues(t.clone())).collect(),
+                drops: held.map(|t| Object::OldValues(t.clone())).collect(),
+                alters: vec![Object::Type(composite.clone()), column(composite, attribute)],
+                requires,
+                releases,
+            }
         }
         Change::AddColumn { table, column: c } => {
             let mut requires = vec![in_table(table)];
             requires.extend(types([&c.type_ref]));
             requires.extend(sequences(&c.default_sequences));
+            requires.extend(new_values([&c.type_ref]));
             let mut creates = vec![column(table, &c.name)];
             if let Some(identity) = &c.identity {
                 creates.push(identity_sequence(table, &c.name, identity));
@@ -422,6 +444,7 @@ fn object_deps(change: &Change) -> Deps {
         }
         Change::DropColumn { table, column: c, type_ref, sequences: used, owned_sequences } => {
             let mut releases = types([type_ref]);
+            releases.extend(old_values([type_ref]));
             releases.extend(sequences(used));
             // Postgres drops the sequences the column owns with it.
             let drops = [vec![column(table, c)], sequences(owned_sequences)].concat();
@@ -430,7 +453,12 @@ fn object_deps(change: &Change) -> Deps {
         Change::AlterColumnType { table, column: c, type_ref, old_type_ref, .. } => {
             let mut requires = vec![in_table(table)];
             requires.extend(types([type_ref]));
-            let releases = if type_ref == old_type_ref { Vec::new() } else { types([old_type_ref]) };
+            let mut releases = Vec::new();
+            if type_ref != old_type_ref {
+                requires.extend(new_values([type_ref]));
+                releases.extend(types([old_type_ref]));
+                releases.extend(old_values([old_type_ref]));
+            }
             Deps { alters: vec![column(table, c), Object::ColumnType(table.clone(), c.clone())], requires, releases, ..Deps::default() }
         }
         Change::AddConstraint { table, constraint: c } => {
@@ -565,6 +593,18 @@ fn is_of_table(o: &Object, table: &QualName) -> bool {
 /// The user-defined types among column type references.
 fn types<'a>(refs: impl IntoIterator<Item = &'a Option<QualName>>) -> Vec<Object> {
     refs.into_iter().flatten().map(|t| Object::Type(t.clone())).collect()
+}
+
+/// The values of the user-defined types among type references, as they were (see
+/// [`Object::OldValues`]).
+fn old_values<'a>(refs: impl IntoIterator<Item = &'a Option<QualName>>) -> Vec<Object> {
+    refs.into_iter().flatten().map(|t| Object::OldValues(t.clone())).collect()
+}
+
+/// The values of the user-defined types among type references, as they become (see
+/// [`Object::NewValues`]).
+fn new_values<'a>(refs: impl IntoIterator<Item = &'a Option<QualName>>) -> Vec<Object> {
+    refs.into_iter().flatten().map(|t| Object::NewValues(t.clone())).collect()
 }
 
 fn sequences<'a>(names: impl IntoIterator<Item = &'a QualName>) -> Vec<Object> {
@@ -1834,6 +1874,7 @@ mod tests {
                 collation: Some(QualName::new("pg_catalog", "C")),
                 type_ref: None,
                 old_type_ref: None,
+                holders: Vec::new(),
             },
             Change::AddAttribute { composite: p.clone(), attribute },
             Change::SetComment { target: CommentTarget::Attribute { composite: p, attribute: "c".into() }, comment: Some("c".into()) },
@@ -1848,6 +1889,94 @@ mod tests {
                 "COMMENT ON COLUMN public.pair.c IS 'c'",
             ]
         );
+    }
+
+    fn retype_pair(holders: Vec<QualName>) -> Change {
+        Change::AlterAttributeType {
+            composite: QualName::new("public", "pair"),
+            attribute: "a".into(),
+            type_name: "bigint".into(),
+            collation: None,
+            type_ref: None,
+            old_type_ref: None,
+            holders,
+        }
+    }
+
+    const RETYPE_PAIR: &str = "ALTER TYPE public.pair ALTER ATTRIBUTE a TYPE bigint";
+
+    #[test]
+    fn a_column_using_a_composite_type_is_dropped_before_its_attribute_type_changes() {
+        let t = table("public", "t", vec![col("p", row_type("public", "pair"))]);
+        assert_eq!(sql(&[retype_pair(vec![]), drop_table(t)]), ["DROP TABLE public.t", RETYPE_PAIR]);
+        let dropped = Change::DropColumn {
+            table: QualName::new("public", "t"),
+            column: "p".into(),
+            type_ref: row_type("public", "pair"),
+            sequences: vec![],
+            owned_sequences: vec![],
+        };
+        assert_eq!(sql(&[retype_pair(vec![]), dropped]), ["ALTER TABLE public.t DROP COLUMN p", RETYPE_PAIR]);
+    }
+
+    #[test]
+    fn a_column_using_a_composite_type_is_created_after_its_attribute_type_changes() {
+        let mut p = col("p", row_type("public", "pair"));
+        p.type_name = "public.pair[]".into();
+        let t = table("public", "t", vec![p.clone()]);
+        assert_eq!(sql(&[retype_pair(vec![]), Change::CreateTable(t)]), [RETYPE_PAIR, "CREATE TABLE public.t (\n    p public.pair[]\n)"]);
+        let retyped = Change::AlterColumnType {
+            table: QualName::new("public", "u"),
+            column: "p".into(),
+            type_name: "public.pair[]".into(),
+            type_ref: row_type("public", "pair"),
+            old_type_ref: None,
+            using: None,
+        };
+        assert_eq!(sql(&[retyped, retype_pair(vec![])]), [RETYPE_PAIR, "ALTER TABLE public.u ALTER COLUMN p TYPE public.pair[]"]);
+    }
+
+    #[test]
+    fn uses_through_a_domain_or_a_nesting_composite_end_before_the_attribute_type_change_and_start_after() {
+        let (d, outer) = (QualName::new("public", "d"), QualName::new("public", "nest"));
+        let t = QualName::new("public", "t");
+        let mut new = col("new", Some(d.clone()));
+        new.type_name = "public.d[]".into();
+        let held = pgmig_model::Attribute {
+            name: "p".into(),
+            type_name: "public.pair".into(),
+            type_ref: row_type("public", "pair"),
+            collation: None,
+            comment: None,
+        };
+        let changes = [
+            Change::AddColumn { table: t.clone(), column: new },
+            Change::AddColumn { table: t.clone(), column: col("o", Some(outer.clone())) },
+            Change::AddAttribute { composite: outer.clone(), attribute: held },
+            Change::DropColumn { table: t, column: "old".into(), type_ref: Some(d.clone()), sequences: vec![], owned_sequences: vec![] },
+            retype_pair(vec![d, outer]),
+        ];
+        assert_eq!(
+            sql(&changes),
+            [
+                "ALTER TABLE public.t DROP COLUMN old",
+                RETYPE_PAIR,
+                "ALTER TABLE public.t ADD COLUMN new public.d[]",
+                "ALTER TABLE public.t ADD COLUMN o nest",
+                "ALTER TYPE public.nest ADD ATTRIBUTE p public.pair",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_skipped_drop_of_a_composite_types_user_skips_the_attribute_type_change() {
+        let t = table("public", "t", vec![col("p", row_type("public", "pair"))]);
+        let changes = vec![retype_pair(vec![]), drop_table(t)];
+        let kinds = [pgmig_diff::ChangeKind::DropTable].into_iter().collect();
+        let (kept, skipped) = skip(&changes, &kinds, &PlanOptions::default());
+        assert!(kept.is_empty());
+        let shown: Vec<String> = skipped.iter().map(ToString::to_string).collect();
+        assert_eq!(shown, ["alter_attribute_type public.pair.a (because drop_table public.t is skipped)", "drop_table public.t (policy)"]);
     }
 
     #[test]

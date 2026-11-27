@@ -35,7 +35,10 @@
 //! comment ([`Change::AddAttribute`], [`Change::DropAttribute`], [`Change::AlterAttributeType`]).
 //! Postgres refuses to change an attribute's type while a table column uses the composite type
 //! (directly, in an array, or through a domain or another composite type): such a change is
-//! [`Change::UnsupportedCompositeChange`], which the planner refuses.
+//! [`Change::UnsupportedCompositeChange`], which the planner refuses. A column that stops using it
+//! (dropped, or changing to another type) or starts using it (added, or changing to it) does not
+//! block the change: [`Change::AlterAttributeType`] lists the types holding the composite type, so
+//! the planner ends those uses before the change and starts the new ones after it.
 //!
 //! # Sequences
 //!
@@ -330,7 +333,11 @@ pub enum Change {
         type_ref: Option<QualName>,
     },
     /// `ALTER TYPE ... ALTER ATTRIBUTE ... TYPE` to `type_name` with `collation`; `type_ref` is the
-    /// new type's, `old_type_ref` the replaced one's.
+    /// new type's, `old_type_ref` the replaced one's. `holders` are the other types whose values
+    /// hold the composite type, in either model: domains over it and composite types with an
+    /// attribute of it, directly or through each other. Postgres refuses the change while a table
+    /// column uses the composite type through any of them, so the planner runs what stops such a
+    /// use before it and what starts one after it.
     AlterAttributeType {
         composite: QualName,
         attribute: String,
@@ -338,6 +345,7 @@ pub enum Change {
         collation: Option<QualName>,
         type_ref: Option<QualName>,
         old_type_ref: Option<QualName>,
+        holders: Vec<QualName>,
     },
     /// An attribute's type (with its collation) changed from `from` to `to` while the table columns
     /// `used_by` use the composite type (see the module doc); the planner reports it as an error.
@@ -1056,6 +1064,34 @@ fn types_in_use(a: &Model, b: &Model) -> BTreeMap<QualName, Vec<String>> {
     out
 }
 
+/// The types other than `ty` whose values hold `ty` in `a` or in `b`: domains over it and composite
+/// types with an attribute of it, directly or through each other (arrays are seen through, as
+/// `type_ref` is the element type).
+fn holders(a: &Model, b: &Model, ty: &QualName) -> Vec<QualName> {
+    let mut out = BTreeSet::new();
+    for m in [a, b] {
+        let mut held = BTreeSet::from([ty.clone()]);
+        loop {
+            let holds = |r: &Option<QualName>| r.as_ref().is_some_and(|r| held.contains(r));
+            let new: Vec<QualName> = m
+                .domains
+                .values()
+                .filter(|d| holds(&d.base_ref))
+                .map(|d| d.name.clone())
+                .chain(m.composites.values().filter(|c| c.attributes.iter().any(|at| holds(&at.type_ref))).map(|c| c.name.clone()))
+                .filter(|n| !held.contains(n))
+                .collect();
+            if new.is_empty() {
+                break;
+            }
+            held.extend(new);
+        }
+        held.remove(ty);
+        out.extend(held);
+    }
+    out.into_iter().collect()
+}
+
 fn attribute_target(composite: &QualName, attribute: &str) -> CommentTarget {
     CommentTarget::Attribute { composite: composite.clone(), attribute: attribute.to_owned() }
 }
@@ -1093,6 +1129,7 @@ fn diff_composites(a: &Model, b: &Model, changes: &mut Vec<Change>) {
                         collation: at.collation.clone(),
                         type_ref: at.type_ref.clone(),
                         old_type_ref: o.type_ref.clone(),
+                        holders: holders(a, b, name),
                     }),
                 }
             }
@@ -2100,6 +2137,7 @@ mod tests {
                 collation: None,
                 type_ref: Some(d.clone()),
                 old_type_ref: None,
+                holders: Vec::new(),
             },
             Change::UnsupportedCompositeChange {
                 name: p.clone(),
@@ -2364,7 +2402,8 @@ mod tests {
                     type_name: "bigint".into(),
                     collation: None,
                     type_ref: None,
-                    old_type_ref: None
+                    old_type_ref: None,
+                    holders: Vec::new()
                 },
                 Change::AddAttribute { composite: p.clone(), attribute: b.attributes[1].clone() },
                 set(CommentTarget::Attribute { composite: p.clone(), attribute: "c".into() }, Some("c")),
@@ -2403,6 +2442,10 @@ mod tests {
         );
         // Without the column it is altered.
         let alone = diff(&with_domains(vec![over.clone()], vec![pair()], vec![]), &with_domains(vec![over], vec![b], vec![]));
-        assert!(matches!(&alone[..], [Change::AlterAttributeType { .. }]), "{alone:?}");
+        // It lists the domain holding the composite type, so the planner orders column uses of it.
+        assert!(
+            matches!(&alone[..], [Change::AlterAttributeType { holders, .. }] if holders == &[QualName::new("public", "d")]),
+            "{alone:?}"
+        );
     }
 }
