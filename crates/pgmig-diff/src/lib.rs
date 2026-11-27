@@ -36,9 +36,12 @@
 //! Postgres refuses to change an attribute's type while a table column uses the composite type
 //! (directly, in an array, or through a domain or another composite type): such a change is
 //! [`Change::UnsupportedCompositeChange`], which the planner refuses. A column that stops using it
-//! (dropped, or changing to another type) or starts using it (added, or changing to it) does not
-//! block the change: [`Change::AlterAttributeType`] lists the types holding the composite type, so
-//! the planner ends those uses before the change and starts the new ones after it.
+//! (dropped, or changing to an unrelated type) or starts using it (added, or changing to it) does
+//! not block the change: [`Change::AlterAttributeType`] lists the types holding the composite type, so
+//! the planner ends those uses before the change and starts the new ones after it. The exception is
+//! a column that holds the composite type both before and after, such as one changing from the
+//! composite type to a domain over it (or the reverse): no order ends the use, so that is
+//! [`Change::UnsupportedCompositeChange`] too.
 //!
 //! # Sequences
 //!
@@ -1034,29 +1037,44 @@ fn kept_users(a: &Model, b: &Model, ty: &QualName) -> Vec<String> {
     out
 }
 
+/// The types a value of type `root` holds in `m`, itself included: through arrays, domains and
+/// composite types.
+fn reach(m: &Model, root: &QualName) -> BTreeSet<QualName> {
+    let mut seen = BTreeSet::new();
+    let mut stack = vec![root.clone()];
+    while let Some(ty) = stack.pop() {
+        if !seen.insert(ty.clone()) {
+            continue;
+        }
+        if let Some(d) = m.domains.get(&ty) {
+            stack.extend(d.base_ref.clone());
+        }
+        if let Some(comp) = m.composites.get(&ty) {
+            stack.extend(comp.attributes.iter().filter_map(|at| at.type_ref.clone()));
+        }
+    }
+    seen
+}
+
 /// The types of `a` that table columns use and keep using in `b`, directly or through arrays,
-/// domains and composite types, each with those columns (as messages name them).
+/// domains and composite types, each with those columns (as messages name them). A column whose
+/// type changes counts for the types both its old type (in `a`) and its new type (in `b`) reach:
+/// it holds them before and after, so no order of the steps can end the use.
 fn types_in_use(a: &Model, b: &Model) -> BTreeMap<QualName, Vec<String>> {
     let mut out: BTreeMap<QualName, Vec<String>> = BTreeMap::new();
     for t in a.tables.values() {
         for c in &t.columns {
             let Some(root) = &c.type_ref else { continue };
-            if !b.tables.get(&t.name).and_then(|n| n.column(&c.name)).is_some_and(|n| n.type_ref.as_ref() == Some(root)) {
+            let Some(new_root) = b.tables.get(&t.name).and_then(|n| n.column(&c.name)).and_then(|n| n.type_ref.as_ref()) else {
                 continue;
-            }
+            };
             let label = format!("column {}.{}", t.name, quote_ident(&c.name));
-            let mut seen = BTreeSet::new();
-            let mut stack = vec![root.clone()];
-            while let Some(ty) = stack.pop() {
-                if !seen.insert(ty.clone()) {
-                    continue;
-                }
-                if let Some(d) = a.domains.get(&ty) {
-                    stack.extend(d.base_ref.clone());
-                }
-                if let Some(comp) = a.composites.get(&ty) {
-                    stack.extend(comp.attributes.iter().filter_map(|at| at.type_ref.clone()));
-                }
+            let mut held = reach(a, root);
+            if new_root != root {
+                let after = reach(b, new_root);
+                held.retain(|ty| after.contains(ty));
+            }
+            for ty in held {
                 out.entry(ty).or_default().push(label.clone());
             }
         }
@@ -2447,5 +2465,64 @@ mod tests {
             matches!(&alone[..], [Change::AlterAttributeType { holders, .. }] if holders == &[QualName::new("public", "d")]),
             "{alone:?}"
         );
+    }
+
+    /// `pair` with `a` retyped to bigint, a domain `d` over `pair` and a composite `nest` holding it.
+    fn holder_fixture() -> (Composite, Domain, Composite) {
+        let p = QualName::new("public", "p");
+        let mut b = pair();
+        b.attributes[0].type_name = "bigint".into();
+        let mut over = posint();
+        over.base_type = "public.p".into();
+        over.base_ref = Some(p.clone());
+        over.constraints.clear();
+        let mut nest = pair();
+        nest.name = QualName::new("public", "nest");
+        nest.attributes = vec![attr("p", "public.p", Some(p))];
+        (b, over, nest)
+    }
+
+    fn column_of(ty: &QualName, sql: &str) -> Column {
+        Column { type_ref: Some(ty.clone()), ..col("c", sql) }
+    }
+
+    /// Whether the diff refuses the retype of `p.a`, naming the column, and plans no attribute alter.
+    fn refused(changes: &[Change]) -> bool {
+        changes.iter().any(|c| {
+            matches!(c, Change::UnsupportedCompositeChange { name, used_by, .. }
+                if name == &QualName::new("public", "p") && used_by == &["column public.t.c".to_string()])
+        }) && !changes.iter().any(|c| matches!(c, Change::AlterAttributeType { .. }))
+    }
+
+    #[test]
+    fn retyping_a_column_between_a_composite_and_a_holder_of_it_is_unsupported() {
+        let p = QualName::new("public", "p");
+        let (b, over, nest) = holder_fixture();
+        let on_p = || column_of(&p, "public.p");
+        let on_d = || column_of(&over.name, "public.d");
+        let on_nest = || column_of(&nest.name, "public.nest");
+        // Domain over the composite type, before and after the retype.
+        let (ma, mb) = (with_domains(vec![], vec![pair()], vec![on_p()]), with_domains(vec![over.clone()], vec![b.clone()], vec![on_d()]));
+        assert!(refused(&diff(&ma, &mb)), "{:?}", diff(&ma, &mb));
+        assert!(refused(&diff(&mb_rev(&over, &pair(), on_d()), &with_domains(vec![], vec![b.clone()], vec![on_p()]))));
+        // A composite type with an attribute of it.
+        let (ma, mb) =
+            (with_domains(vec![], vec![pair()], vec![on_p()]), with_domains(vec![], vec![b.clone(), nest.clone()], vec![on_nest()]));
+        assert!(refused(&diff(&ma, &mb)), "{:?}", diff(&ma, &mb));
+    }
+
+    fn mb_rev(over: &Domain, old_pair: &Composite, col: Column) -> Model {
+        with_domains(vec![over.clone()], vec![old_pair.clone()], vec![col])
+    }
+
+    #[test]
+    fn retyping_a_column_from_a_composite_to_an_unrelated_type_is_ordered() {
+        let p = QualName::new("public", "p");
+        let (b, _, _) = holder_fixture();
+        let ma = with_domains(vec![], vec![pair()], vec![column_of(&p, "public.p")]);
+        let mb = with_domains(vec![], vec![b], vec![col("c", "integer")]);
+        let changes = diff(&ma, &mb);
+        assert!(changes.iter().any(|c| matches!(c, Change::AlterAttributeType { .. })), "{changes:?}");
+        assert!(!changes.iter().any(|c| matches!(c, Change::UnsupportedCompositeChange { .. })), "{changes:?}");
     }
 }
