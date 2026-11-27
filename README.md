@@ -118,17 +118,23 @@ the skip policy left out runs if you add it back.
 
 Pre-migration assertions: in a migration file, a `-- pgmig:assert` line directly above a statement
 makes it an assertion, and `-- pgmig:assert any` makes it part of the file's one-of group. Each is
-a single `SELECT` (or `WITH`) returning one row of one boolean column, and all of them come before
+a single query (`SELECT`, `WITH`, `VALUES`, `TABLE` or a parenthesized one) returning one row of one boolean column, and all of them come before
 the file's first other statement (`migrate diff` never writes them; add them by hand, e.g. with
 `migrate edit`). Before `migrate apply` runs a pending file, and again each time a run starts it
 (a resume included), it evaluates them on the target in a read-only transaction: every plain
 assertion must be true and, if the group exists, at least one `any` assertion; NULL counts as false.
-Otherwise the run stops with error code `assertion_failed`, naming the assertion and its value;
-nothing of that file runs and no revisions row is written, while earlier files of the run stay
+Otherwise the run stops with error code `assertion_failed`, naming the assertion and its value (an
+assertion that errors or returns another shape stops it the same way, with the server's SQLSTATE
+for a query error and the run report in the JSON); nothing of that file runs and no revisions row is written, while earlier files of the run stay
 applied (`--tx-mode all` rolls the whole run back). Assertions are not migration statements: they
 are not counted in a revisions row, and the file's hash still covers them. Replay in the shadow
 database (`migrate diff`, drift checks, `--verify`, fingerprints) and `--dry-run`, `status` and
-`--baseline` do not evaluate them, as the shadow has no data.
+`--baseline` do not evaluate them, as the shadow has no data. Assertions must be side-effect free:
+`READ ONLY` makes the server refuse writes (SQLSTATE 25006, data-modifying `WITH` included) and
+`nextval`, but not functions with outside effects (`pg_terminate_backend`, advisory locks,
+`set_config`, ...). They run with the session's settings, before a file's `--before-sql` hook in
+the per-file modes; with `--tx-mode all` they run inside the run's transaction, after the run's
+hook, in a read-only savepoint that is rolled back.
 
 `--format json` (on `inspect`, `diff`, `validate` and `apply`) prints the command's response as one
 pretty-printed JSON document on stdout and nothing on stderr; a failure prints the error object

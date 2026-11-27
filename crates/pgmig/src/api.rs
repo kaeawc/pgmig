@@ -1007,6 +1007,7 @@ impl From<&Error> for ApiError {
                 let first = &failures[0];
                 let pos = pgmig_sql::Pos { line: first.line, col: 1 };
                 let mut e = err(ErrorCode::AssertionFailed).at(path, Some(pos));
+                e.sqlstate = first.sqlstate.clone();
                 e.migration = Some(Box::new(MigrationFailure {
                     statement_index: None,
                     statement: first.statement.clone(),

@@ -56,15 +56,28 @@
 //!
 //! A line `-- pgmig:assert` directly above a statement makes it a pre-migration assertion;
 //! `-- pgmig:assert any` makes it part of the file's one-of group. Assertions come before the file's
-//! first other statement and are each a single `SELECT` (or `WITH`) returning one row of one boolean
-//! column. Before a pending file runs (before its revisions row, its hooks and its first
+//! first other statement and are each a single query (`SELECT`, `WITH`, `VALUES`, `TABLE` or a
+//! parenthesized one) returning one row of one boolean column. Before a pending file runs (before its revisions row, its hooks and its first
 //! statement), and again on every run that starts it, resumes included, they are evaluated on the
 //! target in a read-only transaction that is rolled back (with `--tx-mode all`, inside the run's
 //! transaction, so they see the earlier files of the run): every plain assertion must be true, and
 //! when the group exists at least one `any` assertion must be true; NULL is false. Otherwise the run
 //! stops with [`Error::AssertionFailed`]: nothing of the file runs and no row is written; earlier
 //! files of the run stay applied (with `--tx-mode all`, the run's transaction is rolled back). An
-//! assertion with another shape, or that does not run, is a [`Error::Directive`] error.
+//! assertion that does not run, or returns another shape, stops the run the same way, as an
+//! [`Error::AssertionFailed`] whose [`FailedAssertion::error`] (and `sqlstate`, for a query the
+//! server refused) says why; the run's report is kept. A statement that is not a query, or a
+//! misplaced or malformed directive, is a [`Error::Directive`] error before anything runs.
+//!
+//! Assertions must be side-effect free. `READ ONLY` makes the server refuse writes (SQLSTATE 25006,
+//! a data-modifying `WITH` included) and `nextval`; with `--tx-mode all` they run in a savepoint
+//! made read only and rolled back, so the run's transaction is untouched. It does not stop
+//! functions with outside effects (`pg_terminate_backend`, advisory locks, `set_config`, ...):
+//! do not call them.
+//!
+//! They run with the session's settings, not the hooks': in the per-file modes before a file's
+//! `before_sql` hook (and its `BEGIN`), with `--tx-mode all` inside the run's transaction after the
+//! run's `before_sql`.
 //!
 //! Assertions are not statements: they are not counted in a revisions row's `total`, `applied` or
 //! hashes, nor in the report. The file's hash covers them (they are part of its text). Replay in the
@@ -75,7 +88,7 @@
 //!
 //! [`ApplyOptions::before_sql`] runs right after each `BEGIN`, [`ApplyOptions::after_sql`] right
 //! before each `COMMIT`, so `SET LOCAL lock_timeout = '5s'` bounds every statement of the
-//! transaction. A file without a transaction runs them at session level, before its first and
+//! transaction (not a file's assertions in the per-file modes, see above). A file without a transaction runs them at session level, before its first and
 //! after its last statement. There `SET LOCAL` has no effect (Postgres warns and ignores it outside
 //! a transaction), and a plain `SET` lasts for the rest of the session, into every later file of
 //! the run: write hooks with `SET LOCAL`, and set what a non-transactional file needs in the file
@@ -382,7 +395,7 @@ pub(crate) struct Assertion {
     any: bool,
 }
 
-/// An assertion that was not true, in [`Error::AssertionFailed`].
+/// An assertion that was not true or could not be evaluated, in [`Error::AssertionFailed`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FailedAssertion {
     /// 1-based line in its file where the statement starts.
@@ -392,6 +405,12 @@ pub struct FailedAssertion {
     pub value: Option<bool>,
     /// It belongs to the `-- pgmig:assert any` group, of which none was true.
     pub any: bool,
+    /// The assertion did not evaluate to a value: the server's message for a query that failed
+    /// (see `sqlstate`), or why its result has the wrong shape. Then `value` is `None`, and
+    /// evaluation stopped at this assertion, `any` or not.
+    pub error: Option<String>,
+    /// The server's SQLSTATE for a query that failed.
+    pub sqlstate: Option<String>,
 }
 
 impl Prepared<'_> {
@@ -497,7 +516,7 @@ pub(crate) fn split_migration_text(path: &Path, text: &str) -> Result<(pgmig_sql
 
 /// Move the `-- pgmig:assert` statements of `sql` out of its statements. They must be directly
 /// above their statement, come before the first other statement, take no argument or `any`, and
-/// start with `SELECT` or `WITH`. Other directives on an assertion move to the file's.
+/// be a query (`SELECT`, `WITH`, `VALUES`, `TABLE` or `(`). Other directives on an assertion move to the file's.
 fn take_assertions(path: &Path, sql: &mut pgmig_sql::File) -> Result<Vec<Assertion>> {
     let bad = |pos, message: &str| Error::Directive { path: path.to_owned(), pos, message: message.to_owned() };
     if let Some(d) = sql.directives.iter().filter(|d| d.name == "assert").min_by_key(|d| d.pos) {
@@ -525,9 +544,13 @@ fn take_assertions(path: &Path, sql: &mut pgmig_sql::File) -> Result<Vec<Asserti
             "any" => true,
             _ => return Err(bad(d.pos, "pgmig:assert takes no argument, or `any`")),
         };
-        let word = s.sql.split(|c: char| !c.is_ascii_alphanumeric() && c != '_').next().unwrap_or("");
-        if !(word.eq_ignore_ascii_case("select") || word.eq_ignore_ascii_case("with")) {
-            return Err(bad(s.pos, "an assertion must be a single SELECT returning one row with one boolean column"));
+        let text = s.sql.trim_start();
+        let word = text.split(|c: char| !c.is_ascii_alphanumeric() && c != '_').next().unwrap_or("");
+        if !(text.starts_with('(') || ["select", "with", "values", "table"].iter().any(|w| word.eq_ignore_ascii_case(w))) {
+            return Err(bad(
+                s.pos,
+                "assertion error: an assertion must be a query (SELECT, WITH, VALUES, TABLE or a parenthesized query) returning one row with one boolean column",
+            ));
         }
         assertions.push(Assertion { pos: s.pos, sql: s.sql, any });
         moved.extend(s.directives.into_iter().filter(|d| d.name != "assert"));
@@ -537,44 +560,66 @@ fn take_assertions(path: &Path, sql: &mut pgmig_sql::File) -> Result<Vec<Asserti
     Ok(assertions)
 }
 
-/// Evaluate the assertions of `p` (see the module docs). `in_transaction`: the run's transaction is
-/// open and is used as it is; otherwise they run in a read-only transaction that is rolled back.
+/// Evaluate the assertions of `p` (see the module docs), read-only and without leaving a trace.
+/// `in_transaction`: the run's read-write transaction is open: they run in a savepoint made read
+/// only and rolled back, so even a data-modifying `WITH` cannot change what the run commits.
+/// Otherwise they run in a read-only transaction that is rolled back.
 fn check_assertions(conn: &mut Conn, p: &Prepared, in_transaction: bool, applied_files: usize) -> Result<()> {
     if p.assertions.is_empty() {
         return Ok(());
     }
-    if !in_transaction {
+    if in_transaction {
+        conn.batch("SAVEPOINT pgmig_assert")?;
+        if let Err(e) = conn.batch("SET TRANSACTION READ ONLY") {
+            let _ = conn.batch("ROLLBACK TO SAVEPOINT pgmig_assert");
+            return Err(e.into());
+        }
+    } else {
         conn.batch("BEGIN READ ONLY")?;
     }
     let res = evaluate(conn, p, in_transaction, applied_files);
-    if !in_transaction {
+    if in_transaction {
+        // Undoes the read-only setting too; works in an aborted transaction.
+        let cleanup = conn.batch("ROLLBACK TO SAVEPOINT pgmig_assert").and_then(|()| conn.batch("RELEASE SAVEPOINT pgmig_assert"));
+        if res.is_ok() {
+            cleanup?;
+        }
+    } else {
         let _ = conn.batch("ROLLBACK");
     }
     res
 }
 
 fn evaluate(conn: &mut Conn, p: &Prepared, in_transaction: bool, applied_files: usize) -> Result<()> {
-    let bad = |a: &Assertion, message: String| Error::Directive { path: p.path.clone(), pos: a.pos, message };
+    // An assertion that cannot run, or returns another shape, stops the run like a false one.
+    let broken = |a: &Assertion, error: String, sqlstate: Option<String>| {
+        let failed = FailedAssertion { line: a.pos.line, statement: a.sql.clone(), value: None, any: a.any, error: Some(error), sqlstate };
+        assertion_error(p, vec![failed], in_transaction, applied_files)
+    };
     let mut group: Vec<FailedAssertion> = Vec::new();
     let mut group_passed = false;
     for a in &p.assertions {
-        let rows = conn.query(&a.sql).map_err(|source| bad(a, format!("the assertion could not run: {source}")))?;
+        let rows = match conn.query(&a.sql) {
+            Ok(rows) => rows,
+            Err(source) => return Err(broken(a, source.message.clone(), source.code.clone())),
+        };
         let value = match rows.as_slice() {
             [row] if row.len() == 1 => match row[0].as_deref() {
                 Some("t") => Some(true),
                 Some("f") => Some(false),
                 None => None,
-                Some(other) => return Err(bad(a, format!("an assertion must return a boolean, not {other:?}"))),
+                Some(other) => return Err(broken(a, format!("an assertion must return a boolean, not {other:?}"), None)),
             },
             _ => {
                 let columns = rows.first().map_or(0, Vec::len);
-                return Err(bad(
+                return Err(broken(
                     a,
                     format!("an assertion must return one row with one boolean column, not {} row(s) of {columns} column(s)", rows.len()),
+                    None,
                 ));
             }
         };
-        let failed = FailedAssertion { line: a.pos.line, statement: a.sql.clone(), value, any: a.any };
+        let failed = FailedAssertion { line: a.pos.line, statement: a.sql.clone(), value, any: a.any, error: None, sqlstate: None };
         match (a.any, value) {
             (false, Some(true)) => {}
             (false, _) => return Err(assertion_error(p, vec![failed], in_transaction, applied_files)),
@@ -597,6 +642,11 @@ fn assertion_error(p: &Prepared, failures: Vec<FailedAssertion>, in_transaction:
 pub(crate) fn assertion_message(path: &Path, failures: &[FailedAssertion], outcome: MigrationOutcome, applied_files: usize) -> String {
     let value = |f: &FailedAssertion| if f.value.is_none() { "NULL" } else { "false" };
     let mut out = match failures {
+        [f] if f.error.is_some() => {
+            let state = f.sqlstate.as_deref().map(|c| format!(" (SQLSTATE {c})")).unwrap_or_default();
+            let error = f.error.as_deref().unwrap_or_default();
+            format!("{}:{}: assertion error: {}: {error}{state}", path.display(), f.line, f.statement)
+        }
         [f] if !f.any => format!("{}:{}: assertion failed: {} returned {}", path.display(), f.line, f.statement, value(f)),
         _ => {
             let mut m = format!("{}: none of the `-- pgmig:assert any` assertions was true:", path.display());

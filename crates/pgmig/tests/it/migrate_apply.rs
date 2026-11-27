@@ -503,7 +503,11 @@ fn a_failing_assertion_stops_before_any_statement_of_the_file() {
 
     // Fixed (the assertion holds once the database is): the file runs.
     m.write(B, "-- pgmig:assert\nSELECT count(*) = 0 FROM b_marker_missing_ok;\nCREATE TABLE b (id int);\n");
-    assert!(matches!(apply(&db, &m, &opts()), Err(Error::Directive { .. })), "an assertion that cannot run is an error");
+    let (failures, outcome, earlier, message) = assertion_error(apply(&db, &m, &opts()));
+    assert_eq!((outcome, earlier, failures[0].sqlstate.as_deref()), (MigrationOutcome::FileRolledBack, 0, Some("42P01")));
+    assert!(failures[0].error.as_deref().is_some_and(|e| e.contains("b_marker_missing_ok")), "{failures:?}");
+    assert!(message.contains("assertion error") && message.contains("SQLSTATE 42P01"), "{message}");
+    assert!(!has_table(&db, "b") && rows(&db).len() == 1);
     m.write(B, "-- pgmig:assert\nSELECT true;\nCREATE TABLE b (id int);\n");
     apply(&db, &m, &opts()).expect("passes");
     assert!(has_table(&db, "b"));
@@ -555,10 +559,8 @@ fn a_null_assertion_fails() {
 #[test]
 fn assertions_of_the_wrong_shape_are_errors() {
     let db = TestDb::new();
+    // Not a query: refused before anything runs.
     for (sql, line) in [
-        ("-- pgmig:assert\nSELECT 1;\nCREATE TABLE a (id int);\n", 2),
-        ("-- pgmig:assert\nSELECT true, true;\nCREATE TABLE a (id int);\n", 2),
-        ("-- pgmig:assert\nSELECT true UNION ALL SELECT true;\nCREATE TABLE a (id int);\n", 2),
         ("-- pgmig:assert\nCREATE TABLE a (id int);\n", 2),
         ("-- pgmig:assert\nINSERT INTO a VALUES (1);\n", 2),
         ("-- pgmig:assert sometimes\nSELECT true;\n", 1),
@@ -568,6 +570,93 @@ fn assertions_of_the_wrong_shape_are_errors() {
         assert!(matches!(&err, Error::Directive { path, pos, .. } if path.ends_with(A) && pos.line == line), "{sql}: {err}");
         assert!(!has_table(&db, "a"), "{sql}");
     }
+    // A query with the wrong result: stops the run like a false assertion, in both modes.
+    for mode in [TxMode::File, TxMode::All] {
+        for sql in [
+            "-- pgmig:assert\nSELECT 1;\nCREATE TABLE a (id int);\n",
+            "-- pgmig:assert\nSELECT true, true;\nCREATE TABLE a (id int);\n",
+            "-- pgmig:assert\nSELECT true UNION ALL SELECT true;\nCREATE TABLE a (id int);\n",
+        ] {
+            let m = Migrations::new(&[(A, sql)]);
+            let (failures, ..) = assertion_error(apply(&db, &m, &with_mode(mode)));
+            assert!(failures[0].error.is_some() && failures[0].sqlstate.is_none() && failures[0].line == 2, "{sql}: {failures:?}");
+            assert!(!has_table(&db, "a"), "{sql}");
+        }
+    }
+}
+
+#[test]
+fn other_query_forms_are_assertions() {
+    let db = TestDb::new();
+    let sql = "-- pgmig:assert\n(SELECT true);\n-- pgmig:assert\nVALUES (true);\n-- pgmig:assert\n  with t as (select true) select * from t;\nCREATE TABLE a (id int);\n";
+    apply(&db, &Migrations::new(&[(A, sql)]), &opts()).expect("apply");
+    assert!(has_table(&db, "a"));
+}
+
+fn count_users(db: &TestDb) -> String {
+    db.connect().query("SELECT count(*) FROM users").expect("count")[0][0].clone().expect("count")
+}
+
+/// Assertions are read-only whatever the mode: a data-modifying `WITH` is refused (25006) and its
+/// delete never commits, with the run's own work intact up to the failure.
+/// Real Postgres only: pgmem does not refuse a data-modifying `WITH` in a read-only transaction (kaeawc/pgmem#299)
+/// (`BEGIN READ ONLY; WITH d AS (DELETE FROM t RETURNING 1) SELECT true` succeeds and deletes).
+#[test]
+fn a_writing_assertion_is_refused_in_every_mode() {
+    if crate::support::postgres_dsn().is_none() {
+        eprintln!("skipped: pgmem allows a data-modifying WITH in a read-only transaction");
+        return;
+    }
+    let writing = "-- pgmig:assert\nWITH d AS (DELETE FROM users RETURNING 1) SELECT true;\nCREATE TABLE b (id int);\n";
+    for mode in [TxMode::File, TxMode::All] {
+        let db = TestDb::new();
+        db.connect().batch("CREATE TABLE users (id int); INSERT INTO users VALUES (1), (2)").expect("users");
+        let m = Migrations::new(&[(A, "CREATE TABLE a (id int);\n"), (B, writing)]);
+        let o = ApplyOptions { allow_dirty: true, ..with_mode(mode) };
+        let (failures, outcome, _, message) = assertion_error(apply(&db, &m, &o));
+        assert_eq!(failures[0].sqlstate.as_deref(), Some("25006"), "{mode:?}: {failures:?}");
+        assert!(message.contains("SQLSTATE 25006") && message.contains("assertion error"), "{message}");
+        assert_eq!(outcome, if mode == TxMode::All { MigrationOutcome::AllRolledBack } else { MigrationOutcome::FileRolledBack });
+        assert_eq!(count_users(&db), "2", "{mode:?}");
+        assert!(!has_table(&db, "b"));
+        assert_eq!(has_table(&db, "a"), mode == TxMode::File);
+    }
+}
+
+/// In `--tx-mode all` the read-only savepoint is rolled back: later statements of the run write.
+/// Real Postgres only: pgmem keeps `transaction_read_only` on after `ROLLBACK TO SAVEPOINT` (kaeawc/pgmem#300)
+/// (`BEGIN; SAVEPOINT s; SET TRANSACTION READ ONLY; ROLLBACK TO SAVEPOINT s; SHOW transaction_read_only`
+/// prints `on`, Postgres `off`), so the run's next write fails with 25006.
+#[test]
+fn all_mode_assertions_leave_the_run_writable() {
+    if crate::support::postgres_dsn().is_none() {
+        eprintln!("skipped: pgmem keeps READ ONLY after ROLLBACK TO SAVEPOINT");
+        return;
+    }
+    let db = TestDb::new();
+    let m = Migrations::new(&[
+        (A, "CREATE TABLE a (id int);\nINSERT INTO a VALUES (1);\n"),
+        (B, "-- pgmig:assert\nSELECT count(*) = 1 FROM a;\nINSERT INTO a VALUES (2);\n"),
+        (C, "-- pgmig:assert\nSELECT count(*) = 2 FROM a;\nINSERT INTO a VALUES (3);\n"),
+    ]);
+    apply(&db, &m, &with_mode(TxMode::All)).expect("apply");
+    assert_eq!(db.connect().query("SELECT count(*) FROM a").expect("count")[0][0].as_deref(), Some("3"));
+    assert_eq!(rows(&db).len(), 3);
+}
+
+/// An assertion error keeps the run report in the JSON, with the SQLSTATE of a query error.
+#[test]
+fn an_assertion_error_keeps_the_run_report_in_json() {
+    let db = TestDb::new();
+    let m = Migrations::new(&[(A, "CREATE TABLE a (id int);\n"), (B, "-- pgmig:assert\nSELECT * FROM nope;\nCREATE TABLE b (id int);\n")]);
+    let err = apply(&db, &m, &opts()).expect_err("fails");
+    let json = serde_json::to_value(pgmig::api::ApiError::from(&err)).expect("serialize");
+    assert_eq!(json["code"], "assertion_failed");
+    assert_eq!((json["sqlstate"].as_str(), json["line"].as_u64()), (Some("42P01"), Some(2)));
+    assert_eq!((json["migration"]["outcome"].as_str(), json["migration"]["applied_files"].as_u64()), (Some("file_rolled_back"), Some(1)));
+    let files = json["migration"]["report"]["files"].as_array().expect("report files");
+    assert_eq!(files.len(), 2, "{json}");
+    assert_eq!((files[0]["status"].as_str(), files[1]["status"].as_str()), (Some("applied"), Some("failed")), "{json}");
 }
 
 #[test]
