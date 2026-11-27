@@ -733,6 +733,7 @@ impl From<&Error> for ApiError {
             Error::ImportEmpty { path, pos, .. } => err(ErrorCode::ImportEmpty).at(path, Some(*pos)),
             Error::ImportCycle { .. } => err(ErrorCode::ImportCycle),
             Error::MigrationDescription { .. } => err(ErrorCode::Usage),
+            Error::MigrationDirChanged { path } => err(ErrorCode::Io).at(path, None),
             Error::Options(_) => err(ErrorCode::Usage),
             Error::MigrationImport { path, pos } => err(ErrorCode::MigrationImport).at(path, Some(*pos)),
             Error::Migrate(m) => match m {
@@ -915,6 +916,7 @@ fn is_diagnostic(e: &Error) -> bool {
         | Error::Checksum(_) => true,
         Error::NotSql
         | Error::MigrationDescription { .. }
+        | Error::MigrationDirChanged { .. }
         | Error::Options(_)
         | Error::Conn(_)
         | Error::Shadow(_)

@@ -164,7 +164,7 @@ pub fn migrate_edit(dir: &Path, migration: &str, editor: &[String]) -> Result<Mi
     if editor.is_empty() {
         return Err(Error::Options("no editor: set VISUAL or EDITOR".into()));
     }
-    let d = open_validated(dir)?;
+    let (_lock, d) = open_validated(dir)?;
     let f = d.find(migration)?.clone();
     let file = d.path.join(&f.name);
     crate::edit::launch(editor, &file, &format!("{} was not rehashed", file.display()))?;
@@ -223,7 +223,7 @@ pub struct MigrateRm {
 /// `migrate rm`: delete the migration `migration` of the directory at `dir` and rehash. The
 /// directory must match its sum file first; with a target, see [`Guard`].
 pub fn migrate_rm(dir: &Path, migration: &str, guard: &Guard) -> Result<MigrateRm> {
-    let d = open_validated(dir)?;
+    let (_lock, d) = open_validated(dir)?;
     let f = d.find(migration)?;
     let recorded = !guard.check(&d, &[f])?.is_empty();
     pgmig_migrate::maintain::remove(&d, &f.name)?;
@@ -263,6 +263,8 @@ fn migrate_rebase_at(dir: &Path, migrations: &[String], guard: &Guard, now: Syst
     if migrations.is_empty() {
         return Err(Error::Options("rebase needs at least one migration".into()));
     }
+    // Held until the sum file is written.
+    let _lock = if dir.is_dir() { Some(pgmig_migrate::DirLock::acquire(dir)?) } else { None };
     let d = MigrationDir::open(dir)?;
     let mut names: Vec<&str> = Vec::new();
     for m in migrations {
@@ -296,11 +298,13 @@ fn validate_rebase(d: &MigrationDir, names: &[&str]) -> Result<()> {
     Ok(pgmig_migrate::check(&d.without(names), &sum)?)
 }
 
-/// The directory at `dir`, checked against its sum file.
-fn open_validated(dir: &Path) -> Result<MigrationDir> {
+/// The directory at `dir`, checked against its sum file, and its lock: keep it until the sum file
+/// is written. A missing directory has no lock; opening it reports the error.
+fn open_validated(dir: &Path) -> Result<(Option<pgmig_migrate::DirLock>, MigrationDir)> {
+    let lock = if dir.is_dir() { Some(pgmig_migrate::DirLock::acquire(dir)?) } else { None };
     let d = MigrationDir::open(dir)?;
     pgmig_migrate::validate(&d)?;
-    Ok(d)
+    Ok((lock, d))
 }
 
 #[cfg(test)]
@@ -328,6 +332,27 @@ mod tests {
         let res = migrate_rebase_at(&path, &["20261103".into()], &Guard::default(), now).expect("rebase");
         assert_eq!(res.moved[0].to, path.join("20261126103000_mine.sql"));
         crate::migrate_validate(&path, None).expect("valid");
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    // Refused before the move (the target is an unhashed file); `move_no_overwrite` has its own
+    // test in pgmig-migrate.
+    fn rebase_refuses_a_taken_target_name() {
+        let path = std::env::temp_dir().join(format!("pgmig-rebase-occupied-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("dir");
+        std::fs::write(path.join("20261101000000_a.sql"), "A").expect("a");
+        std::fs::write(path.join("20261105000000_b.sql"), "B").expect("b");
+        crate::migrate_hash(&path).expect("hash");
+        std::fs::write(path.join("20261103000000_mine.sql"), "M").expect("mine");
+        // The target name the rebase would pick is taken by a file that is not in the sum.
+        std::fs::write(path.join("20261126103000_mine.sql"), "X").expect("occupied");
+        let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_795_689_000);
+        let err = migrate_rebase_at(&path, &["20261103".into()], &Guard::default(), now);
+        assert!(err.is_err());
+        assert_eq!(std::fs::read(path.join("20261126103000_mine.sql")).expect("read"), b"X");
+        assert_eq!(std::fs::read(path.join("20261103000000_mine.sql")).expect("read"), b"M");
         let _ = std::fs::remove_dir_all(&path);
     }
 }

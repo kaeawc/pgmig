@@ -268,17 +268,123 @@ impl Dir {
     }
 }
 
-/// Write `bytes` to `path` through a temporary file in the same directory renamed over it, so a
-/// reader sees the old contents or the new, never part of them. The temporary name starts with `.`
-/// and does not end in `.sql`, so [`Dir::open`] never reads it.
-pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+/// The name of the lock file in a migration directory. It starts with `.` and does not end in
+/// `.sql`, so [`Dir::open`] never reads it. It is created when missing and never deleted.
+pub const LOCK_FILE: &str = ".pgmig.lock";
+
+/// An exclusive advisory lock on a migration directory, held until dropped. Take it before reading
+/// the directory to compute the next version, and keep it until the sum file is written, so two
+/// runs never pick the same version or hash a half-written set.
+#[derive(Debug)]
+pub struct DirLock {
+    file: std::fs::File,
+}
+
+impl DirLock {
+    /// Lock the directory `dir`, waiting for any other holder. The directory must exist.
+    ///
+    /// This blocks for as long as another pgmig run holds the lock, including one waiting in an
+    /// editor (`migrate diff --edit`, `migrate edit`).
+    pub fn acquire(dir: &Path) -> Result<DirLock> {
+        let path = dir.join(LOCK_FILE);
+        let io = |source| Error::Io { path: path.clone(), source };
+        let file = match std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path) {
+            Ok(f) => f,
+            // Another user created it in a shared directory: a read-only handle locks just as well.
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && path.is_file() => std::fs::File::open(&path).map_err(io)?,
+            Err(e) => return Err(io(e)),
+        };
+        file.lock().map_err(io)?;
+        Ok(DirLock { file })
+    }
+}
+
+impl Drop for DirLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+/// A temporary path next to `path`, unique within and across processes. It starts with `.` and does
+/// not end in `.sql`, so [`Dir::open`] never reads it.
+fn temp_path(path: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(0);
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let tmp = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
-    let res = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
+    path.with_file_name(format!(".{name}.{}.{}.tmp", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)))
+}
+
+/// Write `bytes` to a new synced temporary file `tmp`.
+fn write_synced(tmp: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(tmp)?;
+    f.write_all(bytes)?;
+    f.sync_all()
+}
+
+/// Flush the directory entry changes in the parent of `path` to disk (a no-op off unix).
+fn sync_parent(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let parent = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
+        std::fs::File::open(parent)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+/// Write `bytes` to `path` through a synced temporary file in the same directory renamed over it,
+/// then sync the directory, so a reader (or a crash) sees the old contents or the new, never part
+/// of them. The temporary name starts with `.` and does not end in `.sql`, so [`Dir::open`] never
+/// reads it.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let tmp = temp_path(path);
+    let res = write_synced(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path)).and_then(|()| sync_parent(path));
     if res.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
     res.map_err(|source| Error::Io { path: path.to_owned(), source })
+}
+
+/// Move the file `from` to `to` without replacing `to`: a hard link, then removing `from`. Fails
+/// with [`std::io::ErrorKind::AlreadyExists`] when `to` exists. On a file system without hard links
+/// it checks that `to` does not exist and renames, which is safe only while the caller holds the
+/// [`DirLock`] of the directory (no other pgmig run can create `to` in between).
+pub(crate) fn move_no_overwrite(from: &Path, to: &Path) -> std::io::Result<()> {
+    match std::fs::hard_link(from, to) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(e),
+        Err(_) => {
+            if to.exists() {
+                return Err(std::io::ErrorKind::AlreadyExists.into());
+            }
+            return std::fs::rename(from, to);
+        }
+    }
+    match std::fs::remove_file(from) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// Create `path` holding `bytes`, failing with [`std::io::ErrorKind::AlreadyExists`] (inside
+/// [`Error::Io`]) when it exists. The contents are written and synced under a temporary name and
+/// then hard-linked to `path`, so `path` never appears partly written. Where hard links are not
+/// supported it renames instead, after checking `path` is absent: callers must hold the
+/// [`DirLock`] of the directory (they do). The temporary file is always removed.
+pub fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
+    let tmp = temp_path(path);
+    let res = write_synced(&tmp, bytes).and_then(|()| move_no_overwrite(&tmp, path));
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res.and_then(|()| sync_parent(path)).map_err(|source| Error::Io { path: path.to_owned(), source })
 }
 
 /// The hash of a file following the file whose hash is `prev`.
@@ -826,6 +932,84 @@ mod tests {
         let d = Dir::open(&t.0).expect("open");
         assert_eq!(names(&d), ["1_a.sql", "2_b.sql"]);
         assert_eq!(d.files()[0].bytes, b"A");
+    }
+
+    #[test]
+    fn open_ignores_the_lock_and_temporary_files() {
+        let t = TempDir::new(&[("1_a.sql", b"A"), (LOCK_FILE, b""), (".x.tmp", b"x"), (".1_b.sql.1.0.tmp", b"x")]);
+        let d = Dir::open(&t.0).expect("open");
+        assert_eq!(names(&d), ["1_a.sql"]);
+    }
+
+    fn leftovers(t: &TempDir) -> Vec<String> {
+        let mut v: Vec<String> =
+            std::fs::read_dir(&t.0).expect("read").map(|e| e.expect("entry").file_name().to_string_lossy().into_owned()).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn write_atomic_replaces_and_leaves_no_temp_file() {
+        let t = TempDir::new(&[("f", b"old")]);
+        write_atomic(&t.0.join("f"), b"new").expect("write");
+        write_atomic(&t.0.join("g"), b"g").expect("write");
+        assert_eq!(std::fs::read(t.0.join("f")).expect("read"), b"new");
+        assert_eq!(leftovers(&t), ["f", "g"]);
+        let missing = t.0.join("nope").join("f");
+        assert!(write_atomic(&missing, b"x").is_err());
+        assert_eq!(leftovers(&t), ["f", "g"]);
+    }
+
+    #[test]
+    fn write_new_refuses_an_existing_file_and_leaves_no_temp_file() {
+        let t = TempDir::new(&[]);
+        write_new(&t.0.join("1_a.sql"), b"A").expect("write");
+        assert_eq!(std::fs::read(t.0.join("1_a.sql")).expect("read"), b"A");
+        assert_eq!(leftovers(&t), ["1_a.sql"]);
+        let err = write_new(&t.0.join("1_a.sql"), b"B").expect_err("exists");
+        assert!(matches!(&err, Error::Io { source, .. } if source.kind() == std::io::ErrorKind::AlreadyExists), "{err}");
+        assert_eq!(std::fs::read(t.0.join("1_a.sql")).expect("read"), b"A");
+        assert!(write_new(&t.0.join("nope").join("2_b.sql"), b"x").is_err());
+        assert_eq!(leftovers(&t), ["1_a.sql"]);
+    }
+
+    #[test]
+    fn dir_lock_is_exclusive_and_kept() {
+        let t = TempDir::new(&[]);
+        let lock = DirLock::acquire(&t.0).expect("lock");
+        let other = std::fs::OpenOptions::new().read(true).write(true).open(t.0.join(LOCK_FILE)).expect("open");
+        assert!(matches!(other.try_lock(), Err(std::fs::TryLockError::WouldBlock)));
+        drop(lock);
+        other.try_lock().expect("free after drop");
+        assert!(t.0.join(LOCK_FILE).exists());
+    }
+
+    #[test]
+    fn move_no_overwrite_moves_and_refuses_an_existing_target() {
+        let t = TempDir::new(&[("a", b"A"), ("b", b"B")]);
+        move_no_overwrite(&t.0.join("a"), &t.0.join("c")).expect("move");
+        assert_eq!(leftovers(&t), ["b", "c"]);
+        assert_eq!(std::fs::read(t.0.join("c")).expect("read"), b"A");
+        let err = move_no_overwrite(&t.0.join("c"), &t.0.join("b")).expect_err("occupied");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(t.0.join("b")).expect("read"), b"B");
+        assert_eq!(std::fs::read(t.0.join("c")).expect("read"), b"A");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dir_lock_works_with_a_lock_file_this_user_cannot_write() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let t = TempDir::new(&[(LOCK_FILE, b"")]);
+        let lock_path = t.0.join(LOCK_FILE);
+        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o444)).expect("chmod");
+        if std::fs::OpenOptions::new().write(true).open(&lock_path).is_ok() {
+            return; // root ignores the mode
+        }
+        let lock = DirLock::acquire(&t.0).expect("lock through a read-only handle");
+        let other = std::fs::File::open(&lock_path).expect("open");
+        assert!(matches!(other.try_lock(), Err(std::fs::TryLockError::WouldBlock)));
+        drop(lock);
     }
 
     #[test]

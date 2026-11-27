@@ -8,6 +8,11 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
 
 ### Added
 
+- Migration files and `pgmig.sum` are written crash-safely: synced temporary files moved into
+  place, so a file never appears partly written under its final name. Commands that write into
+  the migration directory (`migrate diff`, `new`, `baseline`, `hash`, `edit`, `rm`, `rebase`) lock it (`.pgmig.lock`, safe to ignore in version
+  control), so concurrent runs get distinct versions.
+
 - Indexes: inspected with `pg_get_indexdef` (access methods, expressions, partial, covering,
   operator classes, collation, sort order, `NULLS NOT DISTINCT`, storage parameters) and planned as
   drop and create, with comments; indexes owned by constraints are left to the constraints. Skip
