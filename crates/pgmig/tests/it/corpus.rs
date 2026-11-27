@@ -7,7 +7,7 @@
 //!
 //! `options.toml` sets the case's plan options; a missing file is the defaults, and an unknown key
 //! or a value of the wrong type fails the case. The keys are those of [`pgmig::PlanOptions`]:
-//! `concurrent_indexes` (boolean, default false). On pgmem, the failing cases must be exactly those in
+//! `concurrent_indexes`, `if_exists` and `cascade` (booleans, default false). On pgmem, the failing cases must be exactly those in
 //! `corpus/pgmem_known_failures.txt`; on Postgres, every case must pass.
 
 use std::collections::BTreeSet;
@@ -56,8 +56,12 @@ fn case_options(dir: &Path) -> Result<PlanOptions, String> {
     for (key, value) in &table {
         match (key.as_str(), value) {
             ("concurrent_indexes", toml::Value::Boolean(b)) => opts.concurrent_indexes = *b,
-            ("concurrent_indexes", _) => return Err("options.toml: concurrent_indexes: expected a boolean".into()),
-            _ => return Err(format!("options.toml: unknown key `{key}` (expected `concurrent_indexes`)")),
+            ("if_exists", toml::Value::Boolean(b)) => opts.if_exists = *b,
+            ("cascade", toml::Value::Boolean(b)) => opts.cascade = *b,
+            ("concurrent_indexes" | "if_exists" | "cascade", _) => return Err(format!("options.toml: {key}: expected a boolean")),
+            _ => {
+                return Err(format!("options.toml: unknown key `{key}` (expected `concurrent_indexes`, `if_exists` or `cascade`)"));
+            }
         }
     }
     Ok(opts)
@@ -169,12 +173,20 @@ mod tests {
             ("concurrent_indexes = true\n", Ok(true)),
             ("# plain\nconcurrent_indexes = false\n", Ok(false)),
             ("concurrent_indexes = 1\n", Err("options.toml: concurrent_indexes: expected a boolean")),
-            ("concurent_indexes = true\n", Err("options.toml: unknown key `concurent_indexes` (expected `concurrent_indexes`)")),
+            (
+                "concurent_indexes = true\n",
+                Err("options.toml: unknown key `concurent_indexes` (expected `concurrent_indexes`, `if_exists` or `cascade`)"),
+            ),
+            ("if_exists = 1\n", Err("options.toml: if_exists: expected a boolean")),
+            ("cascade = \"yes\"\n", Err("options.toml: cascade: expected a boolean")),
         ] {
             fs::write(dir.join("options.toml"), text).expect("write");
             let got = case_options(&dir).map(|o| o.concurrent_indexes);
             assert_eq!(got, want.map_err(str::to_owned), "{text}");
         }
+        fs::write(dir.join("options.toml"), "if_exists = true\ncascade = true\n").expect("write");
+        let both = case_options(&dir).expect("both");
+        assert!(both.if_exists && both.cascade && !both.concurrent_indexes);
         fs::write(dir.join("options.toml"), "concurrent_indexes = \n").expect("write");
         assert!(case_options(&dir).expect_err("syntax").starts_with("options.toml: "));
         let _ = fs::remove_dir_all(&dir);

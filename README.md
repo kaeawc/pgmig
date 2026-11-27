@@ -89,6 +89,23 @@ first). Such a plan cannot be combined with `--edit`. `-- pgmig:notx` belongs to
 (`schema diff` output, `--edit`); a migration file holding it is refused, so save such a plan with
 `migrate diff` rather than from `schema diff`.
 
+`--if-exists` and `--cascade` (on `schema diff`, `schema apply`, `schema plan` and `migrate diff`;
+config: `[diff] if_exists = true` and `[diff] cascade = true`; `--no-if-exists` and `--no-cascade`
+override the config) change the statements a plan writes, and are off by default. With
+`--if-exists`, `CREATE SCHEMA`, `CREATE TABLE` (also `PARTITION OF`), `CREATE SEQUENCE`, `CREATE
+INDEX` (also `CONCURRENTLY`) and `ALTER TABLE ... ADD COLUMN` get `IF NOT EXISTS`, and `DROP
+SCHEMA`/`TABLE`/`SEQUENCE`/`INDEX`/`TYPE`/`DOMAIN`, `ALTER TABLE ... DROP COLUMN`, `DROP CONSTRAINT`
+and `ALTER TYPE ... DROP ATTRIBUTE` get `IF EXISTS`, so a plan that was partly applied can run again.
+Postgres has no `IF NOT EXISTS` for `CREATE TYPE` (enums and composite types), `CREATE DOMAIN` or `ADD
+CONSTRAINT`, so those stay as they are, and so does every statement whose effect does not depend on
+whether the object exists. Note that `IF NOT EXISTS` skips an object that exists with a different
+definition (including an `INVALID` index a failed `CONCURRENTLY` build left), without comparing
+them. With `--cascade`, `DROP SCHEMA`/`TABLE`/`SEQUENCE`/`INDEX`/`TYPE`/`DOMAIN`, `DROP COLUMN` and
+`DROP CONSTRAINT` get `CASCADE`. **`CASCADE` makes Postgres drop everything that depends on the
+object, including views, functions and other objects pgmig does not manage or that `--include`,
+`--exclude` and `--skip` leave out, and the plan does not list them.** Use it only when that is what
+you want. `DROP INDEX CONCURRENTLY` has no `CASCADE` form and keeps the plain statement.
+
 `--edit` (on `schema apply` and `migrate diff`) opens the planned SQL in `$VISUAL`, else `$EDITOR`,
 else `vi` (split on whitespace, run without a shell) on a private temp file, removed afterwards.
 What you save is what runs or is written, with no new diff: drop statements, add your own, or keep
@@ -108,15 +125,15 @@ in JSON mode: pass `--auto-approve` or `--dry-run`.
 ### Saved plans: `schema plan` and `schema apply --plan`
 
 `pgmig schema plan --url <db> --to <desired> --out plan.json` plans what `schema apply` would do
-(same `--shadow`, `--include`, `--exclude`, `--schema`, `--skip`, `--concurrent-indexes` and
-`--verify`, and the same config settings) and saves it as a plan file; without `--out` the file
+(same `--shadow`, `--include`, `--exclude`, `--schema`, `--skip`, `--concurrent-indexes`,
+`--if-exists`, `--cascade` and `--verify`, and the same config settings) and saves it as a plan file; without `--out` the file
 goes to stdout. The database is only read. A plan with no statements is saved too.
 
 The file is pretty-printed JSON: `format` (`1`; another number is refused), `pgmig_version`, `from`
 (the `h1:` fingerprint of the database's managed objects when planned, as `schema fingerprint`
 prints it), `to` (the fingerprint of the desired state's managed objects), `skipped` (changes
 `--skip` left out, when there are any), `options` (filters, schema mode, revisions schema, skip
-policy, `concurrent_indexes`: the scope both fingerprints are relative to), `plan` (the statements,
+policy, `concurrent_indexes`, `if_exists`, `cascade`: the scope both fingerprints are relative to), `plan` (the statements,
 commit point and statements outside a transaction: what runs) and `sql` (the plan as a script, for
 reviewing).
 
@@ -136,7 +153,7 @@ database again: when it is not `to` the changes stay applied and the command fai
 `plan_diverged` ("applied, but the result does not match the planned state") so that CI notices.
 That last check is skipped when `skipped` is not empty, since the result is then expected to differ.
 `--plan` cannot be combined with `--to`, `--shadow`, `--include`, `--exclude`, `--schema`, `--skip`,
-`--concurrent-indexes`, `--verify` or `--edit` (usage error, exit `2`): the file carries its scope
+`--concurrent-indexes`, `--if-exists`, `--cascade`, `--verify` or `--edit` (usage error, exit `2`): the file carries its scope
 and was verified when planned. With `--format json` the response has `target`, `from`, `to`, `plan`,
 `sql`, `applied`, `report` and `fingerprint` (the database's after applying).
 

@@ -24,6 +24,8 @@
 //! | `diff.skip` | `--skip` | array of kinds of change (`"drop_table"`, ...; [`pgmig_diff::ChangeKind`]) |
 //! | `diff.verify` | `--verify` (`schema apply`, `migrate diff`) | boolean |
 //! | `diff.concurrent_indexes` | `--concurrent-indexes` | boolean |
+//! | `diff.if_exists` | `--if-exists` | boolean |
+//! | `diff.cascade` | `--cascade` | boolean |
 //!
 //! Top-level keys apply everywhere; an `[env.<name>]` section overrides them key by key (an array
 //! replaces the one below it, it does not extend it). [`Config::resolve`] applies the precedence
@@ -78,6 +80,10 @@ pub struct Settings {
     pub diff_verify: Option<bool>,
     /// `[diff] concurrent_indexes`: create and drop indexes `CONCURRENTLY`.
     pub diff_concurrent_indexes: Option<bool>,
+    /// `[diff] if_exists`: `IF [NOT] EXISTS` on generated statements.
+    pub diff_if_exists: Option<bool>,
+    /// `[diff] cascade`: `CASCADE` on generated drops.
+    pub diff_cascade: Option<bool>,
 }
 
 impl fmt::Debug for Settings {
@@ -103,6 +109,8 @@ impl fmt::Debug for Settings {
             .field("diff_skip", &self.diff_skip)
             .field("diff_verify", &self.diff_verify)
             .field("diff_concurrent_indexes", &self.diff_concurrent_indexes)
+            .field("diff_if_exists", &self.diff_if_exists)
+            .field("diff_cascade", &self.diff_cascade)
             .finish()
     }
 }
@@ -373,16 +381,21 @@ fn settings(table: &toml::Table, prefix: &str, problems: &mut Vec<Problem>) -> S
                 toml::Value::Table(d) => {
                     for (k, v) in d {
                         let path = join(&path, k);
-                        if k == "verify" || k == "concurrent_indexes" {
-                            match v {
-                                toml::Value::Boolean(b) if k == "verify" => s.diff_verify = Some(*b),
-                                toml::Value::Boolean(b) => s.diff_concurrent_indexes = Some(*b),
+                        if matches!(k.as_str(), "verify" | "concurrent_indexes" | "if_exists" | "cascade") {
+                            match (v, k.as_str()) {
+                                (toml::Value::Boolean(b), "verify") => s.diff_verify = Some(*b),
+                                (toml::Value::Boolean(b), "concurrent_indexes") => s.diff_concurrent_indexes = Some(*b),
+                                (toml::Value::Boolean(b), "if_exists") => s.diff_if_exists = Some(*b),
+                                (toml::Value::Boolean(b), _) => s.diff_cascade = Some(*b),
                                 _ => problems.push(Problem::key(&path, "expected a boolean")),
                             }
                             continue;
                         }
                         if k != "skip" {
-                            problems.push(Problem::key(&path, "unknown key (expected `skip`, `verify` or `concurrent_indexes`)"));
+                            problems.push(Problem::key(
+                                &path,
+                                "unknown key (expected `skip`, `verify`, `concurrent_indexes`, `if_exists` or `cascade`)",
+                            ));
                             continue;
                         }
                         let toml::Value::Array(items) = v else {
@@ -666,6 +679,8 @@ impl Config {
             diff_skip,
             diff_verify: section.diff_verify.or(self.top.diff_verify),
             diff_concurrent_indexes: section.diff_concurrent_indexes.or(self.top.diff_concurrent_indexes),
+            diff_if_exists: section.diff_if_exists.or(self.top.diff_if_exists),
+            diff_cascade: section.diff_cascade.or(self.top.diff_cascade),
         })
     }
 }
@@ -838,7 +853,7 @@ exclude = ["e"]
 schema = "app"
 format = "text"
 migrations = { dir = "m", revisions_schema = "ops", tx_mode = "none", exec_order = "linear-skip", lock_name = "l", lock_timeout = "5s", before_sql = "SET LOCAL lock_timeout = '1s'", after_sql = "SELECT 1" }
-diff = { skip = ["drop_table", "drop_column"], verify = true, concurrent_indexes = true }
+diff = { skip = ["drop_table", "drop_column"], verify = true, concurrent_indexes = true, if_exists = true, cascade = true }
 "#,
         );
         let s = c.resolve(None, &Vars::only(BTreeMap::new())).expect("resolve");
@@ -862,6 +877,8 @@ diff = { skip = ["drop_table", "drop_column"], verify = true, concurrent_indexes
             diff_skip: Some(vec!["drop_table".into(), "drop_column".into()]),
             diff_verify: Some(true),
             diff_concurrent_indexes: Some(true),
+            diff_if_exists: Some(true),
+            diff_cascade: Some(true),
         };
         assert_eq!(s, want);
         assert!(c.envs.is_empty());
@@ -927,7 +944,7 @@ skip = true
         assert_eq!(got.len(), 4, "{got:?}");
         assert!(got[0].starts_with("diff.skip[1]: unknown kind of change \"drop_tables\" (expected one of create_schema,"), "{got:?}");
         assert_eq!(got[1], "diff.skip[2]: expected a string");
-        assert_eq!(got[2], "diff.skipp: unknown key (expected `skip`, `verify` or `concurrent_indexes`)");
+        assert_eq!(got[2], "diff.skipp: unknown key (expected `skip`, `verify`, `concurrent_indexes`, `if_exists` or `cascade`)");
         assert_eq!(got[3], "env.prod.diff.skip: expected an array of kinds of change");
         // An environment replaces the list; a placeholder is checked once interpolated.
         let c = parse("[diff]\nskip = [\"drop_table\"]\n[env.prod.diff]\nskip = [\"${KIND}\"]\n");
@@ -959,6 +976,29 @@ skip = true
         assert_eq!(c.resolve(Some("dev"), &vars(&[])).expect("dev").diff_concurrent_indexes, Some(false));
         assert_eq!(c.resolve(Some("qa"), &vars(&[])).expect("qa").diff_concurrent_indexes, Some(true));
         assert_eq!(parse("").resolve(None, &vars(&[])).expect("empty").diff_concurrent_indexes, None);
+    }
+
+    #[test]
+    fn diff_if_exists_and_cascade_are_booleans_an_environment_overrides() {
+        let got = problems("[diff]\nif_exists = \"yes\"\ncascade = 0\n[env.dev.diff]\nif_exists = 1\ncascade = \"no\"\n");
+        assert_eq!(
+            got,
+            [
+                "diff.cascade: expected a boolean",
+                "diff.if_exists: expected a boolean",
+                "env.dev.diff.cascade: expected a boolean",
+                "env.dev.diff.if_exists: expected a boolean"
+            ]
+        );
+        let c = parse("[diff]\nif_exists = true\ncascade = true\n[env.dev.diff]\nif_exists = false\ncascade = false\n[env.qa]\n");
+        let top = c.resolve(None, &vars(&[])).expect("top");
+        assert_eq!((top.diff_if_exists, top.diff_cascade), (Some(true), Some(true)));
+        let dev = c.resolve(Some("dev"), &vars(&[])).expect("dev");
+        assert_eq!((dev.diff_if_exists, dev.diff_cascade), (Some(false), Some(false)));
+        let qa = c.resolve(Some("qa"), &vars(&[])).expect("qa");
+        assert_eq!((qa.diff_if_exists, qa.diff_cascade), (Some(true), Some(true)));
+        let empty = parse("").resolve(None, &vars(&[])).expect("empty");
+        assert_eq!((empty.diff_if_exists, empty.diff_cascade), (None, None));
     }
 
     #[test]

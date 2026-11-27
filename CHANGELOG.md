@@ -8,6 +8,18 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
 
 ### Added
 
+- `--if-exists` and `--cascade` on `schema diff`, `schema apply`, `schema plan` and `migrate diff`
+  (or `[diff] if_exists = true` and `[diff] cascade = true`; `--no-if-exists` and `--no-cascade`
+  override), as `PlanOptions::if_exists` / `cascade` and the `if_exists` / `cascade` fields of the
+  options (left out of the JSON when false, carried in a saved plan's `options`). `--if-exists`
+  writes `IF NOT EXISTS` on `CREATE SCHEMA`, `CREATE TABLE`, `CREATE SEQUENCE`, `CREATE INDEX
+  [CONCURRENTLY]` and `ADD COLUMN`, and `IF EXISTS` on `DROP SCHEMA`/`TABLE`/`SEQUENCE`/`INDEX`/
+  `TYPE`/`DOMAIN`, `DROP COLUMN`, `DROP CONSTRAINT` and `DROP ATTRIBUTE`; `CREATE TYPE`, `CREATE
+  DOMAIN` and `ADD CONSTRAINT` have no such form in Postgres and are unchanged. `--cascade` writes
+  `CASCADE` on those drops except `DROP ATTRIBUTE` and `DROP INDEX CONCURRENTLY` (which has none).
+  `CASCADE` makes Postgres drop what depends on the object, including views, functions and objects
+  pgmig does not manage or the filters leave out, without listing them: it is off by default. `schema
+  clean` and `--verify` do not use either.
 - Declarative partitioning: range, list and hash partitioned tables, sub-partitions and default
   partitions are inspected, diffed and planned. The model gains `Table.partition_key`
   (`pg_get_partkeydef`) and `Table.partition_of` (`parent`, and `bound` as `pg_get_expr(relpartbound)`

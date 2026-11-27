@@ -10,6 +10,7 @@ mod edit;
 mod filters;
 mod json;
 mod migrate;
+mod plan_options;
 mod policy;
 mod saved_plan;
 mod support;

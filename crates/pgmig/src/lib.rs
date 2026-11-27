@@ -414,8 +414,8 @@ impl ShadowSpec {
 
 /// What pgmig manages, how it prints names, and which changes it never plans. Serialized as
 /// `{"filter": {...}, "schema": ..., "revisions_schema": ..., "skip": [...], "concurrent_indexes":
-/// ...}`; each may be left out, `revisions_schema` is left out when it is the default, `skip` when
-/// it is empty and `concurrent_indexes` when it is false.
+/// ..., "if_exists": ..., "cascade": ...}`; each may be left out, `revisions_schema` is left out
+/// when it is the default, `skip` when it is empty and the booleans when they are false.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Options {
@@ -444,6 +444,16 @@ pub struct Options {
     /// is left out of the JSON when false.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub concurrent_indexes: bool,
+    /// `IF NOT EXISTS` on generated creates and `IF EXISTS` on generated drops where Postgres has
+    /// them (see [`PlanOptions::if_exists`]). Applies where `skip` does, and is left out of the
+    /// JSON when false.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub if_exists: bool,
+    /// `CASCADE` on generated drops (see [`PlanOptions::cascade`]): Postgres also drops what
+    /// depends on the object, objects pgmig does not manage included, without listing them. Applies
+    /// where `skip` does, and is left out of the JSON when false.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub cascade: bool,
 }
 
 impl Default for Options {
@@ -454,6 +464,8 @@ impl Default for Options {
             revisions_schema: revisions::DEFAULT_SCHEMA.to_owned(),
             skip: Vec::new(),
             concurrent_indexes: false,
+            if_exists: false,
+            cascade: false,
         }
     }
 }
@@ -499,12 +511,22 @@ impl Options {
 
     /// How printed plans name objects under these options.
     pub fn plan_options(&self) -> PlanOptions {
-        PlanOptions { unqualified_schema: self.schema.clone(), concurrent_indexes: self.concurrent_indexes }
+        PlanOptions {
+            unqualified_schema: self.schema.clone(),
+            concurrent_indexes: self.concurrent_indexes,
+            if_exists: self.if_exists,
+            cascade: self.cascade,
+        }
     }
 
     /// How plans that are executed name objects: always qualified (see [`schema_plan_apply`]).
     pub fn qualified_plan_options(&self) -> PlanOptions {
-        PlanOptions { concurrent_indexes: self.concurrent_indexes, ..PlanOptions::default() }
+        PlanOptions {
+            concurrent_indexes: self.concurrent_indexes,
+            if_exists: self.if_exists,
+            cascade: self.cascade,
+            ..PlanOptions::default()
+        }
     }
 
     /// The changes of `changes` to plan under [`Options::skip`], and those left out, statements

@@ -245,6 +245,24 @@ fn statements_outside_a_transaction_run_as_planned() {
 }
 
 #[test]
+fn if_exists_and_cascade_are_planned_carried_in_the_file_and_run() {
+    let db = target("CREATE TABLE t (id int); CREATE TABLE gone (id int);");
+    let t = Tmp::new();
+    let (spec, _keep) = shadow();
+    let options = Options { if_exists: true, cascade: true, ..Options::default() };
+    let saved = plan(&db, &t.sql("CREATE TABLE t (id int); CREATE TABLE fresh (id int);"), &spec, options.clone());
+    assert_eq!(
+        saved.plan.statements,
+        ["CREATE TABLE IF NOT EXISTS public.fresh (\n    id integer\n)", "DROP TABLE IF EXISTS public.gone CASCADE"]
+    );
+    assert_eq!(saved.options, options);
+    let back = SavedPlan::parse(&saved.to_json()).expect("parse");
+    assert_eq!(back, saved);
+    let done = apply(&db, &back).expect("apply");
+    assert_eq!(done.fingerprint, saved.to);
+}
+
+#[test]
 fn a_policy_that_skips_changes_does_not_expect_the_desired_fingerprint() {
     let db = target("CREATE TABLE t (id int); CREATE TABLE keep (id int);");
     let t = Tmp::new();
