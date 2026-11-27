@@ -227,7 +227,8 @@ fn plans_with_skipped_changes_apply() {
         let db = TestDb::new();
         db.connect().batch(from).expect("load target");
         let (shadow, _keep) = shadow();
-        let req = PlanApplyRequest { target: db.conninfo.clone(), desired: t.sql("to.sql", to), shadow, options: skipping(kinds) };
+        let req =
+            PlanApplyRequest { target: db.conninfo.clone(), desired: t.sql("to.sql", to), shadow, options: skipping(kinds), verify: false };
         let res = api::schema_plan_apply(&req).unwrap_or_else(|e| panic!("{name}: plan: {e}"));
         let mut got = shown(&res.skipped);
         let mut want_sorted: Vec<String> = want.iter().map(|s| (*s).to_owned()).collect();
@@ -269,7 +270,13 @@ fn a_kept_replacement_keeps_the_foreign_key_using_it() {
         let db = TestDb::new();
         db.connect().batch(from).expect("load target");
         let (shadow, _keep) = shadow();
-        let req = PlanApplyRequest { target: db.conninfo.clone(), desired: t.sql("to.sql", to), shadow, options: skipping(&[*kind]) };
+        let req = PlanApplyRequest {
+            target: db.conninfo.clone(),
+            desired: t.sql("to.sql", to),
+            shadow,
+            options: skipping(&[*kind]),
+            verify: false,
+        };
         let res = api::schema_plan_apply(&req).expect("plan");
         assert!(
             res.plan.statements.iter().all(|s| !s.contains("c_pid_fkey")),
@@ -303,7 +310,7 @@ fn migrate_diff_leaves_skipped_changes_out_of_the_file() {
     assert!(res.written.is_none() && res.plan.is_empty());
     assert_eq!(shown(&res.skipped), ["drop_table public.old (policy)"]);
     // The response carries them too.
-    let req = api::MigrateDiffRequest { dir, name: "again".into(), to, shadow, options: opts, editor: None };
+    let req = api::MigrateDiffRequest { dir, name: "again".into(), to, shadow, options: opts, editor: None, verify: false };
     let json = serde_json::to_value(api::migrate_diff(&req).expect("api")).expect("json");
     assert_eq!(json["skipped"][0]["kind"], "drop_table");
     assert_eq!(json["file"], serde_json::Value::Null);

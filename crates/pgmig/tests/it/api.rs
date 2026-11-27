@@ -91,6 +91,7 @@ fn plan_apply_then_apply() {
         desired: Source::Sql(desired.0.clone()),
         shadow: spec.clone(),
         options: Options::default(),
+        verify: false,
     };
     let res = api::schema_plan_apply(&req).expect("plan");
     assert!(matches!(res.changes.as_slice(), [Change::CreateTable(_)]), "{:?}", res.changes);

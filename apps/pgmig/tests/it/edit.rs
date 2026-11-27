@@ -209,3 +209,39 @@ fn sql_files(d: &Path) -> Vec<String> {
     names.sort();
     names
 }
+
+#[test]
+fn apply_verify_aborts_an_edited_plan_before_touching_the_target() {
+    let editor = Editor::new("grep -v age \"$1\" > \"$1.new\" && cat \"$1.new\" > \"$1\" && rm \"$1.new\"");
+    let (db, desired, (shadow, _keep)) = setup();
+    let path = desired.path();
+    let args = [&apply_args(&db, &path, &shadow)[..], &["--verify"]].concat();
+    let (code, out) = pgmig_tty(&args, &editor);
+    assert_eq!(code, Some(1), "{out}");
+    editor.assert_ran_and_cleaned_up();
+    assert!(out.contains("verification failed") && out.contains("add_column public.t.age"), "{out}");
+    assert!(!out.contains("applied 1 statement"), "{out}");
+    assert_eq!(columns(&db, "t"), ["id"]);
+
+    // The edit kept whole verifies and applies.
+    let editor = Editor::new("printf -- '-- reviewed\\n' >> \"$1\"");
+    let (code, out) = pgmig_tty(&args, &editor);
+    assert_eq!(code, Some(0), "{out}");
+    assert!(out.contains("verified:") && out.contains("applied 2 statements"), "{out}");
+    assert_eq!(columns(&db, "t"), ["id", "name", "age"]);
+}
+
+#[test]
+fn migrate_diff_verify_writes_nothing_when_the_edit_misses_a_change() {
+    let editor = Editor::new("printf 'CREATE TABLE public.t (id integer, name text);\\n' > \"$1\"");
+    let (_, desired, (shadow, _keep)) = setup();
+    let root = Editor::new("");
+    let dir = root.0.join("migrations");
+    let dir_arg = dir.to_string_lossy().into_owned();
+    let args = ["migrate", "diff", "edited", "--dir", &dir_arg, "--to", &desired.path(), "--shadow", &shadow, "--edit", "--verify"];
+    let (code, out) = pgmig_tty(&args, &editor);
+    assert_eq!(code, Some(1), "{out}");
+    editor.assert_ran_and_cleaned_up();
+    assert!(out.contains("verification failed") && out.contains("add_column public.t.age"), "{out}");
+    assert!(sql_files(&dir).is_empty() && !dir.join("pgmig.sum").exists());
+}

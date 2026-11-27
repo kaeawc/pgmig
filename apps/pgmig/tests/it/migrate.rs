@@ -403,3 +403,15 @@ fn baseline_status_and_set() {
     assert_eq!((v["current"].as_str(), v["pending"].as_array().map(Vec::len)), (Some(version.as_str()), Some(0)));
     assert_eq!(v["files"][0]["kind"], "baseline");
 }
+
+#[test]
+fn diff_verify_checks_the_migration_before_writing_it() {
+    let t = Dir::new(&[("schema.sql", SCHEMA)]);
+    let dir = t.0.join("migrations");
+    let (dir_arg, to) = (dir.to_string_lossy().into_owned(), t.0.join("schema.sql").to_string_lossy().into_owned());
+    let (shadow, _keep) = shadow_arg();
+    let out = pgmig(&["migrate", "diff", "init", "--dir", &dir_arg, "--to", &to, "--shadow", &shadow, "--verify"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(stderr(&out).starts_with("verified: in the shadow database the migration makes the desired state\nwrote "), "{}", stderr(&out));
+    assert_eq!(sql_files(&dir).len(), 1);
+}

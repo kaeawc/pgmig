@@ -8,6 +8,12 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
 
 ### Added
 
+- `--verify` on `schema apply` and `migrate diff` (or `[diff] verify = true`; `--no-verify`
+  overrides): the plan, or the edited SQL, first runs in the shadow database on a copy of the
+  current schema, and the result must equal the desired schema (changes the diff policy skips
+  aside). A failing statement or a remaining difference aborts before anything is applied or
+  written; JSON errors carry code `verify_failed` and a `verify` object.
+
 - Domains and composite types: inspected (base type, collation, default, `NOT NULL`, named checks
   with `NOT VALID`, attributes, comments) and planned in dependency order with the tables, enums,
   domains and composites that use them: create, drop, `ALTER DOMAIN` defaults, `NOT NULL`, checks
