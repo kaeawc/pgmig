@@ -34,6 +34,13 @@ impl Tmp {
         self.0.join("migrations")
     }
 
+    /// Write a migration and rehash the directory.
+    fn migration(&self, name: &str, sql: &str) {
+        std::fs::create_dir_all(self.dir()).expect("create migrations");
+        std::fs::write(self.dir().join(name), sql).expect("write migration");
+        pgmig::migrate_hash(&self.dir()).expect("hash");
+    }
+
     fn files(&self) -> Vec<String> {
         let mut names: Vec<String> = std::fs::read_dir(self.dir())
             .map(|rd| {
@@ -188,11 +195,14 @@ fn a_failed_concurrent_build_commits_nothing_and_says_how_to_remove_the_invalid_
     assert_eq!(units, [true, false], "{}", plan.to_sql());
 
     let err = apply(&db.conninfo, &plan).expect_err("duplicates");
-    let Error::Apply { statement_index, statement, source, committed_batches, outside_transaction } = &err else { panic!("{err}") };
+    let Error::Apply { statement_index, statement, source, committed_batches, committed_outside_transaction, outside_transaction } = &err
+    else {
+        panic!("{err}")
+    };
     assert_eq!(*statement_index, Some(1));
     assert!(statement.starts_with("CREATE UNIQUE INDEX CONCURRENTLY t_a_idx"), "{statement}");
     assert_eq!(source.code.as_deref(), Some("23505"), "{source}");
-    assert_eq!((*committed_batches, *outside_transaction), (1, true));
+    assert_eq!((*committed_batches, *committed_outside_transaction, *outside_transaction), (1, 0, true));
     let msg = err.to_string();
     assert!(msg.contains("SQLSTATE 23505"), "{msg}");
     assert!(msg.contains("INVALID index") && msg.contains("DROP INDEX CONCURRENTLY public.t_a_idx"), "{msg}");
@@ -202,6 +212,7 @@ fn a_failed_concurrent_build_commits_nothing_and_says_how_to_remove_the_invalid_
     let columns = db.connect().query("SELECT count(*) FROM information_schema.columns WHERE table_name = 't'").expect("query");
     assert_eq!(columns, vec![vec![Some("3".to_owned())]]);
     // Postgres leaves the failed build behind, INVALID; the statement in the message removes it.
+    // pgmem leaves nothing behind (kaeawc/pgmem#279), so there is nothing to check or drop there.
     if postgres_dsn().is_some() {
         assert_eq!(indexes(&db), [("t_a_idx".into(), false)]);
         db.connect().batch("DROP INDEX CONCURRENTLY public.t_a_idx").expect("the suggested statement");
@@ -212,6 +223,29 @@ fn a_failed_concurrent_build_commits_nothing_and_says_how_to_remove_the_invalid_
     assert_eq!(json["apply"]["outcome"], "statement_failed");
     assert_eq!(json["apply"]["committed_batches"], 1);
     assert_eq!(json["sqlstate"], "23505");
+}
+
+#[test]
+fn an_earlier_statement_outside_a_transaction_stays_applied_and_is_counted() {
+    let db = target("CREATE TABLE t (id int, a int); INSERT INTO t VALUES (1, 7), (2, 7);");
+    let t = Tmp::new();
+    let (spec, _keep) = shadow();
+    // Built in name order: the first succeeds, the unique one over duplicates fails.
+    let desired = t.sql("CREATE TABLE t (id int, a int);\nCREATE INDEX a_id_idx ON t (id);\nCREATE UNIQUE INDEX z_a_idx ON t (a);");
+    let plan = schema_plan_apply(&db.conninfo, &desired, &spec, &concurrent()).expect("plan");
+    assert_eq!(plan.non_transactional.len(), 2, "{}", plan.to_sql());
+
+    let err = apply(&db.conninfo, &plan).expect_err("duplicates");
+    let Error::Apply { committed_batches, committed_outside_transaction, outside_transaction, .. } = &err else { panic!("{err}") };
+    assert_eq!((*committed_batches, *committed_outside_transaction, *outside_transaction), (0, 1, true));
+    let msg = err.to_string();
+    // No transaction was committed, and the message does not say one was.
+    assert!(msg.contains("1 earlier statement outside a transaction committed and stays applied"), "{msg}");
+    assert!(!msg.contains("batch") && !msg.contains("nothing was committed"), "{msg}");
+    let json = serde_json::to_value(api::ApiError::from(&err)).expect("serialize");
+    assert_eq!(json["apply"]["committed_batches"], 0);
+    assert_eq!(json["apply"]["committed_outside_transaction"], 1);
+    assert!(indexes(&db).iter().any(|(name, valid)| name == "a_id_idx" && *valid), "{:?}", indexes(&db));
 }
 
 #[test]
@@ -237,11 +271,12 @@ fn verify_runs_statements_outside_a_transaction() {
         shadow: spec,
         options: concurrent(),
     });
-    if postgres_dsn().is_some() {
-        let err = err.expect_err("CONCURRENTLY inside a transaction");
-        assert_eq!(err.code, ErrorCode::VerifyFailed, "{err}");
-        assert_eq!(err.sqlstate.as_deref(), Some("25001"), "{err}");
-    }
+    // The plan's first statement is a DROP INDEX CONCURRENTLY, which Postgres refuses inside a
+    // transaction; pgmem accepts that one (kaeawc/pgmem#280) and refuses the CREATE INDEX
+    // CONCURRENTLY after it with the same SQLSTATE, so the check holds on both.
+    let err = err.expect_err("CONCURRENTLY inside a transaction");
+    assert_eq!(err.code, ErrorCode::VerifyFailed, "{err}");
+    assert_eq!(err.sqlstate.as_deref(), Some("25001"), "{err}");
 }
 
 #[test]
@@ -417,12 +452,7 @@ fn a_plan_diff_prints_the_concurrent_statements_and_marks_them() {
 #[test]
 fn indexes_on_a_partitioned_table_are_inspected_and_stay_plain() {
     let db = TestDb::new();
-    let partitioned = db.connect().batch("CREATE TABLE p (id int, a int) PARTITION BY RANGE (id); CREATE INDEX p_a_idx ON p (a);");
-    if let Err(e) = partitioned {
-        assert!(postgres_dsn().is_none(), "partitioned tables failed on Postgres: {e}");
-        eprintln!("skipped on pgmem: PARTITION BY is not supported: {e}");
-        return;
-    }
+    db.connect().batch("CREATE TABLE p (id int, a int) PARTITION BY RANGE (id); CREATE INDEX p_a_idx ON p (a);").expect("partitioned");
     let model = pgmig::inspect(&mut db.connect()).expect("inspect");
     let p = &model.tables[&pgmig_model::QualName::new("public", "p")];
     assert!(p.indexes.iter().all(|i| i.on_partitioned_table), "{:?}", p.indexes);
@@ -431,4 +461,49 @@ fn indexes_on_a_partitioned_table_are_inspected_and_stay_plain() {
     let changes = pgmig::diff(&pgmig::Model::empty_database(), &model);
     let planned = pgmig::plan_with(&changes, &pgmig::PlanOptions { concurrent_indexes: true, ..Default::default() }).expect("plan");
     assert!(planned.non_transactional.is_empty(), "{}", planned.to_sql());
+}
+
+#[test]
+fn a_saved_plan_is_refused_as_a_migration_and_the_error_says_what_to_do() {
+    let db = target(FROM);
+    let t = Tmp::new();
+    let (spec, _keep) = shadow();
+    // What `schema diff --concurrent-indexes > m.sql` writes.
+    let plan = pgmig::schema_diff(&Source::Database(db.conninfo.clone()), &t.sql(TO), &spec, &concurrent()).expect("diff");
+    assert!(plan.to_sql().contains("-- pgmig:notx"));
+    t.migration("1_saved.sql", &plan.to_sql());
+
+    let target = TestDb::new();
+    let err = migrate_apply(&target.conninfo, &t.dir(), &ApplyOptions::default()).expect_err("refused");
+    let Error::Directive { pos, message, .. } = &err else { panic!("{err}") };
+    assert_eq!(pos.line, 2, "{err}");
+    assert!(message.contains("pgmig:notx belongs to the text of a plan") && message.contains("`-- pgmig:txmode none`"), "{err}");
+    assert!(indexes(&target).is_empty());
+    // Replaying the directory (`migrate validate`, `migrate diff`) refuses it the same way.
+    let err = pgmig::migrate_validate(&t.dir(), Some(&spec)).expect_err("replay refuses it");
+    assert!(matches!(&err, Error::Directive { message, .. } if message.contains("pgmig:notx")), "{err}");
+    // `plan_from_sql` still reads it: that is what the directive is for.
+    assert_eq!(pgmig::plan_from_sql(&plan.to_sql()).expect("a plan"), plan);
+}
+
+#[test]
+fn a_failed_concurrent_build_in_a_migration_file_names_the_index_to_drop() {
+    let t = Tmp::new();
+    t.migration("1_data.sql", "CREATE TABLE t (id int, a int);\nINSERT INTO t VALUES (1, 7), (2, 7);\n");
+    t.migration("2_index.sql", "-- pgmig:txmode none\nCREATE UNIQUE INDEX CONCURRENTLY t_a_idx ON public.t USING btree (a);\n");
+    let db = TestDb::new();
+    let err = migrate_apply(&db.conninfo, &t.dir(), &ApplyOptions::default()).expect_err("duplicates");
+    let msg = err.to_string();
+    assert!(matches!(&err, Error::MigrationFailed { source, .. } if source.code.as_deref() == Some("23505")), "{msg}");
+    assert!(msg.contains("2_index.sql:2:1") && msg.contains("SQLSTATE 23505"), "{msg}");
+    assert!(msg.contains("INVALID index") && msg.contains("DROP INDEX CONCURRENTLY public.t_a_idx"), "{msg}");
+
+    // In a file that runs in a transaction the server refuses the statement before building
+    // anything (25001): there is no index to remove, and the message does not suggest one.
+    let t = Tmp::new();
+    t.migration("1_index.sql", "CREATE TABLE t (id int, a int);\nCREATE INDEX CONCURRENTLY t_a_idx ON public.t USING btree (a);\n");
+    let db = TestDb::new();
+    let err = migrate_apply(&db.conninfo, &t.dir(), &ApplyOptions::default()).expect_err("in a transaction");
+    assert!(matches!(&err, Error::MigrationFailed { source, .. } if source.code.as_deref() == Some("25001")), "{err}");
+    assert!(!err.to_string().contains("INVALID"), "{err}");
 }

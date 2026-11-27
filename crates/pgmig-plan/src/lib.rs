@@ -12,7 +12,7 @@
 //! `ALTER TYPE ... ADD VALUE` may run in a transaction, but the new value cannot be used (as a
 //! column default, say) until that transaction commits. So the plan puts every `ADD VALUE` first
 //! and, when other statements follow, marks a commit point after them ([`Plan::commit_after`]):
-//! [`Plan::batches`] are the scripts to run in separate transactions, and [`Plan::to_sql`] writes
+//! [`Plan::units`] are the stretches to run in separate transactions, and [`Plan::to_sql`] writes
 //! the point as a comment and the `-- pgmig:commit` directive ([`COMMIT_MARKER`]), which
 //! `migrate apply` commits at when it runs a file `migrate diff` wrote. pgmig does not check which
 //! later statements use a new value; any statement after an `ADD VALUE` waits for the commit.
@@ -100,9 +100,10 @@ use serde::{Deserialize, Serialize};
 
 /// Serialized as `{"statements": [...], "commit_after": <index or null>}`, and
 /// `"non_transactional": [...]` after them when some statement runs outside a transaction. Without
-/// the field, as written before it existed, every statement is transactional.
+/// the field, as written before it existed, every statement is transactional. Reading refuses a
+/// `non_transactional` that is not strictly ascending or names a statement the plan does not have.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "PlanWire")]
 pub struct Plan {
     pub statements: Vec<String>,
     /// The index of the last statement that must be committed before the statements after it run
@@ -112,6 +113,34 @@ pub struct Plan {
     /// one, each as a unit of its own (`CREATE INDEX CONCURRENTLY`; see the module doc).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub non_transactional: Vec<usize>,
+}
+
+/// What [`Plan`] is read from, before its `non_transactional` is checked.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlanWire {
+    statements: Vec<String>,
+    commit_after: Option<usize>,
+    #[serde(default)]
+    non_transactional: Vec<usize>,
+}
+
+impl TryFrom<PlanWire> for Plan {
+    type Error = String;
+
+    fn try_from(w: PlanWire) -> Result<Plan, String> {
+        let PlanWire { statements, commit_after, non_transactional } = w;
+        if let Some(i) = non_transactional.iter().find(|&&i| i >= statements.len()) {
+            return Err(format!("non_transactional: statement {i} does not exist (the plan has {})", statements.len()));
+        }
+        if let Some(pair) = non_transactional.windows(2).find(|p| p[0] >= p[1]) {
+            return Err(format!(
+                "non_transactional: expected strictly ascending statement indexes, but {} is followed by {}",
+                pair[0], pair[1]
+            ));
+        }
+        Ok(Plan { statements, commit_after, non_transactional })
+    }
 }
 
 /// A run of a plan's statements ([`Plan::units`]).
@@ -148,7 +177,7 @@ impl Plan {
     }
 
     fn is_non_transactional(&self, i: usize) -> bool {
-        self.non_transactional.binary_search(&i).is_ok()
+        self.non_transactional.contains(&i)
     }
 
     /// The plan as the units that run in order, each committed before the next one starts: the
@@ -2336,6 +2365,30 @@ mod tests {
         let json = serde_json::to_string(&with).expect("serialize");
         assert_eq!(json, r#"{"statements":["CREATE INDEX i ON t (x)"],"commit_after":null,"non_transactional":[0]}"#);
         assert_eq!(serde_json::from_str::<Plan>(&json).expect("deserialize"), with);
+    }
+
+    #[test]
+    fn plan_json_with_a_bad_non_transactional_list_is_refused() {
+        let read = |list: &str| {
+            serde_json::from_str::<Plan>(&format!(r#"{{"statements":["a","b","c"],"commit_after":null,"non_transactional":{list}}}"#))
+        };
+        assert_eq!(read("[0,2]").expect("ascending").non_transactional, [0, 2]);
+        assert!(read("[]").expect("empty").non_transactional.is_empty());
+        for (list, message) in [
+            ("[2,0]", "strictly ascending statement indexes, but 2 is followed by 0"),
+            ("[1,1]", "strictly ascending statement indexes, but 1 is followed by 1"),
+            ("[3]", "statement 3 does not exist (the plan has 3)"),
+            ("[0,7]", "statement 7 does not exist"),
+        ] {
+            let err = read(list).expect_err(list).to_string();
+            assert!(err.contains(message), "{list}: {err}");
+        }
+        // Other fields are still checked, and unknown ones refused.
+        assert!(serde_json::from_str::<Plan>(r#"{"statements":[],"commit_after":null,"x":1}"#).is_err());
+        // A plan built in code with the list out of order still lays out its units by statement.
+        let plan = Plan { statements: vec!["a".into(), "b".into(), "c".into()], non_transactional: vec![2, 0], ..Plan::default() };
+        let outside: Vec<bool> = plan.units().iter().map(|u| u.transactional).collect();
+        assert_eq!(outside, [false, true, false]);
     }
 
     #[test]

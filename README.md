@@ -85,7 +85,9 @@ and the error names it and says to remove it with `DROP INDEX CONCURRENTLY`. `mi
 plan with such statements as one file per unit with consecutive versions (`<name>.sql`,
 `<name>_2.sql`, ...), a concurrent statement's file starting with `-- pgmig:txmode none`, all hashed
 into the sum file together; its JSON response lists them in `files` (`file` and `version` are the
-first). Such a plan cannot be combined with `--edit`.
+first). Such a plan cannot be combined with `--edit`. `-- pgmig:notx` belongs to the text of a plan
+(`schema diff` output, `--edit`); a migration file holding it is refused, so save such a plan with
+`migrate diff` rather than from `schema diff`.
 
 `--edit` (on `schema apply` and `migrate diff`) opens the planned SQL in `$VISUAL`, else `$EDITOR`,
 else `vi` (split on whitespace, run without a shell) on a private temp file, removed afterwards.

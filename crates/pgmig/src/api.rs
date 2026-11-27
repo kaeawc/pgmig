@@ -732,9 +732,12 @@ pub struct ApplyFailure {
     pub statement_index: Option<usize>,
     /// The failing statement (`BEGIN` or `COMMIT` included).
     pub statement: String,
-    /// Units committed before the failing one (transactions, and statements that ran outside one);
-    /// their changes stay applied.
+    /// Transactions committed before the failing statement; their changes stay applied.
     pub committed_batches: usize,
+    /// Statements that ran outside a transaction before it and committed by themselves; their
+    /// changes stay applied too. Left out of the JSON when none did.
+    #[serde(default, skip_serializing_if = "crate::is_zero")]
+    pub committed_outside_transaction: usize,
     pub outcome: ApplyOutcome,
 }
 
@@ -879,7 +882,7 @@ impl From<&Error> for ApiError {
             Error::Inspect(pgmig_inspect::Error::Query { source, .. }) => err(ErrorCode::Inspect).sqlstate(source),
             Error::Inspect(_) => err(ErrorCode::Inspect),
             Error::Plan(_) => err(ErrorCode::Plan),
-            Error::Apply { statement_index, statement, source, committed_batches, outside_transaction } => {
+            Error::Apply { statement_index, statement, source, committed_batches, committed_outside_transaction, outside_transaction } => {
                 let outcome = match (statement_index, statement.as_str()) {
                     _ if *outside_transaction => ApplyOutcome::StatementFailed,
                     (None, "BEGIN") => ApplyOutcome::NotStarted,
@@ -891,6 +894,7 @@ impl From<&Error> for ApiError {
                     statement_index: *statement_index,
                     statement: statement.clone(),
                     committed_batches: *committed_batches,
+                    committed_outside_transaction: *committed_outside_transaction,
                     outcome,
                 }));
                 e
@@ -1468,6 +1472,7 @@ mod tests {
             statement: "SELECT 1".into(),
             source: server(),
             committed_batches: 0,
+            committed_outside_transaction: 0,
             outside_transaction: false,
         };
         let e = ApiError::from(&apply);
@@ -1481,7 +1486,14 @@ mod tests {
     fn apply_errors_are_structured() {
         let apply = |statement_index, statement: &str, code: Option<&str>| {
             let source = pgmig_conn::Error { code: code.map(Into::into), message: "boom".into(), position: None };
-            let e = Error::Apply { statement_index, statement: statement.into(), source, committed_batches: 2, outside_transaction: false };
+            let e = Error::Apply {
+                statement_index,
+                statement: statement.into(),
+                source,
+                committed_batches: 2,
+                committed_outside_transaction: 0,
+                outside_transaction: false,
+            };
             serde_json::to_string(&ApiError::from(&e)).expect("serialize")
         };
         let tail = |index: &str, statement: &str, outcome: &str| {

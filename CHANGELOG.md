@@ -20,7 +20,10 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
   remove it (`DROP INDEX CONCURRENTLY <name>`), with the server's SQLSTATE and message. `migrate
   diff` writes such a plan as one file per unit with consecutive versions, a concurrent statement's
   file starting with `-- pgmig:txmode none`, and lists every file it wrote (JSON: `files`; `file`
-  and `version` stay the first); combining it with `--edit` is a usage error. The apply report
+  and `version` stay the first); combining it with `--edit` is a usage error. `-- pgmig:notx` is
+  only for the text of a plan: a migration file holding it is refused with a message that says to use a
+  file of its own that starts with `-- pgmig:txmode none`. A `migrate apply` statement that fails
+  while building an index `CONCURRENTLY` says how to remove the `INVALID` index it may have left. The apply report
   gains `non_transactional`, and an apply error `outcome` `statement_failed`.
 
 - `--verify` on `schema apply` and `migrate diff` (or `[diff] verify = true`; `--no-verify`
@@ -149,6 +152,13 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
   object they describe.
 
 ### Changed
+
+- `pgmig_plan::Plan::batches` is replaced by `Plan::units` (and `Plan::unit_sql`): a plan is an
+  ordered list of transactional and non-transactional units, and a statement run outside a
+  transaction is a unit of its own. A `Plan` literal needs the new `non_transactional` field (use
+  `..Plan::default()`), `migrate_diff`'s `written` is a list of the files written,
+  `Error::Apply` carries `committed_outside_transaction` and `outside_transaction`, and the `apply`
+  report's JSON has `non_transactional` when some statement ran outside a transaction.
 
 - Replaying a migration directory in the shadow (`migrate diff`, `--verify`, fingerprints and
   other `migrate` sources) runs each file as `migrate apply` does: one transaction per stretch

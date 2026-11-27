@@ -99,7 +99,7 @@ pub enum Error {
     Plan(#[from] pgmig_plan::Error),
     /// A statement of an applied plan failed; its transaction was rolled back (a statement outside
     /// a transaction committed nothing).
-    #[error("{}", apply_message(.statement_index, .statement, .source, .committed_batches, .outside_transaction))]
+    #[error("{}", apply_message(.statement_index, .statement, .source, .committed_batches, .committed_outside_transaction, .outside_transaction))]
     Apply {
         /// 0-based index into [`Plan::statements`]; `None` when the `COMMIT` itself failed.
         statement_index: Option<usize>,
@@ -107,9 +107,11 @@ pub enum Error {
         statement: String,
         /// The server's error, verbatim with its SQLSTATE.
         source: pgmig_conn::Error,
-        /// Units committed before the failing one (transactions, and statements that ran outside
-        /// one): their changes stay applied.
+        /// Transactions committed before the failing statement: their changes stay applied.
         committed_batches: usize,
+        /// Statements that ran outside a transaction ([`Plan::non_transactional`]) before it, and
+        /// committed by themselves: their changes stay applied too.
+        committed_outside_transaction: usize,
         /// The statement ran outside a transaction ([`Plan::non_transactional`]).
         outside_transaction: bool,
     },
@@ -134,7 +136,7 @@ pub enum Error {
     #[error("{path}: cannot resume after the statements an earlier run applied: {reason}")]
     Resume { path: PathBuf, reason: String },
     /// A migration statement failed; `pos` is where the server located the error.
-    #[error("{path}:{pos}: {source}\n{}", migrate_apply::outcome_message(*.outcome, *.applied_files))]
+    #[error("{path}:{pos}: {source}\n{}{}", migrate_apply::outcome_message(*.outcome, *.applied_files), leftover_index_hint(.statement, .source))]
     MigrationFailed {
         path: PathBuf,
         pos: pgmig_sql::Pos,
@@ -224,7 +226,14 @@ pub enum Error {
     VerifySetup { statement: String, source: pgmig_conn::Error },
 }
 
-fn apply_message(index: &Option<usize>, statement: &str, source: &pgmig_conn::Error, committed: &usize, outside: &bool) -> String {
+fn apply_message(
+    index: &Option<usize>,
+    statement: &str,
+    source: &pgmig_conn::Error,
+    committed: &usize,
+    committed_outside: &usize,
+    outside: &bool,
+) -> String {
     let what = match index {
         Some(i) => format!("statement {} failed", i + 1),
         None => format!("{statement} failed"),
@@ -238,18 +247,38 @@ fn apply_message(index: &Option<usize>, statement: &str, source: &pgmig_conn::Er
         (None, "BEGIN") => "this batch did not start",
         _ => "its transaction was rolled back",
     };
-    let committed = match committed {
-        0 => "nothing was committed".to_owned(),
-        1 => "1 earlier batch was committed and stays applied".to_owned(),
-        n => format!("{n} earlier batches were committed and stay applied"),
+    let committed = match (committed, committed_outside) {
+        (0, 0) => "nothing was committed".to_owned(),
+        (1, 0) => "1 earlier batch was committed and stays applied".to_owned(),
+        (n, 0) => format!("{n} earlier batches were committed and stay applied"),
+        (n, m) => {
+            let plural = |n: &usize, one: &str, many: &str| match n {
+                0 => None,
+                1 => Some(format!("1 earlier {one}")),
+                n => Some(format!("{n} earlier {many}")),
+            };
+            let parts: Vec<String> =
+                [plural(n, "batch", "batches"), plural(m, "statement outside a transaction", "statements outside a transaction")]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+            format!("{} committed and stay{} applied", parts.join(" and "), if *n == 0 && *m == 1 { "s" } else { "" })
+        }
     };
-    let leftover = match concurrent_index_name(statement) {
-        Some(name) if *outside => format!(
-            "\na failed CREATE INDEX CONCURRENTLY can leave an INVALID index behind (`pg_index.indisvalid` is false): remove it with DROP INDEX CONCURRENTLY {name}, then plan again"
+    let leftover = if *outside { leftover_index_hint(statement, source) } else { String::new() };
+    format!("{what}: {statement}\n{source}\n{batch}; {committed}{leftover}")
+}
+
+/// For a `CREATE INDEX CONCURRENTLY` that failed while it ran (not one the server refused in a
+/// transaction block, SQLSTATE 25001, which builds nothing): a line that says an `INVALID` index may
+/// be left behind and how to remove it. Empty for any other statement.
+fn leftover_index_hint(statement: &str, source: &pgmig_conn::Error) -> String {
+    match concurrent_index_name(statement) {
+        Some(name) if source.code.as_deref() != Some("25001") => format!(
+            "\na failed CREATE INDEX CONCURRENTLY can leave an INVALID index behind (`pg_index.indisvalid` is false): remove it with DROP INDEX CONCURRENTLY {name}, then try again"
         ),
         _ => String::new(),
-    };
-    format!("{what}: {statement}\n{source}\n{batch}; {committed}{leftover}")
+    }
 }
 
 /// The name (schema-qualified when the statement says the table's schema) of the index a
@@ -1049,7 +1078,7 @@ pub struct ApplyReport {
     pub non_transactional: usize,
 }
 
-fn is_zero(n: &usize) -> bool {
+pub(crate) fn is_zero(n: &usize) -> bool {
     *n == 0
 }
 
@@ -1064,12 +1093,14 @@ fn is_zero(n: &usize) -> bool {
 pub fn apply(target: &str, plan: &Plan) -> Result<ApplyReport> {
     let mut conn = Conn::connect(target)?;
     let mut report = ApplyReport::default();
-    for (done, unit) in plan.units().into_iter().enumerate() {
+    for unit in plan.units() {
+        let (committed_batches, committed_outside_transaction) = (report.batches, report.non_transactional);
         let error = |statement_index, statement: &str, source, outside_transaction| Error::Apply {
             statement_index,
             statement: statement.to_owned(),
             source,
-            committed_batches: done,
+            committed_batches,
+            committed_outside_transaction,
             outside_transaction,
         };
         if !unit.transactional {
@@ -1107,15 +1138,20 @@ mod tests {
     fn apply_messages_say_what_is_applied() {
         let lost = pgmig_conn::Error { code: None, message: "connection closed".into(), position: None };
         let server = pgmig_conn::Error { code: Some("23503".into()), message: "deferred fk".into(), position: None };
-        assert!(apply_message(&None, "COMMIT", &lost, &0, &false).contains("may or may not be applied"));
-        assert!(apply_message(&None, "COMMIT", &server, &0, &false).contains("rolled back; nothing was committed"));
-        assert!(apply_message(&None, "BEGIN", &lost, &1, &false).contains("did not start; 1 earlier batch was committed"));
-        assert!(apply_message(&Some(2), "SELECT 1", &server, &0, &false).starts_with("statement 3 failed: SELECT 1"));
+        assert!(apply_message(&None, "COMMIT", &lost, &0, &0, &false).contains("may or may not be applied"));
+        assert!(apply_message(&None, "COMMIT", &server, &0, &0, &false).contains("rolled back; nothing was committed"));
+        assert!(apply_message(&None, "BEGIN", &lost, &1, &0, &false).contains("did not start; 1 earlier batch was committed"));
+        assert!(apply_message(&Some(2), "SELECT 1", &server, &0, &0, &false).starts_with("statement 3 failed: SELECT 1"));
         let build = "CREATE INDEX CONCURRENTLY t_x_idx ON public.t USING btree (x)";
-        let msg = apply_message(&Some(1), build, &server, &1, &true);
-        assert!(msg.contains("ran outside a transaction and committed nothing; 1 earlier batch"), "{msg}");
+        let msg = apply_message(&Some(1), build, &server, &1, &0, &true);
+        assert!(msg.contains("ran outside a transaction and committed nothing; 1 earlier batch was committed and stays applied"), "{msg}");
+        let both = |batches, outside| apply_message(&Some(1), build, &server, &batches, &outside, &true);
+        assert!(both(1, 1).contains("1 earlier batch and 1 earlier statement outside a transaction committed and stay applied"));
+        assert!(both(2, 3).contains("2 earlier batches and 3 earlier statements outside a transaction committed and stay applied"));
+        assert!(both(0, 1).contains("1 earlier statement outside a transaction committed and stays applied"), "{}", both(0, 1));
+        assert!(both(0, 2).contains("2 earlier statements outside a transaction committed and stay applied"), "{}", both(0, 2));
         assert!(msg.contains("INVALID index") && msg.contains("DROP INDEX CONCURRENTLY public.t_x_idx"), "{msg}");
-        assert!(!apply_message(&Some(1), build, &server, &1, &false).contains("INVALID"));
+        assert!(!apply_message(&Some(1), build, &server, &1, &0, &false).contains("INVALID"));
     }
 
     #[test]

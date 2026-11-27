@@ -78,11 +78,14 @@ fn failing_statement_rolls_back_its_batch() {
     assert!(plan.statements[..failing].iter().any(|s| s.contains("ADD COLUMN")), "ADD COLUMN runs first:\n{}", plan.to_sql());
 
     let err = apply(&db.conninfo, &plan).expect_err("apply must fail");
-    let Error::Apply { statement_index, statement, source, committed_batches, outside_transaction } = &err else { panic!("{err}") };
+    let Error::Apply { statement_index, statement, source, committed_batches, committed_outside_transaction, outside_transaction } = &err
+    else {
+        panic!("{err}")
+    };
     assert_eq!(*statement_index, Some(failing));
     assert_eq!(statement, &plan.statements[failing]);
     assert_eq!(source.code.as_deref(), Some("23502"), "{source}");
-    assert_eq!(*committed_batches, 0);
+    assert_eq!((*committed_batches, *committed_outside_transaction), (0, 0));
     assert!(!outside_transaction);
     let msg = err.to_string();
     assert!(msg.contains(&format!("statement {} failed", failing + 1)) && msg.contains("SQLSTATE 23502"), "{msg}");
