@@ -13,6 +13,10 @@
 //!
 //! - schemas: name, comment;
 //! - enums: name, labels in order, comment;
+//! - domains: name, base type, collation, default, `NOT NULL`, comment; check constraints by name,
+//!   each with its definition (without `NOT VALID`), whether it is validated, and comment;
+//! - composite types: name, comment; attributes by name (as columns), each with its type,
+//!   collation and comment;
 //! - sequences: name, data type, options, `OWNED BY`, comment;
 //! - tables: name, comment; columns by name (column order is not compared: Postgres cannot reorder
 //!   columns, so a diff never tries to), each with its type, `NOT NULL`, default, comment and
@@ -25,9 +29,9 @@
 //! columns and references (which say nothing its definition doesn't; the referenced index name
 //! is the catalog's), and an index's uniqueness and columns (its definition says them).
 //!
-//! Indexes entered the fingerprint without a new [`FORMAT`]: a model without indexes writes no
-//! index record, so its fingerprint is what it was. A schema with indexes fingerprints differently
-//! from before, as it should: earlier versions did not read its indexes at all.
+//! Indexes, domains and composite types entered the fingerprint without a new [`FORMAT`]: a model
+//! without them writes no record of them, so its fingerprint is what it was. A schema with them
+//! fingerprints differently from before, as it should: earlier versions did not read them at all.
 //!
 //! # Encoding
 //!
@@ -44,8 +48,8 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    Column, Constraint, ConstraintKind, Enum, Generated, Identity, Index, Model, OwnedBy, QualName, Schema, Sequence, SequenceOptions,
-    Table,
+    Attribute, Column, Composite, Constraint, ConstraintKind, Domain, DomainConstraint, Enum, Generated, Identity, Index, Model, OwnedBy,
+    QualName, Schema, Sequence, SequenceOptions, Table,
 };
 
 /// The first line of the canonical text. Changing what enters the fingerprint, or how it is
@@ -62,7 +66,7 @@ pub fn fingerprint(model: &Model) -> String {
 /// Every struct is destructured with all its fields named (no `..`), so a field added to the model
 /// does not compile here until it is either written or listed as excluded with the reason.
 pub fn canonical(model: &Model) -> String {
-    let Model { schemas, tables, enums, sequences } = model;
+    let Model { schemas, tables, enums, sequences, domains, composites } = model;
     let mut w = Writer(format!("{FORMAT}\n"));
     for s in schemas.values() {
         let Schema { name, comment } = s;
@@ -71,6 +75,45 @@ pub fn canonical(model: &Model) -> String {
     for e in enums.values() {
         let Enum { name, labels, comment } = e;
         w.tag("enum").name(name).list(labels).opt(comment).end();
+    }
+    for d in domains.values() {
+        let Domain {
+            name,
+            base_type,
+            // Derived from the base type.
+            base_ref: _,
+            collation,
+            default,
+            not_null,
+            constraints,
+            comment,
+        } = d;
+        w.tag("domain").name(name).str(base_type).opt_name(collation).opt(default).bool(*not_null).opt(comment).end();
+        let mut constraints: Vec<_> = constraints.iter().collect();
+        constraints.sort_by(|a, b| a.name.cmp(&b.name));
+        for c in constraints {
+            // The body: Postgres prints `NOT VALID` after it, pgmem does not (kaeawc/pgmem#266);
+            // `validated` says it.
+            let DomainConstraint { name, definition: _, validated, comment } = c;
+            w.tag("domain_constraint").str(name).str(c.body()).bool(*validated).opt(comment).end();
+        }
+    }
+    for c in composites.values() {
+        let Composite { name, attributes, comment } = c;
+        w.tag("composite").name(name).opt(comment).end();
+        let mut attributes: Vec<_> = attributes.iter().collect();
+        attributes.sort_by(|a, b| a.name.cmp(&b.name));
+        for a in attributes {
+            let Attribute {
+                name,
+                type_name,
+                // Derived from the type name.
+                type_ref: _,
+                collation,
+                comment,
+            } = a;
+            w.tag("attribute").str(name).str(type_name).opt_name(collation).opt(comment).end();
+        }
     }
     for s in sequences.values() {
         let Sequence { name, data_type, options, owned_by, comment } = s;
@@ -185,6 +228,13 @@ impl Writer {
     fn opt(&mut self, s: &Option<String>) -> &mut Writer {
         match s {
             Some(s) => self.raw("+").str(s),
+            None => self.raw("-"),
+        }
+    }
+
+    fn opt_name(&mut self, n: &Option<QualName>) -> &mut Writer {
+        match n {
+            Some(n) => self.raw("+").name(n),
             None => self.raw("-"),
         }
     }
@@ -482,5 +532,116 @@ index 14:users_team_idx 76:CREATE INDEX users_team_idx ON app.users USING btree 
             fingerprint(&m)
         };
         assert_ne!(empty(None), empty(Some("")));
+    }
+
+    /// [`sample`] with a domain and a composite type.
+    fn with_types() -> Model {
+        let mut m = sample();
+        let d = QualName::new("app", "posint");
+        let check = |name: &str, definition: &str, validated| DomainConstraint {
+            name: name.into(),
+            definition: definition.into(),
+            validated,
+            comment: None,
+        };
+        m.domains.insert(
+            d.clone(),
+            Domain {
+                name: d.clone(),
+                base_type: "integer".into(),
+                base_ref: None,
+                collation: None,
+                default: Some("1".into()),
+                not_null: true,
+                constraints: vec![
+                    check("posint_small", "CHECK ((VALUE < 10)) NOT VALID", false),
+                    check("posint_check", "CHECK ((VALUE > 0))", true),
+                ],
+                comment: Some("pos".into()),
+            },
+        );
+        let p = QualName::new("app", "pair");
+        let attr = |name: &str, type_name: &str, type_ref: Option<QualName>| Attribute {
+            name: name.into(),
+            type_name: type_name.into(),
+            type_ref,
+            collation: None,
+            comment: None,
+        };
+        m.composites.insert(
+            p.clone(),
+            Composite { name: p, attributes: vec![attr("b", "app.posint", Some(d)), attr("a", "text", None)], comment: None },
+        );
+        m
+    }
+
+    fn domain(m: &mut Model) -> &mut Domain {
+        m.domains.values_mut().next().expect("domain")
+    }
+
+    fn composite(m: &mut Model) -> &mut Composite {
+        m.composites.values_mut().next().expect("composite")
+    }
+
+    #[test]
+    fn domains_and_composite_types_enter_the_canonical_text() {
+        let text = canonical(&with_types());
+        assert!(
+            text.contains(
+                "enum 3:app 4:mood 2 3:sad 2:ok -
+domain 3:app 6:posint 7:integer - + 1:1 t + 3:pos
+domain_constraint 12:posint_check 19:CHECK ((VALUE > 0)) t -
+domain_constraint 12:posint_small 20:CHECK ((VALUE < 10)) f -
+composite 3:app 4:pair -
+attribute 1:a 4:text - -
+attribute 1:b 10:app.posint - -
+sequence "
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn domain_and_composite_fields_the_diff_compares_change_the_fingerprint() {
+        let base = fingerprint(&with_types());
+        let unchanged: Vec<(&str, Edit)> = vec![
+            ("base_ref", |m| domain(m).base_ref = Some(QualName::new("x", "y"))),
+            ("attribute type_ref", |m| composite(m).attributes[0].type_ref = None),
+            ("attribute order", |m| composite(m).attributes.reverse()),
+            ("constraint order", |m| domain(m).constraints.reverse()),
+            // pgmem prints no NOT VALID; the flag says it.
+            ("NOT VALID in the definition", |m| domain(m).constraints[0].definition = "CHECK ((VALUE < 10))".into()),
+        ];
+        for (what, change) in unchanged {
+            let mut m = with_types();
+            change(&mut m);
+            assert_eq!(fingerprint(&m), base, "{what}");
+        }
+        let changes: Vec<(&str, Edit)> = vec![
+            ("domain base type", |m| domain(m).base_type = "bigint".into()),
+            ("domain collation", |m| domain(m).collation = Some(QualName::new("pg_catalog", "C"))),
+            ("domain default", |m| domain(m).default = None),
+            ("domain not null", |m| domain(m).not_null = false),
+            ("domain comment", |m| domain(m).comment = None),
+            ("domain check", |m| domain(m).constraints[1].definition = "CHECK ((VALUE > 1))".into()),
+            ("domain check validated", |m| domain(m).constraints[0].validated = true),
+            ("domain check comment", |m| domain(m).constraints[0].comment = Some("c".into())),
+            ("domain check dropped", |m| domain(m).constraints.truncate(1)),
+            ("composite comment", |m| composite(m).comment = Some("c".into())),
+            ("attribute type", |m| composite(m).attributes[1].type_name = "varchar".into()),
+            ("attribute collation", |m| composite(m).attributes[1].collation = Some(QualName::new("pg_catalog", "C"))),
+            ("attribute comment", |m| composite(m).attributes[1].comment = Some("c".into())),
+            ("attribute dropped", |m| composite(m).attributes.truncate(1)),
+            ("composite dropped", |m| m.composites.clear()),
+            ("domain dropped", |m| m.domains.clear()),
+        ];
+        let mut seen = std::collections::BTreeSet::from([base.clone()]);
+        for (what, change) in changes {
+            let mut m = with_types();
+            change(&mut m);
+            let fp = fingerprint(&m);
+            assert_ne!(fp, base, "{what}");
+            assert!(seen.insert(fp), "{what}: same fingerprint as another change");
+        }
     }
 }

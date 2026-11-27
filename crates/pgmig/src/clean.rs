@@ -5,7 +5,8 @@
 //! new database's `public` schema (kept, with its standard comment, when it is managed) and the
 //! objects the options do not manage. Those stay, and so does every managed object one of them
 //! needs, or dropping it would fail (`2BP01`) or take the unmanaged object with it: the schema
-//! holding it, the enum or table row type a column uses, the sequence a default takes values from
+//! holding it, the enum, domain, composite type or table row type a column uses (and those a kept
+//! domain is over or a kept composite type's attributes use), the sequence a default takes values from
 //! or that owns a sequence, the table, columns and key a foreign key references, the columns a
 //! constraint or index uses. Each is reported as [`Kept`]. A table that stays keeps its unmanaged
 //! indexes; managed indexes go (with their table, or alone when the table stays).
@@ -98,6 +99,8 @@ pub fn clean_desired(full: &Model, opts: &Options) -> (Model, Vec<Kept>) {
         d.schemas.insert(name, s);
     }
     d.enums.retain(|n, _| !managed.enums.contains_key(n));
+    d.domains.retain(|n, _| !managed.domains.contains_key(n));
+    d.composites.retain(|n, _| !managed.composites.contains_key(n));
     d.sequences.retain(|n, _| !managed.sequences.contains_key(n));
     d.tables = full
         .tables
@@ -136,6 +139,8 @@ enum Need {
     Schema(String),
     Table(QualName),
     Enum(QualName),
+    Domain(QualName),
+    Composite(QualName),
     Sequence(QualName),
     Column(QualName, String),
     Constraint(QualName, String),
@@ -149,12 +154,10 @@ fn needs(full: &Model, d: &Model) -> Vec<(Need, String)> {
         out.push((Need::Schema(t.name.schema.clone()), format!("{table} is in it")));
         for c in &t.columns {
             let col = format!("column {}.{}", t.name, pgmig_model::quote_ident(&c.name));
-            if let Some(r) = &c.type_ref {
-                if full.enums.contains_key(r) {
-                    out.push((Need::Enum(r.clone()), format!("{col} uses it")));
-                } else if full.tables.contains_key(r) && r != &t.name {
-                    out.push((Need::Table(r.clone()), format!("{col} uses its row type")));
-                }
+            if let Some(r) = &c.type_ref
+                && r != &t.name
+            {
+                out.extend(type_need(full, r, &col));
             }
             for s in &c.default_sequences {
                 out.push((Need::Sequence(s.clone()), format!("the default of {col} uses it")));
@@ -185,6 +188,22 @@ fn needs(full: &Model, d: &Model) -> Vec<(Need, String)> {
     for e in d.enums.values() {
         out.push((Need::Schema(e.name.schema.clone()), format!("enum {} is in it", e.name)));
     }
+    for dom in d.domains.values() {
+        let what = format!("domain {}", dom.name);
+        out.push((Need::Schema(dom.name.schema.clone()), format!("{what} is in it")));
+        if let Some(r) = &dom.base_ref {
+            out.extend(type_need(full, r, &what));
+        }
+    }
+    for c in d.composites.values() {
+        out.push((Need::Schema(c.name.schema.clone()), format!("composite type {} is in it", c.name)));
+        for a in &c.attributes {
+            let what = format!("attribute {}.{}", c.name, pgmig_model::quote_ident(&a.name));
+            if let Some(r) = a.type_ref.as_ref().filter(|r| **r != c.name) {
+                out.extend(type_need(full, r, &what));
+            }
+        }
+    }
     for s in d.sequences.values() {
         out.push((Need::Schema(s.name.schema.clone()), format!("sequence {} is in it", s.name)));
         if let Some(o) = &s.owned_by {
@@ -193,6 +212,22 @@ fn needs(full: &Model, d: &Model) -> Vec<(Need, String)> {
         }
     }
     out
+}
+
+/// What `user` (`column public.t.c`) needs to use type `r`: the enum, domain, composite type or
+/// table (its row type) of that name in `full`.
+fn type_need(full: &Model, r: &QualName, user: &str) -> Option<(Need, String)> {
+    if full.enums.contains_key(r) {
+        Some((Need::Enum(r.clone()), format!("{user} uses it")))
+    } else if full.domains.contains_key(r) {
+        Some((Need::Domain(r.clone()), format!("{user} uses it")))
+    } else if full.composites.contains_key(r) {
+        Some((Need::Composite(r.clone()), format!("{user} uses it")))
+    } else if full.tables.contains_key(r) {
+        Some((Need::Table(r.clone()), format!("{user} uses its row type")))
+    } else {
+        None
+    }
 }
 
 /// Put `need` back into `d` from `full`; the object restored, or `None` when `d` already has it
@@ -213,6 +248,20 @@ fn restore(full: &Model, d: &mut Model, need: &Need) -> Option<String> {
             }
             d.enums.insert(n.clone(), full.enums.get(n)?.clone());
             Some(format!("enum {n}"))
+        }
+        Need::Domain(n) => {
+            if d.domains.contains_key(n) {
+                return None;
+            }
+            d.domains.insert(n.clone(), full.domains.get(n)?.clone());
+            Some(format!("domain {n}"))
+        }
+        Need::Composite(n) => {
+            if d.composites.contains_key(n) {
+                return None;
+            }
+            d.composites.insert(n.clone(), full.composites.get(n)?.clone());
+            Some(format!("composite type {n}"))
         }
         Need::Sequence(n) => {
             if d.sequences.contains_key(n) {
@@ -333,6 +382,52 @@ mod tests {
         assert_eq!(objects, ["enum app.mood", "schema app"]);
         assert_eq!(kept[0].because, "column public.keep.m uses it");
     }
+    #[test]
+    fn domains_and_composite_types_an_excluded_table_needs_are_kept_with_what_they_use() {
+        let mut full = model();
+        let (d, p) = (QualName::new("app", "d"), QualName::new("app", "pair"));
+        full.domains.insert(
+            d.clone(),
+            pgmig_model::Domain {
+                name: d.clone(),
+                base_type: "app.mood".into(),
+                base_ref: Some(QualName::new("app", "mood")),
+                collation: None,
+                default: None,
+                not_null: false,
+                constraints: vec![],
+                comment: None,
+            },
+        );
+        let attribute = pgmig_model::Attribute {
+            name: "a".into(),
+            type_name: "app.d".into(),
+            type_ref: Some(d.clone()),
+            collation: None,
+            comment: None,
+        };
+        full.composites.insert(p.clone(), pgmig_model::Composite { name: p.clone(), attributes: vec![attribute], comment: None });
+        let keep = QualName::new("public", "keep");
+        full.tables.get_mut(&keep).expect("keep").columns = vec![col("ps", Some(p.clone()))];
+        let opts = Options { filter: Filter::parse::<&str, _>(&[], &["table:public.keep"]).expect("filter"), ..Options::default() };
+        let (desired, kept) = clean_desired(&full, &opts);
+        assert!(desired.composites.contains_key(&p) && desired.domains.contains_key(&d));
+        assert!(desired.enums.contains_key(&QualName::new("app", "mood")));
+        let shown: Vec<String> = kept.iter().map(|k| format!("{} ({})", k.object, k.because)).collect();
+        assert_eq!(
+            shown,
+            [
+                "composite type app.pair (column public.keep.ps uses it)",
+                "schema app (composite type app.pair is in it)",
+                "domain app.d (attribute app.pair.a uses it)",
+                "enum app.mood (domain app.d uses it)",
+            ]
+        );
+        // With nothing needing them they go.
+        let (bare, _) = clean_desired(&full, &Options::default());
+        assert!(bare.domains.is_empty() && bare.composites.is_empty());
+    }
+
     #[test]
     fn indexes_follow_their_table_and_keep_the_columns_they_use() {
         let index = |table: &str, name: &str, columns: &[&str]| pgmig_model::Index {

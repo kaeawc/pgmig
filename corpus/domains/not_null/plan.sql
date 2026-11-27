@@ -1,0 +1,2 @@
+ALTER DOMAIN public.opt DROP NOT NULL;
+ALTER DOMAIN public.req SET NOT NULL;

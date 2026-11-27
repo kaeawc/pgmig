@@ -1,7 +1,7 @@
 //! Which objects pgmig manages: `--include` / `--exclude` patterns over `schema.object[.column]`.
 //!
-//! A pattern is `[kind:]glob`, where `kind` is `schema`, `table`, `enum` or `sequence` (no prefix
-//! matches any kind) and `glob` has one part per level separated by `.`: `schema`, `schema.object`
+//! A pattern is `[kind:]glob`, where `kind` is `schema`, `table`, `enum`, `domain`, `composite` (a
+//! composite type) or `sequence` (no prefix matches any kind) and `glob` has one part per level separated by `.`: `schema`, `schema.object`
 //! or `schema.table.column`. Each part matches an unquoted name with `*` (any run of characters)
 //! and `?` (one character); everything else matches itself. Names containing `.` cannot be named.
 //!
@@ -45,6 +45,9 @@ pub enum Kind {
     Table,
     Enum,
     Sequence,
+    Domain,
+    /// A composite type.
+    Composite,
 }
 
 /// One `--include` or `--exclude` pattern. Serialized as its string.
@@ -66,7 +69,9 @@ impl Pattern {
                     "table" => Kind::Table,
                     "enum" => Kind::Enum,
                     "sequence" => Kind::Sequence,
-                    _ => return Err(err("the kind must be schema, table, enum or sequence")),
+                    "domain" => Kind::Domain,
+                    "composite" => Kind::Composite,
+                    _ => return Err(err("the kind must be schema, table, enum, domain, composite or sequence")),
                 };
                 (Some(kind), rest)
             }
@@ -78,8 +83,10 @@ impl Pattern {
         }
         match (kind, parts.len()) {
             (Some(Kind::Schema), n) if n != 1 => Err(err("a schema pattern has one part")),
-            (Some(Kind::Table | Kind::Enum | Kind::Sequence), 1) => Err(err("an object pattern needs schema.object")),
-            (Some(Kind::Enum | Kind::Sequence), 3) => Err(err("only tables have columns")),
+            (Some(Kind::Table | Kind::Enum | Kind::Sequence | Kind::Domain | Kind::Composite), 1) => {
+                Err(err("an object pattern needs schema.object"))
+            }
+            (Some(Kind::Enum | Kind::Sequence | Kind::Domain | Kind::Composite), 3) => Err(err("only tables have columns")),
             _ => Ok(Pattern { kind, parts }),
         }
     }
@@ -107,6 +114,8 @@ impl fmt::Display for Pattern {
             Some(Kind::Table) => "table:",
             Some(Kind::Enum) => "enum:",
             Some(Kind::Sequence) => "sequence:",
+            Some(Kind::Domain) => "domain:",
+            Some(Kind::Composite) => "composite:",
         };
         write!(f, "{kind}{}", self.parts.join("."))
     }
@@ -180,6 +189,8 @@ pub fn filter_model(model: &Model, filter: &Filter) -> Model {
     let mut m = model.clone();
     m.schemas.retain(|name, _| filter.manages_schema(name));
     m.enums.retain(|name, _| filter.manages_object(Kind::Enum, name));
+    m.domains.retain(|name, _| filter.manages_object(Kind::Domain, name));
+    m.composites.retain(|name, _| filter.manages_object(Kind::Composite, name));
     // A sequence `OWNED BY` a column follows that column: it is created and dropped with it.
     m.sequences.retain(|name, seq| match &seq.owned_by {
         Some(o) => filter.manages_object(Kind::Table, &o.table) && filter.manages_column(&o.table, &o.column),
@@ -205,6 +216,8 @@ pub fn without_schema(model: &Model, schema: &str) -> Model {
     m.schemas.remove(schema);
     m.tables.retain(|n, _| n.schema != schema);
     m.enums.retain(|n, _| n.schema != schema);
+    m.domains.retain(|n, _| n.schema != schema);
+    m.composites.retain(|n, _| n.schema != schema);
     m.sequences.retain(|n, _| n.schema != schema);
     m
 }
@@ -216,6 +229,8 @@ pub fn scope_model(model: &Model, schema: &str) -> Model {
     m.schemas.clear();
     m.tables.retain(|n, _| n.schema == schema);
     m.enums.retain(|n, _| n.schema == schema);
+    m.domains.retain(|n, _| n.schema == schema);
+    m.composites.retain(|n, _| n.schema == schema);
     m.sequences.retain(|n, _| n.schema == schema);
     m
 }
@@ -252,9 +267,16 @@ mod tests {
 
     #[test]
     fn filters_serialize_as_pattern_strings() {
-        let f = Filter::parse(&["app", "table:public.t*.a?", "enum:x.e", "sequence:x.s", "schema:s"], &["public.tmp_*"]).expect("patterns");
+        let f = Filter::parse(
+            &["app", "table:public.t*.a?", "enum:x.e", "sequence:x.s", "schema:s", "domain:x.d", "composite:x.c"],
+            &["public.tmp_*"],
+        )
+        .expect("patterns");
         let json = serde_json::to_string(&f).expect("serialize");
-        assert_eq!(json, r#"{"include":["app","table:public.t*.a?","enum:x.e","sequence:x.s","schema:s"],"exclude":["public.tmp_*"]}"#);
+        assert_eq!(
+            json,
+            r#"{"include":["app","table:public.t*.a?","enum:x.e","sequence:x.s","schema:s","domain:x.d","composite:x.c"],"exclude":["public.tmp_*"]}"#
+        );
         assert_eq!(serde_json::from_str::<Filter>(&json).expect("deserialize"), f);
         assert_eq!(serde_json::from_str::<Filter>("{}").expect("defaults"), Filter::default());
         let err = serde_json::from_str::<Filter>(r#"{"include":["view:public.v"]}"#).expect_err("bad pattern");
@@ -284,12 +306,12 @@ mod tests {
         assert_eq!(p, Pattern { kind: Some(Kind::Table), parts: vec!["public".into(), "tmp_*".into()] });
         assert_eq!(Pattern::parse("public.t.c").expect("parse").parts.len(), 3);
         assert_eq!(Pattern::parse("schema:app").expect("parse").kind, Some(Kind::Schema));
-        for bad in ["", "a..b", "a.b.c.d", "view:a.b", "schema:a.b", "table:a", "enum:a.b.c", "public."] {
+        for bad in ["", "a..b", "a.b.c.d", "view:a.b", "schema:a.b", "table:a", "enum:a.b.c", "domain:a", "composite:a.b.c", "public."] {
             assert!(Pattern::parse(bad).is_err(), "{bad}");
         }
         assert_eq!(
             Pattern::parse("view:a.b").expect_err("bad").to_string(),
-            "invalid filter pattern \"view:a.b\": the kind must be schema, table, enum or sequence"
+            "invalid filter pattern \"view:a.b\": the kind must be schema, table, enum, domain, composite or sequence"
         );
     }
 
@@ -318,6 +340,13 @@ mod tests {
         let f = Filter::parse::<&str, _>(&[], &["enum:public.*"]).expect("filter");
         assert!(!f.manages_object(Kind::Enum, &q("public", "mood")));
         assert!(f.manages_object(Kind::Table, &q("public", "mood")));
+        assert!(f.manages_object(Kind::Domain, &q("public", "mood")));
+
+        let f = Filter::parse::<&str, _>(&[], &["domain:public.d*", "composite:public.p*"]).expect("filter");
+        assert!(!f.manages_object(Kind::Domain, &q("public", "dx")));
+        assert!(f.manages_object(Kind::Composite, &q("public", "dx")));
+        assert!(!f.manages_object(Kind::Composite, &q("public", "px")));
+        assert!(f.manages_object(Kind::Enum, &q("public", "px")));
         assert!(f.manages_schema("public"));
 
         let f = Filter::parse(&["table:public.*"], &[] as &[&str]).expect("filter");
@@ -388,6 +417,20 @@ mod tests {
         let tmp = Table { name: q("public", "tmp_x"), columns: vec![], comment: None, constraints: vec![], indexes: vec![] };
         m.tables.insert(tmp.name.clone(), tmp);
         m.enums.insert(q("app", "mood"), Enum { name: q("app", "mood"), labels: vec![], comment: None });
+        let domain = pgmig_model::Domain {
+            name: q("public", "tmp_d"),
+            base_type: "integer".into(),
+            base_ref: None,
+            collation: None,
+            default: None,
+            not_null: false,
+            constraints: vec![],
+            comment: None,
+        };
+        m.domains.insert(domain.name.clone(), domain.clone());
+        m.domains.insert(q("app", "d"), pgmig_model::Domain { name: q("app", "d"), ..domain });
+        let composite = pgmig_model::Composite { name: q("public", "pair"), attributes: vec![], comment: None };
+        m.composites.insert(composite.name.clone(), composite);
 
         let f = Filter::parse::<&str, _>(&[], &["public.tmp_*", "public.t.legacy", "schema:app"]).expect("filter");
         let out = filter_model(&m, &f);
@@ -398,10 +441,14 @@ mod tests {
         assert!(t.constraints.is_empty());
         assert_eq!(t.indexes.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(), ["t_id_idx"]);
         assert!(out.enums.is_empty());
+        assert!(out.domains.is_empty());
+        assert_eq!(out.composites.keys().collect::<Vec<_>>(), [&q("public", "pair")]);
         assert_eq!(filter_model(&m, &Filter::default()), m);
 
         let scoped = scope_model(&m, "public");
         assert!(scoped.schemas.is_empty() && scoped.enums.is_empty());
+        assert_eq!(scoped.domains.keys().collect::<Vec<_>>(), [&q("public", "tmp_d")]);
+        assert!(without_schema(&m, "app").domains.keys().all(|d| d.schema == "public"));
         assert_eq!(scoped.tables.len(), 2);
     }
 }

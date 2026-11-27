@@ -31,6 +31,13 @@ pub struct Model {
     /// Identity columns' sequences are not here: they belong to the column ([`Column::identity`]).
     #[serde(with = "as_list")]
     pub sequences: BTreeMap<QualName, Sequence>,
+    /// Absent from older JSON: none.
+    #[serde(default, with = "as_list")]
+    pub domains: BTreeMap<QualName, Domain>,
+    /// Composite types made with `CREATE TYPE ... AS (...)`, not tables' row types. Absent from
+    /// older JSON: none.
+    #[serde(default, with = "as_list")]
+    pub composites: BTreeMap<QualName, Composite>,
 }
 
 impl Model {
@@ -196,6 +203,102 @@ pub struct Enum {
     pub labels: Vec<String>,
     /// `obj_description` of the type.
     pub comment: Option<String>,
+}
+
+/// A domain (`pg_type.typtype = 'd'`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Domain {
+    pub name: QualName,
+    /// `format_type(typbasetype, typtypmod)`.
+    pub base_type: String,
+    /// The user-defined type the domain is over (the element type for an array), as for
+    /// [`Column::type_ref`]; `None` for types in system schemas.
+    pub base_ref: Option<QualName>,
+    /// `COLLATE`: the domain's collation when it differs from its base type's (`typcollation`).
+    pub collation: Option<QualName>,
+    /// `pg_get_expr(typdefaultbin, 0)`.
+    pub default: Option<String>,
+    /// `typnotnull`.
+    pub not_null: bool,
+    /// The domain's check constraints, by name (`NOT NULL` is [`Domain::not_null`]).
+    pub constraints: Vec<DomainConstraint>,
+    /// `obj_description` of the type.
+    pub comment: Option<String>,
+}
+
+impl Domain {
+    pub fn constraint(&self, name: &str) -> Option<&DomainConstraint> {
+        self.constraints.iter().find(|c| c.name == name)
+    }
+
+    /// The base type as `CREATE DOMAIN ... AS` writes it: [`Domain::base_type`] and its `COLLATE`.
+    pub fn base_type_clause(&self) -> String {
+        match &self.collation {
+            Some(c) => format!("{} COLLATE {c}", self.base_type),
+            None => self.base_type.clone(),
+        }
+    }
+}
+
+/// A check constraint of a domain. It lives in the domain's schema.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DomainConstraint {
+    pub name: String,
+    /// `pg_get_constraintdef`: `CHECK (...)`, with `NOT VALID` when it is not validated.
+    pub definition: String,
+    /// `convalidated`: false for `NOT VALID`.
+    pub validated: bool,
+    /// `obj_description` of the constraint.
+    pub comment: Option<String>,
+}
+
+impl DomainConstraint {
+    /// [`DomainConstraint::definition`] without `NOT VALID`: two constraints whose bodies are equal
+    /// differ at most in [`DomainConstraint::validated`].
+    pub fn body(&self) -> &str {
+        self.definition.strip_suffix(" NOT VALID").unwrap_or(&self.definition)
+    }
+}
+
+/// A composite type made with `CREATE TYPE ... AS (...)`: `pg_type.typtype = 'c'` whose
+/// relation is of kind `c` (a table's row type is the table's, not one of these).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Composite {
+    pub name: QualName,
+    /// In `attnum` order. Postgres can't reorder attributes, so diffs match them by name.
+    pub attributes: Vec<Attribute>,
+    /// `obj_description` of the type.
+    pub comment: Option<String>,
+}
+
+impl Composite {
+    pub fn attribute(&self, name: &str) -> Option<&Attribute> {
+        self.attributes.iter().find(|a| a.name == name)
+    }
+}
+
+/// An attribute of a [`Composite`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attribute {
+    pub name: String,
+    /// `format_type(atttypid, atttypmod)`.
+    pub type_name: String,
+    /// As [`Column::type_ref`].
+    pub type_ref: Option<QualName>,
+    /// `COLLATE`: the attribute's collation when it differs from its type's (`attcollation`).
+    pub collation: Option<QualName>,
+    /// `col_description` of the attribute.
+    pub comment: Option<String>,
+}
+
+impl Attribute {
+    /// The attribute's type as `CREATE TYPE` and `ALTER TYPE` write it, with its `COLLATE`.
+    pub fn type_clause(&self) -> String {
+        match &self.collation {
+            Some(c) => format!("{} COLLATE {c}", self.type_name),
+            None => self.type_name.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -540,7 +643,7 @@ macro_rules! keyed_by_qualname {
         }
     )*};
 }
-keyed_by_qualname!(Table, Enum, Sequence);
+keyed_by_qualname!(Table, Enum, Sequence, Domain, Composite);
 
 /// A `BTreeMap` of [`Keyed`] objects as a list of them in key order; a list naming one object twice
 /// is refused.
@@ -733,7 +836,55 @@ mod tests {
                 comment: Some("counter".into()),
             },
         );
+        let code = QualName::new("app", "code");
+        m.domains.insert(
+            code.clone(),
+            Domain {
+                name: code.clone(),
+                base_type: "app.mood".into(),
+                base_ref: Some(QualName::new("app", "mood")),
+                collation: Some(QualName::new("pg_catalog", "C")),
+                default: Some("'ok'::app.mood".into()),
+                not_null: true,
+                constraints: vec![DomainConstraint {
+                    name: "code_check".into(),
+                    definition: "CHECK ((VALUE <> 'sad'::app.mood)) NOT VALID".into(),
+                    validated: false,
+                    comment: Some("never sad".into()),
+                }],
+                comment: Some("a code".into()),
+            },
+        );
+        let pair = QualName::new("app", "pair");
+        let attributes = vec![
+            Attribute {
+                name: "a".into(),
+                type_name: "app.code[]".into(),
+                type_ref: Some(code),
+                collation: None,
+                comment: Some("first".into()),
+            },
+            Attribute {
+                name: "b".into(),
+                type_name: "text".into(),
+                type_ref: None,
+                collation: Some(QualName::new("pg_catalog", "C")),
+                comment: None,
+            },
+        ];
+        m.composites.insert(pair.clone(), Composite { name: pair, attributes, comment: Some("two".into()) });
         m
+    }
+
+    #[test]
+    fn clauses_print_the_collation() {
+        let m = sample();
+        let d = &m.domains[&QualName::new("app", "code")];
+        assert_eq!(d.base_type_clause(), "app.mood COLLATE pg_catalog.\"C\"");
+        assert_eq!(d.constraints[0].body(), "CHECK ((VALUE <> 'sad'::app.mood))");
+        let p = &m.composites[&QualName::new("app", "pair")];
+        assert_eq!(p.attribute("a").map(Attribute::type_clause).as_deref(), Some("app.code[]"));
+        assert_eq!(p.attribute("b").map(Attribute::type_clause).as_deref(), Some("text COLLATE pg_catalog.\"C\""));
     }
 
     #[test]
@@ -751,6 +902,7 @@ mod tests {
         let s = r#"{"schemas":[],"tables":[{"name":{"schema":"public","name":"t"},"columns":[],"comment":null,"constraints":[]}],"enums":[],"sequences":[]}"#;
         let m: Model = serde_json::from_str(s).expect("deserialize");
         assert!(m.tables[&QualName::new("public", "t")].indexes.is_empty());
+        assert!(m.domains.is_empty() && m.composites.is_empty());
     }
 
     #[test]
@@ -864,7 +1016,9 @@ mod tests {
     }
   ],
   "enums": [],
-  "sequences": []
+  "sequences": [],
+  "domains": [],
+  "composites": []
 }"#;
         assert_eq!(serde_json::to_string_pretty(&m).expect("serialize"), want);
     }

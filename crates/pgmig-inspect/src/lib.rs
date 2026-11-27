@@ -7,8 +7,8 @@ use pgmig_conn::{Conn, Row};
 use std::collections::BTreeMap;
 
 use pgmig_model::{
-    Column, Constraint, ConstraintKind, Enum, Generated, Identity, Index, Model, OwnedBy, QualName, References, Schema, Sequence,
-    SequenceOptions, Table, quote_literal,
+    Attribute, Column, Composite, Constraint, ConstraintKind, Domain, DomainConstraint, Enum, Generated, Identity, Index, Model, OwnedBy,
+    QualName, References, Schema, Sequence, SequenceOptions, Table, quote_literal,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -112,6 +112,9 @@ fn inspect_catalog(conn: &mut Conn) -> Result<Model> {
             e.labels.push(label);
         }
     }
+
+    inspect_domains(conn, &mut model)?;
+    inspect_composites(conn, &mut model)?;
 
     // Sequences with what owns them: `a` is `OWNED BY` (standalone), `i` an identity column's.
     let sequences = format!(
@@ -339,6 +342,120 @@ fn inspect_indexes(conn: &mut Conn, model: &mut Model, attnames: &BTreeMap<(Qual
     Ok(())
 }
 
+/// Domains and their check constraints.
+///
+/// pgmem leaves `typdefaultbin` empty and keeps only `typdefault` (kaeawc/pgmem#265), so the
+/// default falls back to it. On Postgres the two are set together, and `pg_get_expr` prints the
+/// default under inspection's search path.
+fn inspect_domains(conn: &mut Conn, model: &mut Model) -> Result<()> {
+    let what = "domains";
+    let domains = format!(
+        "SELECT n.nspname, t.typname, format_type(t.typbasetype, t.typtypmod), bn.nspname, COALESCE(be.typname, bt.typname), \
+                cn.nspname, cl.collname, COALESCE(pg_get_expr(t.typdefaultbin, 0), t.typdefault), t.typnotnull, \
+                obj_description(t.oid, 'pg_type') \
+         FROM pg_type t \
+         JOIN pg_namespace n ON n.oid = t.typnamespace \
+         JOIN pg_type bt ON bt.oid = t.typbasetype \
+         LEFT JOIN pg_type be ON be.typarray = bt.oid \
+         LEFT JOIN pg_namespace bn ON bn.oid = COALESCE(be.typnamespace, bt.typnamespace) \
+         LEFT JOIN pg_collation cl ON cl.oid = t.typcollation AND t.typcollation <> bt.typcollation \
+         LEFT JOIN pg_namespace cn ON cn.oid = cl.collnamespace \
+         WHERE t.typtype = 'd' AND {USER_SCHEMA} ORDER BY 1, 2"
+    );
+    for row in run(conn, what, &domains)? {
+        let name = QualName::new(text(&row, 0, what)?, text(&row, 1, what)?);
+        let domain = Domain {
+            name: name.clone(),
+            base_type: text(&row, 2, what)?,
+            base_ref: user_type(&row, 3, 4),
+            collation: qual_name(&row, 5, 6),
+            default: row.get(7).cloned().flatten(),
+            not_null: text(&row, 8, what)? == "t",
+            constraints: Vec::new(),
+            comment: row.get(9).cloned().flatten(),
+        };
+        model.domains.insert(name, domain);
+    }
+    // Check constraints only: a domain's `NOT NULL` (a constraint of its own since Postgres 17) is
+    // `typnotnull`.
+    let constraints = format!(
+        "SELECT n.nspname, t.typname, co.conname, pg_get_constraintdef(co.oid), co.convalidated, obj_description(co.oid, 'pg_constraint') \
+         FROM pg_constraint co \
+         JOIN pg_type t ON t.oid = co.contypid \
+         JOIN pg_namespace n ON n.oid = t.typnamespace \
+         WHERE co.contype = 'c' AND t.typtype = 'd' AND {USER_SCHEMA} ORDER BY 1, 2, 3"
+    );
+    let what = "domain constraints";
+    for row in run(conn, what, &constraints)? {
+        let domain = QualName::new(text(&row, 0, what)?, text(&row, 1, what)?);
+        let constraint = DomainConstraint {
+            name: text(&row, 2, what)?,
+            definition: text(&row, 3, what)?,
+            validated: text(&row, 4, what)? == "t",
+            comment: row.get(5).cloned().flatten(),
+        };
+        if let Some(d) = model.domains.get_mut(&domain) {
+            d.constraints.push(constraint);
+        }
+    }
+    // By name in byte order, whatever the server's collation.
+    for d in model.domains.values_mut() {
+        d.constraints.sort_by(|x, y| x.name.cmp(&y.name));
+    }
+    Ok(())
+}
+
+/// Composite types made with `CREATE TYPE ... AS`: their relation is of kind `c`, where a table's
+/// row type has the table's.
+fn inspect_composites(conn: &mut Conn, model: &mut Model) -> Result<()> {
+    let what = "composite types";
+    let composites = format!(
+        "SELECT n.nspname, t.typname, obj_description(t.oid, 'pg_type') \
+         FROM pg_type t \
+         JOIN pg_namespace n ON n.oid = t.typnamespace \
+         JOIN pg_class c ON c.oid = t.typrelid \
+         WHERE t.typtype = 'c' AND c.relkind = 'c' AND {USER_SCHEMA} ORDER BY 1, 2"
+    );
+    for row in run(conn, what, &composites)? {
+        let name = QualName::new(text(&row, 0, what)?, text(&row, 1, what)?);
+        model.composites.insert(name.clone(), Composite { name, attributes: Vec::new(), comment: row.get(2).cloned().flatten() });
+    }
+    let what = "composite type attributes";
+    let attributes = format!(
+        "SELECT n.nspname, c.relname, a.attname, format_type(a.atttypid, a.atttypmod), tn.nspname, COALESCE(e.typname, t.typname), \
+                cn.nspname, cl.collname, col_description(a.attrelid, a.attnum) \
+         FROM pg_attribute a \
+         JOIN pg_class c ON c.oid = a.attrelid \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         LEFT JOIN pg_type t ON t.oid = a.atttypid \
+         LEFT JOIN pg_type e ON e.typarray = a.atttypid \
+         LEFT JOIN pg_namespace tn ON tn.oid = COALESCE(e.typnamespace, t.typnamespace) \
+         LEFT JOIN pg_collation cl ON cl.oid = a.attcollation AND a.attcollation <> t.typcollation \
+         LEFT JOIN pg_namespace cn ON cn.oid = cl.collnamespace \
+         WHERE c.relkind = 'c' AND a.attnum > 0 AND NOT a.attisdropped AND {USER_SCHEMA} \
+         ORDER BY 1, 2, a.attnum"
+    );
+    for row in run(conn, what, &attributes)? {
+        let composite = QualName::new(text(&row, 0, what)?, text(&row, 1, what)?);
+        let attribute = Attribute {
+            name: text(&row, 2, what)?,
+            type_name: text(&row, 3, what)?,
+            type_ref: user_type(&row, 4, 5),
+            collation: qual_name(&row, 6, 7),
+            comment: row.get(8).cloned().flatten(),
+        };
+        if let Some(c) = model.composites.get_mut(&composite) {
+            c.attributes.push(attribute);
+        }
+    }
+    Ok(())
+}
+
+/// The name in columns `schema` and `name` of `row`, when both are set.
+fn qual_name(row: &Row, schema: usize, name: usize) -> Option<QualName> {
+    Some(QualName::new(row.get(schema).cloned().flatten()?, row.get(name).cloned().flatten()?))
+}
+
 /// The elements of an `int2vector` as the server prints it (`1 2`; pgmem prints `{1,2}`,
 /// kaeawc/pgmem#170), as text.
 fn int_vector(printed: &str) -> impl Iterator<Item = String> + '_ {
@@ -352,10 +469,14 @@ fn int_array(printed: &str) -> impl Iterator<Item = String> + '_ {
 
 /// The column's type when it lives in a user schema: columns 6 (schema) and 7 (name).
 fn type_ref(row: &Row) -> Option<QualName> {
-    let schema = row.get(6).cloned().flatten()?;
-    let name = row.get(7).cloned().flatten()?;
-    let system = schema == "pg_catalog" || schema == "information_schema" || schema.starts_with("pg_");
-    (!system).then(|| QualName::new(schema, name))
+    user_type(row, 6, 7)
+}
+
+/// The type in columns `schema` and `name` of `row` when it lives in a user schema.
+fn user_type(row: &Row, schema: usize, name: usize) -> Option<QualName> {
+    let q = qual_name(row, schema, name)?;
+    let system = q.schema == "pg_catalog" || q.schema == "information_schema" || q.schema.starts_with("pg_");
+    (!system).then_some(q)
 }
 
 /// The arguments of `nextval('<name>'::regclass)` calls in an expression as `pg_get_expr` prints
