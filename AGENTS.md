@@ -69,7 +69,7 @@ run.
 - `crates/pgmig-config` — `pgmig.toml`: environments, `${VAR}` interpolation, `config validate`.
 - `crates/pgmig-sql` — `split`: SQL text → statements with positions and `-- pgmig:` directives.
 - `crates/pgmig-inspect` — catalog queries → `Model`.
-- `crates/pgmig-diff` — `diff(a, b) -> Vec<Change>`.
+- `crates/pgmig-diff` — `diff(a, b) -> Vec<Change>`; `rename`: `-- pgmig:rename` hints (parse, which apply, suggestions).
 - `crates/pgmig-plan` — `plan(changes) -> Plan` (ordered SQL).
 - `crates/pgmig` — library surface (`schema_diff`, `schema_inspect`, `Source`, `ShadowSpec`) and the
   integration tests, including the corpus runner (`tests/it/corpus.rs`).

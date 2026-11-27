@@ -27,6 +27,12 @@
 //!   does not exist: a change whose statement names it as a literal of that type
 //!   (`'label'::type`, as the server prints a default or a check) is skipped. The match is on
 //!   text and conservative: it can skip a change that only mentions the literal;
+//! - a table whose `rename_table` is skipped keeps its old name: a change that names the new one
+//!   (the table it is about, a partition's parent, a referenced table, a sequence's owner) is
+//!   skipped, whatever its kind;
+//! - a type whose `rename_enum`, `rename_domain` or `rename_composite_type` is skipped keeps its old
+//!   name: a change whose statement casts to the new one (`::name` or `::schema.name`, as the
+//!   server prints a default or a check) is skipped, matched on text like an enum value;
 //!
 //! and on one column:
 //!
@@ -47,7 +53,7 @@
 
 use std::collections::BTreeSet;
 
-use pgmig_diff::{Change, ChangeKind};
+use pgmig_diff::{Change, ChangeKind, CommentTarget};
 use pgmig_model::{ConstraintKind, QualName, quote_ident, quote_literal};
 use serde::{Deserialize, Serialize};
 
@@ -167,6 +173,14 @@ fn depends(c: &Change, cd: &Deps, statement: Option<&str>, s: &Change, sd: &Deps
         {
             return true;
         }
+        // A table not renamed: whatever names its new name waits with the rename.
+        Change::RenameTable { from, to } if tables_named(c).contains(&&QualName::new(from.schema.clone(), to.clone())) => return true,
+        // A type not renamed: whatever casts to its new name waits with the rename.
+        Change::RenameEnum { from, to } | Change::RenameDomain { from, to } | Change::RenameCompositeType { from, to }
+            if statement.is_some_and(|st| mentions_type(st, &QualName::new(from.schema.clone(), to.clone()))) =>
+        {
+            return true;
+        }
         _ => {}
     }
     let (Some(at), Some(sat)) = (column_of(c), column_of(s)) else {
@@ -203,6 +217,99 @@ fn mentions_label(statement: &str, name: &QualName, label: &str) -> bool {
             rest.strip_prefix(n.as_str()).is_some_and(|after| !after.starts_with(|ch: char| ch.is_alphanumeric() || ch == '_' || ch == '$'))
         })
     })
+}
+
+/// Whether `statement` casts to type `name` the way the server prints it (`::name`,
+/// `::schema.name`, also `::name[]`). Conservative like [`mentions_label`].
+fn mentions_type(statement: &str, name: &QualName) -> bool {
+    let bare = quote_ident(&name.name);
+    let qualified = format!("{}.{bare}", quote_ident(&name.schema));
+    statement.match_indices("::").any(|(i, _)| {
+        let rest = &statement[i + 2..];
+        [&bare, &qualified].iter().any(|n| {
+            rest.strip_prefix(n.as_str()).is_some_and(|after| !after.starts_with(|ch: char| ch.is_alphanumeric() || ch == '_' || ch == '$'))
+        })
+    })
+}
+
+/// The tables a change names: the one it is about, a partition's parent, a referenced table, the
+/// owner of a sequence.
+fn tables_named(c: &Change) -> Vec<&QualName> {
+    use Change::*;
+    fn references(k: &pgmig_model::Constraint) -> Option<&QualName> {
+        k.references.as_ref().map(|r| &r.table)
+    }
+    match c {
+        CreateTable(t) => {
+            let mut out = vec![&t.name];
+            out.extend(t.partition_of.as_ref().map(|p| &p.parent));
+            out.extend(t.constraints.iter().filter_map(references));
+            out
+        }
+        DropTable { table, .. } => vec![&table.name],
+        AddColumn { table, .. }
+        | DropColumn { table, .. }
+        | AlterColumnType { table, .. }
+        | SetNotNull { table, .. }
+        | DropNotNull { table, .. }
+        | SetDefault { table, .. }
+        | DropDefault { table, .. }
+        | AddIdentity { table, .. }
+        | AlterIdentity { table, .. }
+        | DropIdentity { table, .. }
+        | RenameConstraint { table, .. }
+        | CreateIndex { table, .. }
+        | DropIndex { table, .. }
+        | RenameColumn { table, .. }
+        | RenameIndex { table, .. } => vec![table],
+        AddConstraint { table, constraint } | DropConstraint { table, constraint } | AlterConstraint { table, to: constraint } => {
+            let mut out = vec![table];
+            out.extend(references(constraint));
+            out
+        }
+        DetachPartition { table, parent, .. } => vec![table, parent],
+        AttachPartition { table, partition_of, .. } => vec![table, &partition_of.parent],
+        UnsupportedPartitionChange { name, .. } => vec![name],
+        CreateSequence(s) | DropSequence(s) | AlterSequence { to: s, .. } => s.owned_by.iter().map(|o| &o.table).collect(),
+        SetSequenceOwner { owned_by, old, .. } => owned_by.iter().chain(old).map(|o| &o.table).collect(),
+        RenameTable { from, .. } => vec![from],
+        SetComment { target, .. } => match target {
+            CommentTarget::Table(table)
+            | CommentTarget::Column { table, .. }
+            | CommentTarget::Constraint { table, .. }
+            | CommentTarget::Index { table, .. } => {
+                vec![table]
+            }
+            _ => vec![],
+        },
+        CreateSchema(_)
+        | DropSchema(_)
+        | CreateEnum(_)
+        | DropEnum(_)
+        | AddEnumValue { .. }
+        | RenameEnumValue { .. }
+        | UnsupportedEnumChange { .. }
+        | CreateDomain(_)
+        | DropDomain(_)
+        | SetDomainDefault { .. }
+        | DropDomainDefault { .. }
+        | SetDomainNotNull { .. }
+        | DropDomainNotNull { .. }
+        | AddDomainConstraint { .. }
+        | DropDomainConstraint { .. }
+        | ValidateDomainConstraint { .. }
+        | UnsupportedDomainChange { .. }
+        | CreateCompositeType(_)
+        | DropCompositeType(_)
+        | AddAttribute { .. }
+        | DropAttribute { .. }
+        | AlterAttributeType { .. }
+        | UnsupportedCompositeChange { .. }
+        | RenameEnum { .. }
+        | RenameSequence { .. }
+        | RenameDomain { .. }
+        | RenameCompositeType { .. } => vec![],
+    }
 }
 
 /// The column a column change is about.
@@ -266,6 +373,116 @@ mod tests {
     fn nothing_skipped_without_kinds() {
         let changes = vec![Change::DropSchema("app".into())];
         assert_eq!(skip(&changes, &BTreeSet::new(), &PlanOptions::default()), (changes, vec![]));
+    }
+
+    #[test]
+    fn a_skipped_rename_takes_what_names_the_new_object_with_it() {
+        let users = QualName::new("public", "users");
+        let accounts = QualName::new("public", "accounts");
+        let changes = vec![
+            Change::RenameTable { from: users, to: "accounts".into() },
+            Change::RenameColumn { table: accounts.clone(), from: "a".into(), to: "b".into() },
+            Change::AddColumn { table: accounts.clone(), column: col("c") },
+            Change::SetNotNull { table: accounts, column: "b".into() },
+            Change::AddColumn { table: QualName::new("public", "other"), column: col("c") },
+        ];
+        let (kept, skipped) = skip(&changes, &kinds(&[ChangeKind::RenameTable]), &PlanOptions::default());
+        assert_eq!(kept, [changes[4].clone()]);
+        let shown: Vec<String> = skipped.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            shown,
+            [
+                "rename_table public.users (policy)",
+                "rename_column public.accounts.a (because rename_table public.users is skipped)",
+                "add_column public.accounts.c (because rename_table public.users is skipped)",
+                "set_not_null public.accounts.b (because rename_table public.users is skipped)",
+            ]
+        );
+        assert_eq!(skipped[0].statement.as_deref(), Some("ALTER TABLE public.users RENAME TO accounts"));
+
+        // Skipping only the column's rename leaves the table's, and what names the new column goes.
+        let (kept, skipped) = skip(&changes, &kinds(&[ChangeKind::RenameColumn]), &PlanOptions::default());
+        assert_eq!(kept.len(), 3, "{kept:?}");
+        assert_eq!(skipped.len(), 2);
+    }
+
+    #[test]
+    fn a_skipped_table_rename_takes_every_change_naming_the_new_table() {
+        let users = QualName::new("public", "users");
+        let accounts = QualName::new("public", "accounts");
+        let check = Constraint {
+            name: "users_name_check".into(),
+            kind: ConstraintKind::Check,
+            definition: "CHECK ((length(name) > 0))".into(),
+            columns: vec!["name".into()],
+            references: None,
+            deferrable: false,
+            deferred: false,
+            validated: true,
+            comment: None,
+            index_definition: None,
+            on_partitioned_table: false,
+        };
+        let fkey = Constraint {
+            name: "o_uid_fkey".into(),
+            kind: ConstraintKind::ForeignKey,
+            definition: "FOREIGN KEY (uid) REFERENCES public.accounts(id)".into(),
+            references: Some(pgmig_model::References { table: accounts.clone(), columns: vec!["id".into()], constraint: None }),
+            ..check.clone()
+        };
+        let changes = vec![
+            Change::RenameTable { from: users, to: "accounts".into() },
+            Change::DropConstraint { table: accounts.clone(), constraint: check },
+            Change::DetachPartition { table: QualName::new("public", "p1"), parent: accounts.clone(), columns: vec![] },
+            Change::AddConstraint { table: QualName::new("public", "o"), constraint: fkey },
+            Change::SetComment { target: CommentTarget::Table(accounts), comment: Some("x".into()) },
+            Change::DropSchema("other".into()),
+        ];
+        let (kept, skipped) = skip(&changes, &kinds(&[ChangeKind::RenameTable]), &PlanOptions::default());
+        assert_eq!(kept, [changes[5].clone()]);
+        assert_eq!(skipped.len(), 5, "{skipped:?}");
+        assert!(skipped[1..].iter().all(|s| s.because == Some(Cause { kind: ChangeKind::RenameTable, object: "public.users".into() })));
+        for s in &skipped[1..] {
+            assert!(s.statement.as_deref().is_some_and(|st| st.contains("accounts")), "{s:?}");
+        }
+
+        // Not skipped, the rename plans as before, and so does what names the new table.
+        let (kept, skipped) = skip(&changes, &kinds(&[ChangeKind::DropSchema]), &PlanOptions::default());
+        assert_eq!(kept, changes[..5]);
+        assert_eq!(skipped.len(), 1);
+    }
+
+    #[test]
+    fn a_skipped_type_rename_takes_what_casts_to_the_new_name() {
+        let t = QualName::new("public", "p");
+        let set_default = |default: &str| Change::SetDefault {
+            table: t.clone(),
+            column: "m".into(),
+            default: default.into(),
+            sequences: vec![],
+            old_sequences: vec![],
+        };
+        for rename in [
+            Change::RenameEnum { from: QualName::new("public", "mood"), to: "feeling".into() },
+            Change::RenameDomain { from: QualName::new("public", "mood"), to: "feeling".into() },
+        ] {
+            let changes = vec![
+                rename.clone(),
+                set_default("'sad'::feeling"),
+                set_default("'sad'::public.feeling"),
+                set_default("'sad'::feelings"),
+                set_default("'sad'::text"),
+            ];
+            let (kept, skipped) = skip(&changes, &kinds(&[rename.kind()]), &PlanOptions::default());
+            assert_eq!(kept, changes[3..], "{rename:?}");
+            assert_eq!(skipped.len(), 3);
+            assert!(skipped.iter().skip(1).all(|s| s.because.as_ref().is_some_and(|c| c.kind == rename.kind())));
+        }
+        let quoted = QualName::new("app", "Big Mood");
+        assert!(mentions_type("DEFAULT 'a'::\"Big Mood\"", &quoted));
+        assert!(mentions_type("CHECK (m <> 'a'::app.\"Big Mood\")", &quoted));
+        assert!(mentions_type("DEFAULT '{a}'::\"Big Mood\"[]", &quoted));
+        assert!(!mentions_type("DEFAULT 'a'::\"Big Moods\"", &quoted));
     }
 
     #[test]

@@ -32,7 +32,9 @@
 
 use std::path::PathBuf;
 
-use crate::{Change, Conn, Error, MigrationDir, Model, Options, Plan, PlanOptions, Result, Shadow, ShadowSpec, diff, inspect, plan_with};
+use crate::{
+    Change, Conn, Error, MigrationDir, Model, Options, Plan, PlanOptions, Rename, Result, Shadow, ShadowSpec, diff, inspect, plan_with,
+};
 
 /// The current state a plan under test starts from, copied into the shadow database.
 #[derive(Debug, Clone, Copy)]
@@ -55,8 +57,15 @@ struct Unit<'a> {
 /// Check that `plan`, applied to a copy of `current`, reaches `to` (the desired state's model, as
 /// `opts` manages it) but for the changes `opts` skips.
 pub fn verify_plan(current: Current, plan: &Plan, to: &Model, shadow: &ShadowSpec, opts: &Options) -> Result<()> {
+    verify_plan_with(current, plan, to, &[], shadow, opts)
+}
+
+/// [`verify_plan`] with the rename hints of the desired state (see [`crate::Rename`]). A hint the
+/// plan did not carry out, because the policy skips its `rename_*` kind, is found again in what the
+/// plan leaves, and is expected to remain with the changes that depend on it, as any skipped change.
+pub fn verify_plan_with(current: Current, plan: &Plan, to: &Model, renames: &[Rename], shadow: &ShadowSpec, opts: &Options) -> Result<()> {
     let units = plan_units(plan);
-    verify_units(current, &units, to, shadow, opts)
+    verify_units(current, &units, to, renames, shadow, opts)
 }
 
 /// The units of `plan` as verification runs them.
@@ -71,6 +80,19 @@ fn plan_units(plan: &Plan) -> Vec<Unit<'_>> {
 /// `migrate apply` runs a file, honouring its `-- pgmig:txmode` and `-- pgmig:commit` directives.
 /// Errors in the text name it `label`.
 pub fn verify_migration_sql(current: Current, sql: &str, label: &str, to: &Model, shadow: &ShadowSpec, opts: &Options) -> Result<()> {
+    verify_migration_sql_with(current, sql, label, to, &[], shadow, opts)
+}
+
+/// [`verify_migration_sql`] with the rename hints of the desired state ([`verify_plan_with`]).
+pub fn verify_migration_sql_with(
+    current: Current,
+    sql: &str,
+    label: &str,
+    to: &Model,
+    renames: &[Rename],
+    shadow: &ShadowSpec,
+    opts: &Options,
+) -> Result<()> {
     let path = PathBuf::from(label);
     // Assertions are not run: the shadow has no data.
     let (file, _) = crate::migrate_apply::split_migration_text(&path, sql)?;
@@ -80,19 +102,24 @@ pub fn verify_migration_sql(current: Current, sql: &str, label: &str, to: &Model
         .into_iter()
         .map(|seg| Unit { statements: all[seg.range].to_vec(), transaction: seg.transaction })
         .collect();
-    verify_units(current, &units, to, shadow, opts)
+    verify_units(current, &units, to, renames, shadow, opts)
 }
 
-fn verify_units(current: Current, units: &[Unit], to: &Model, shadow: &ShadowSpec, opts: &Options) -> Result<()> {
+fn verify_units(current: Current, units: &[Unit], to: &Model, renames: &[Rename], shadow: &ShadowSpec, opts: &Options) -> Result<()> {
     // Dropped on return: the shadow is wiped whatever happens.
     let mut sh = copy(current, shadow)?;
     let conn = sh.conn();
     for unit in units {
         run_unit(conn, unit)?;
     }
-    let after = opts.managed(&inspect(conn)?);
+    let full = inspect(conn)?;
+    drop(sh);
+    let after = opts.managed(&full);
+    // A rename the plan left out is still to be made: it remains, as the change it is.
+    let (mut left, after) = crate::hints::renamed_state(&full, after, to, renames, shadow, opts)?;
+    left.extend(diff(&after, to));
     let names = PlanOptions::default();
-    let (remaining, _expected) = opts.apply_policy(&diff(&after, to), &names);
+    let (remaining, _expected) = opts.apply_policy(&left, &names);
     if remaining.is_empty() { Ok(()) } else { Err(Error::VerifyFailed { remaining }) }
 }
 
@@ -109,7 +136,7 @@ fn copy(current: Current, shadow: &ShadowSpec) -> Result<Shadow> {
 }
 
 /// Make the empty shadow hold `from`: the plan from a new database.
-fn recreate(conn: &mut Conn, from: &Model) -> Result<()> {
+pub(crate) fn recreate(conn: &mut Conn, from: &Model) -> Result<()> {
     let setup = |statement: &str, source| Error::VerifySetup { statement: statement.to_owned(), source };
     let plan = plan_with(&diff(&Model::empty_database(), from), &PlanOptions::default())?;
     for unit in plan_units(&plan) {

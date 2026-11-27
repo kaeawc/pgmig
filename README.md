@@ -142,6 +142,46 @@ pretty-printed JSON document on stdout and nothing on stderr; a failure prints t
 still reported as text on stderr. `apply` never asks
 in JSON mode: pass `--auto-approve` or `--dry-run`.
 
+### Rename hints: `-- pgmig:rename`
+
+pgmig never guesses a rename: a column that disappears while another of the same type appears is a
+`DROP COLUMN` and an `ADD COLUMN`, which loses the data. Say it is a rename with a hint anywhere in
+a desired-state SQL file:
+
+```sql
+-- pgmig:rename table public.users accounts
+-- pgmig:rename column public.accounts.name full_name
+CREATE TABLE accounts (id integer PRIMARY KEY, full_name text);
+```
+
+The plan is `ALTER TABLE public.users RENAME TO accounts;` and `ALTER TABLE public.accounts RENAME
+COLUMN name TO full_name;`, and the rows stay. The kinds are `table`, `column`
+(`<schema>.<table>.<old> <new>`, the table named as in the desired state), `enum`, `domain`, `type`
+(a composite type), `sequence` and `index` (`<schema>.<old> <new>`). Names follow SQL: unquoted
+ones are lower-cased, `"Mixed Case"` keeps its case. The new name is bare or qualified with the
+same schema: a rename never moves an object to another schema. A constraint renamed with the same
+definition is already planned as `RENAME CONSTRAINT`; a schema cannot be renamed with a hint.
+
+What else differs between the renamed object and its desired state is planned as usual, after the
+rename. A hint applies when the old object exists in the current state, the new one in the desired
+state, the new name is free in the current one and the old name is gone from the desired one.
+Otherwise it is ignored and reported as a warning (`unused_hints` in JSON), so a hint can stay in
+the file after it ran. A malformed hint is an error at its line, also in `schema validate`. In a
+migration file a hint does nothing. `--skip rename_table` (or `rename_column`, `rename_enum`,
+`rename_domain`, `rename_composite_type`, `rename_sequence`, `rename_index`) leaves a rename out with
+the changes that name the renamed object.
+
+When there is a hint to write, `schema diff`, `schema apply`, `schema plan` and `migrate diff` say
+so on stderr, and in `hints` in JSON: a table dropped while another with the same columns is
+created, and a column dropped while another of the same type is added to the same table.
+
+Applying a hint copies the current state into a shadow database, renames there and inspects the
+result, so the rest of the diff compares what the server prints after the rename. The copy is
+rebuilt from what pgmig models (the same one `--verify` uses), so a current schema with objects
+pgmig does not model that a copied statement needs (a default calling a function, a type from an
+extension) fails with error code `rename_hint` and the statement that failed. Remove the hint then,
+or rename the object by hand.
+
 ### Saved plans: `schema plan` and `schema apply --plan`
 
 `pgmig schema plan --url <db> --to <desired> --out plan.json` plans what `schema apply` would do

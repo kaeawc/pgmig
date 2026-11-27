@@ -20,6 +20,7 @@ mod migrate_status;
 mod partitions;
 mod policy;
 mod quoting;
+mod rename_hints;
 mod revisions;
 mod saved_plan;
 mod search_path;

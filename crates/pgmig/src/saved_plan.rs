@@ -11,7 +11,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ApplyReport, Error, Options, Plan, Result, ShadowSpec, Skipped, Source};
+use crate::{ApplyReport, Error, Options, Plan, Result, ShadowSpec, Skipped, Source, Suggestion, UnusedHint};
 
 /// The version of the file layout, `format` in the file. A file with another number is refused.
 pub const FORMAT: u32 = 1;
@@ -38,6 +38,13 @@ pub struct SavedPlan {
     /// result of applying is not expected to have fingerprint `to`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skipped: Vec<Skipped>,
+    /// Rename hints to consider (see [`crate::Rename`]), as the diff noted them when planning.
+    /// Notes for the reader: not part of what runs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hints: Vec<Suggestion>,
+    /// `-- pgmig:rename` hints of the desired state that did not apply.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unused_hints: Vec<UnusedHint>,
     /// What is managed and how: the plan and both fingerprints are relative to these options.
     pub options: Options,
     /// The statements to run, schema-qualified, with their transaction units.
@@ -109,7 +116,7 @@ impl SavedPlan {
 pub fn schema_plan_saved(target: &str, desired: &Source, shadow: &ShadowSpec, opts: &Options, verify: bool) -> Result<SavedPlan> {
     let d = crate::plan_apply_changes(target, desired, shadow, opts)?;
     if verify {
-        crate::verify_plan(crate::Current::Model(&d.current), &d.plan, &d.to, shadow, opts)?;
+        crate::verify_plan_with(crate::Current::Model(&d.current), &d.plan, &d.to, &d.renames, shadow, opts)?;
     }
     Ok(SavedPlan {
         format: FORMAT,
@@ -117,6 +124,8 @@ pub fn schema_plan_saved(target: &str, desired: &Source, shadow: &ShadowSpec, op
         from: d.from_fingerprint,
         to: pgmig_model::fingerprint(&d.to),
         skipped: d.skipped,
+        hints: d.suggestions,
+        unused_hints: d.unused_hints,
         options: opts.clone(),
         sql: d.plan.to_sql(),
         plan: d.plan,
@@ -178,6 +187,8 @@ mod tests {
             from: "h1:a".into(),
             to: "h1:b".into(),
             skipped: Vec::new(),
+            hints: Vec::new(),
+            unused_hints: Vec::new(),
             options: Options::default(),
             sql: plan.to_sql(),
             plan,
