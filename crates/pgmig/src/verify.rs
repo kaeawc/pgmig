@@ -65,19 +65,10 @@ pub fn verify_migration_sql(current: Current, sql: &str, label: &str, to: &Model
     let file = pgmig_sql::split(sql).map_err(|source| Error::Split { path: path.clone(), source })?;
     let (no_tx, commits) = crate::migrate_apply::check_directives(&path, &file)?;
     let all: Vec<(usize, &str)> = file.statements.iter().enumerate().map(|(i, s)| (i, s.sql.as_str())).collect();
-    let units = if no_tx {
-        vec![Unit { statements: all, transaction: false }]
-    } else {
-        let mut units = Vec::new();
-        let mut start = 0;
-        for end in commits.iter().map(|(i, _)| *i).chain(std::iter::once(all.len())) {
-            if end > start {
-                units.push(Unit { statements: all[start..end].to_vec(), transaction: true });
-            }
-            start = end;
-        }
-        units
-    };
+    let units: Vec<Unit> = crate::migrate_apply::segments(no_tx, &commits, all.len())
+        .into_iter()
+        .map(|seg| Unit { statements: all[seg.range].to_vec(), transaction: seg.transaction })
+        .collect();
     verify_units(current, &units, to, shadow, opts)
 }
 

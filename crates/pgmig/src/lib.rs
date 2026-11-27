@@ -735,7 +735,8 @@ pub(crate) fn check_no_imports(dir: &MigrationDir) -> Result<()> {
     Ok(())
 }
 
-/// Execute every migration of `dir` in order in a fresh shadow database.
+/// Execute every migration of `dir` in order in a fresh shadow database, each file as `migrate apply`
+/// runs it ([`migrate_apply::run_file`]).
 fn replay(dir: &MigrationDir, shadow: &ShadowSpec) -> Result<Shadow> {
     let mut sh = shadow.open()?;
     for f in dir.files() {
@@ -743,7 +744,7 @@ fn replay(dir: &MigrationDir, shadow: &ShadowSpec) -> Result<Shadow> {
         let text = std::str::from_utf8(&f.bytes)
             .map_err(|e| Error::Io { path: path.clone(), source: std::io::Error::new(std::io::ErrorKind::InvalidData, e) })?;
         let file = pgmig_sql::split(text).map_err(|source| Error::Split { path: path.clone(), source })?;
-        exec_file(sh.conn(), &path, &file)?;
+        migrate_apply::run_file(sh.conn(), &path, &file)?;
     }
     Ok(sh)
 }

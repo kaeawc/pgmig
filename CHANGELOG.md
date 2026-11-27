@@ -132,6 +132,12 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
 
 ### Changed
 
+- Replaying a migration directory in the shadow (`migrate diff`, `--verify`, fingerprints and
+  other `migrate` sources) runs each file as `migrate apply` does: one transaction per stretch
+  between `-- pgmig:commit` points, or statement by statement under `-- pgmig:txmode none`, with
+  the same directive checks. A file whose transaction layout fails on a real database now fails
+  replay too.
+
 - Literals in plans (comments, enum labels) containing a backslash render as escape strings
   (`E'...'`), so they read back the same whatever `standard_conforming_strings` the target has (#116).
 

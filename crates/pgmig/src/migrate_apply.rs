@@ -491,6 +491,63 @@ pub(crate) fn commit_points(sql: &pgmig_sql::File) -> std::result::Result<Vec<(u
     Ok(out)
 }
 
+/// A run of a file's statements: in one transaction, or each committing on its own.
+pub(crate) struct Segment {
+    /// The statements, by index in the file.
+    pub(crate) range: std::ops::Range<usize>,
+    pub(crate) transaction: bool,
+}
+
+/// How `migrate apply` lays out a file of `len` statements: with `no_tx` one segment run without a
+/// transaction; otherwise one transaction per stretch between commit points (see [`commit_points`]).
+pub(crate) fn segments(no_tx: bool, commits: &[(usize, pgmig_sql::Pos)], len: usize) -> Vec<Segment> {
+    if no_tx {
+        return vec![Segment { range: 0..len, transaction: false }];
+    }
+    let mut out = Vec::new();
+    let mut start = 0;
+    for end in commits.iter().map(|(i, _)| *i).chain(std::iter::once(len)) {
+        if end > start {
+            out.push(Segment { range: start..end, transaction: true });
+        }
+        start = end;
+    }
+    out
+}
+
+/// Run a migration file as `migrate apply` does, without its revision row, hooks or lock: its
+/// directives are checked, each stretch between commit points runs in a transaction of its own and a
+/// `-- pgmig:txmode none` file runs one statement at a time with none. An error names the file and
+/// the statement.
+pub(crate) fn run_file(conn: &mut Conn, path: &Path, file: &pgmig_sql::File) -> Result<()> {
+    let (no_tx, commits) = check_directives(path, file)?;
+    for seg in segments(no_tx, &commits, file.statements.len()) {
+        if seg.transaction {
+            conn.batch("BEGIN").map_err(|source| Error::Load {
+                path: path.to_owned(),
+                pos: file.statements[seg.range.start].pos,
+                source,
+            })?;
+        }
+        for stmt in &file.statements[seg.range.clone()] {
+            if let Err(source) = conn.batch(&stmt.sql) {
+                if seg.transaction {
+                    let _ = conn.batch("ROLLBACK");
+                }
+                return Err(Error::Load { path: path.to_owned(), pos: source.position.map_or(stmt.pos, |n| stmt.locate(n)), source });
+            }
+        }
+        if seg.transaction {
+            conn.batch("COMMIT").map_err(|source| Error::Load {
+                path: path.to_owned(),
+                pos: file.statements[seg.range.end - 1].pos,
+                source,
+            })?;
+        }
+    }
+    Ok(())
+}
+
 /// Take the session-level advisory lock `key`, polling until `timeout`.
 pub(crate) fn lock(conn: &mut Conn, name: &str, key: i64, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
