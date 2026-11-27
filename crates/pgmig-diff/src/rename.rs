@@ -37,6 +37,17 @@
 //! the table) is what the server prints, not something to patch in the model. What differs besides
 //! the name is diffed as usual, so a renamed column whose type changes is a `RENAME COLUMN` and
 //! then an `ALTER COLUMN ... TYPE`.
+//!
+//! # Owned sequences follow their column
+//!
+//! A sequence `OWNED BY` a column (a `serial` column's) keeps its name when its table or column is
+//! renamed, while the desired state names it after the new one (`users_id_seq` becomes
+//! `accounts_id_seq`). Diffed as it is, that sequence would be dropped and another one created,
+//! starting over, and the next row would take a value the table already has. So a table or column
+//! hint also renames the sequences of `a` owned by the renamed column when `b` has one owned by
+//! that column under another name (with the same checks as a `rename sequence` hint, and only if no
+//! hint renames it already): the plan renames the sequence and its current value carries on. An
+//! identity column's sequence needs nothing: its name is never compared.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -298,8 +309,52 @@ pub fn resolve(a: &Model, b: &Model, renames: &[Rename]) -> Resolution {
             Err(reason) => out.unused.push((i, reason)),
         }
     }
+    owned_sequences(a, b, &mut out.applied, &from_taken, &to_taken);
     out.unused.sort_by_key(|(i, _)| *i);
     out
+}
+
+/// Adds to `applied` the renames of the sequences that follow their column (see the module doc):
+/// a sequence of `a` owned by a column a hint renames (or a column of a table a hint renames), when
+/// `b` has, under another name, a sequence owned by that column as it is renamed, the new name is
+/// free in `a`, the old name is not in `b`, and no hint renames either. Each comes under the index
+/// of the hint that renames its table (or else its column), with the table renames, before columns.
+fn owned_sequences(a: &Model, b: &Model, applied: &mut Vec<(usize, Change)>, from_taken: &BTreeSet<String>, to_taken: &BTreeSet<String>) {
+    let mut follow = Vec::new();
+    for seq in a.sequences.values() {
+        let Some(owner) = &seq.owned_by else { continue };
+        let (mut table, mut column, mut hint) = (owner.table.clone(), owner.column.clone(), None);
+        for (i, change) in applied.iter() {
+            match change {
+                Change::RenameTable { from, to } if *from == table => {
+                    table = QualName::new(from.schema.clone(), to.clone());
+                    hint = Some(*i);
+                }
+                Change::RenameColumn { table: t, from, to } if *t == table && *from == column => {
+                    column = to.clone();
+                    hint = hint.or(Some(*i));
+                }
+                _ => {}
+            }
+        }
+        let Some(hint) = hint else { continue };
+        let owned = |s: &&pgmig_model::Sequence| s.owned_by.as_ref().is_some_and(|o| o.table == table && o.column == column);
+        let Some(new) = b.sequences.values().find(owned) else { continue };
+        if new.name == seq.name
+            || new.name.schema != seq.name.schema
+            || has_relation(a, &new.name)
+            || b.sequences.contains_key(&seq.name)
+            || from_taken.contains(&format!("sequence {}", seq.name))
+            || to_taken.contains(&format!("sequence {}", new.name))
+        {
+            continue;
+        }
+        follow.push((hint, Change::RenameSequence { from: seq.name.clone(), to: new.name.name.clone() }));
+    }
+    // With the other renames of rank 0, before the columns and indexes.
+    let at =
+        applied.iter().position(|(_, c)| matches!(c, Change::RenameColumn { .. } | Change::RenameIndex { .. })).unwrap_or(applied.len());
+    applied.splice(at..at, follow);
 }
 
 impl Names<'_> {
@@ -711,6 +766,58 @@ mod tests {
         b.tables.get_mut(&q("public", "t")).expect("t").indexes[0].name = "new_idx".into();
         let r = resolve(&a, &b, &[parse("index public.old_idx new_idx").expect("parse")]);
         assert_eq!(r.applied, [(0, Change::RenameIndex { table: q("public", "t"), from: "old_idx".into(), to: "new_idx".into() })]);
+    }
+
+    #[test]
+    fn an_owned_sequence_follows_its_renamed_table_and_column() {
+        let seq = |name: &str, table: &str, column: &str| pgmig_model::Sequence {
+            name: q("public", name),
+            data_type: "integer".into(),
+            options: pgmig_model::SequenceOptions::defaults("integer", 1).expect("options"),
+            owned_by: Some(pgmig_model::OwnedBy { table: q("public", table), column: column.into() }),
+            comment: None,
+        };
+        let with = |mut m: Model, seqs: &[pgmig_model::Sequence]| {
+            for s in seqs {
+                m.sequences.insert(s.name.clone(), s.clone());
+            }
+            m
+        };
+        let a = with(
+            model(&[("users", &[("id", "integer"), ("n", "integer")])]),
+            &[seq("users_id_seq", "users", "id"), seq("users_n_seq", "users", "n")],
+        );
+        let b = with(
+            model(&[("accounts", &[("id", "integer"), ("m", "integer")])]),
+            &[seq("accounts_id_seq", "accounts", "id"), seq("accounts_m_seq", "accounts", "m")],
+        );
+        let hints = [parse("column public.accounts.n m").expect("parse"), parse("table public.users accounts").expect("parse")];
+        let r = resolve(&a, &b, &hints);
+        assert!(r.unused.is_empty(), "{:?}", r.unused);
+        assert_eq!(
+            r.applied,
+            [
+                (1, Change::RenameTable { from: q("public", "users"), to: "accounts".into() }),
+                (1, Change::RenameSequence { from: q("public", "users_id_seq"), to: "accounts_id_seq".into() }),
+                (1, Change::RenameSequence { from: q("public", "users_n_seq"), to: "accounts_m_seq".into() }),
+                (0, Change::RenameColumn { table: q("public", "accounts"), from: "n".into(), to: "m".into() }),
+            ]
+        );
+
+        // A hint for the sequence wins; a sequence whose name stays (or that stays in `b`) is left.
+        let hints = [parse("table public.users accounts").expect("parse"), parse("sequence public.users_id_seq other_seq").expect("parse")];
+        let b2 = with(
+            model(&[("accounts", &[("id", "integer"), ("n", "integer")])]),
+            &[seq("other_seq", "accounts", "id"), seq("users_n_seq", "accounts", "n")],
+        );
+        let r = resolve(&a, &b2, &hints);
+        assert_eq!(
+            r.applied,
+            [
+                (0, Change::RenameTable { from: q("public", "users"), to: "accounts".into() }),
+                (1, Change::RenameSequence { from: q("public", "users_id_seq"), to: "other_seq".into() }),
+            ]
+        );
     }
 
     #[test]

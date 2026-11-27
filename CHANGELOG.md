@@ -23,8 +23,10 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
   drops a column and adds another of the same type to one table, a note on stderr and in `hints`
   (`directive`, `message`) gives the line to write. The new change kinds `rename_table`,
   `rename_column`, `rename_enum`, `rename_sequence`, `rename_domain`, `rename_composite_type` and
-  `rename_index` can be listed in `--skip` (what names the renamed object is skipped with it).
-  `migrate diff` writes the `RENAME` statements into the migration. A hint that applies copies the
+  `rename_index` can be listed in `--skip` (what names the renamed object, or casts to the renamed
+  type, is skipped with it). A table or column hint also renames the sequence `OWNED BY` the
+  column (a `serial`'s) when the desired state names it after the new table or column, so its
+  current value carries on instead of starting over. `migrate diff` writes the `RENAME` statements into the migration. A hint that applies copies the
   current schema into a shadow database to diff what is left, as `--verify` does, so objects pgmig
   does not model make it fail with `rename_hint` (`Error::RenameSetup`) rather than guess. A
   malformed hint is a directive error naming file and line, also in `schema validate`. The
@@ -257,6 +259,10 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
   object they describe.
 
 ### Changed
+
+- A malformed `-- pgmig:` directive (`txmode`, `assert`, `rename`, ...) is now a diagnostic of
+  `schema validate` and `migrate validate` (`diagnostics`, code `directive`, with file, line and
+  column, in an `Ok` response) instead of an error response.
 
 - `pgmig_plan::Plan::batches` is replaced by `Plan::units` (and `Plan::unit_sql`): a plan is an
   ordered list of transactional and non-transactional units, and a statement run outside a

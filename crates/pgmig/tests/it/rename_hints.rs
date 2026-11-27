@@ -373,3 +373,97 @@ fn a_rename_with_a_type_change_that_needs_using_still_asks_the_server() {
         ["ALTER TABLE public.t RENAME COLUMN qty TO amount", "ALTER TABLE public.t ALTER COLUMN amount TYPE integer USING amount::integer"]
     );
 }
+
+#[test]
+fn a_table_hint_renames_its_serial_sequence_so_the_next_value_carries_on() {
+    let db = TestDb::new();
+    let mut conn = db.connect();
+    conn.batch("CREATE TABLE users (id serial PRIMARY KEY, name text);").expect("load target");
+    conn.batch("INSERT INTO users (name) VALUES ('ada'), ('grace')").expect("insert");
+    let t = Tmp::new();
+    let desired =
+        t.sql("schema.sql", "-- pgmig:rename table public.users accounts\nCREATE TABLE accounts (id serial PRIMARY KEY, name text);\n");
+    let (shadow, _keep) = shadow();
+    let res = api::schema_plan_apply(&PlanApplyRequest {
+        target: db.conninfo.clone(),
+        desired: desired.clone(),
+        shadow: shadow.clone(),
+        options: Options::default(),
+        verify: true,
+    })
+    .expect("plan, verified");
+    assert_eq!(
+        res.plan.statements,
+        [
+            "ALTER TABLE public.users RENAME TO accounts",
+            "ALTER SEQUENCE public.users_id_seq RENAME TO accounts_id_seq",
+            "ALTER TABLE public.accounts RENAME CONSTRAINT users_pkey TO accounts_pkey",
+        ]
+    );
+    apply(&db.conninfo, &res.plan).expect("apply");
+    conn.batch("INSERT INTO accounts (name) VALUES ('edsger')").expect("the next insert takes a new id");
+    let rows = conn.query("SELECT id, name FROM accounts ORDER BY id").expect("select");
+    let ids: Vec<Option<String>> = rows.into_iter().map(|r| r[0].clone()).collect();
+    assert_eq!(ids, [Some("1".to_owned()), Some("2".to_owned()), Some("3".to_owned())]);
+    let again = pgmig::schema_plan_apply(&db.conninfo, &desired, &shadow, &Options::default()).expect("plan again");
+    assert!(again.is_empty(), "{:?}", again.statements);
+}
+
+#[test]
+fn a_skipped_table_rename_leaves_out_what_names_the_new_table() {
+    let db = TestDb::new();
+    db.connect()
+        .batch("CREATE TABLE users (id integer, name text, CONSTRAINT users_name_check CHECK (length(name) > 0));")
+        .expect("load target");
+    let t = Tmp::new();
+    let desired = t.sql("schema.sql", "-- pgmig:rename table public.users accounts\nCREATE TABLE accounts (id integer, name text);\n");
+    let (shadow, _keep) = shadow();
+    let res = api::schema_plan_apply(&PlanApplyRequest {
+        target: db.conninfo.clone(),
+        desired,
+        shadow,
+        options: skipping(&[ChangeKind::RenameTable]),
+        verify: true,
+    })
+    .expect("verified");
+    assert!(res.plan.statements.iter().all(|s| !s.contains("accounts")), "{}", res.sql);
+    let skipped: Vec<String> = res.skipped.iter().map(ToString::to_string).collect();
+    assert_eq!(
+        skipped,
+        [
+            "rename_table public.users (policy)",
+            "drop_constraint public.accounts.users_name_check (because rename_table public.users is skipped)",
+        ]
+    );
+    apply(&db.conninfo, &res.plan).expect("apply");
+}
+
+#[test]
+fn a_skipped_enum_rename_leaves_out_what_casts_to_the_new_name() {
+    let db = TestDb::new();
+    db.connect().batch("CREATE TYPE mood AS ENUM ('sad', 'ok'); CREATE TABLE p (m mood DEFAULT 'ok');").expect("load target");
+    let t = Tmp::new();
+    let desired = t.sql(
+        "schema.sql",
+        "-- pgmig:rename enum public.mood feeling\nCREATE TYPE feeling AS ENUM ('sad', 'ok');\nCREATE TABLE p (m feeling DEFAULT 'sad');\n",
+    );
+    let (shadow, _keep) = shadow();
+    let res = api::schema_plan_apply(&PlanApplyRequest {
+        target: db.conninfo.clone(),
+        desired,
+        shadow,
+        options: skipping(&[ChangeKind::RenameEnum]),
+        verify: false,
+    })
+    .expect("plan");
+    assert!(res.plan.statements.iter().all(|s| !s.contains("feeling")), "{}", res.sql);
+    assert_eq!(res.skipped[0].kind, ChangeKind::RenameEnum);
+    assert!(
+        res.skipped
+            .iter()
+            .any(|s| s.kind == ChangeKind::SetDefault && s.because.as_ref().is_some_and(|c| c.kind == ChangeKind::RenameEnum)),
+        "{:?}",
+        res.skipped
+    );
+    apply(&db.conninfo, &res.plan).expect("apply");
+}
