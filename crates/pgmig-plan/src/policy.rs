@@ -28,8 +28,12 @@
 //!   (`'label'::type`, as the server prints a default or a check) is skipped. The match is on
 //!   text and conservative: it can skip a change that only mentions the literal;
 //! - a table whose `rename_table` is skipped keeps its old name: a change that names the new one
-//!   (the table it is about, a partition's parent, a referenced table, a sequence's owner) is
-//!   skipped, whatever its kind;
+//!   (the table it is about, a partition's parent, a referenced table, a sequence's owner, the
+//!   owner a sequence rename follows) is skipped, whatever its kind;
+//! - a column whose `rename_column` is skipped keeps its old name, and so does the sequence it owns
+//!   when the diff renames that sequence along with the column (a `serial` column's, see
+//!   `pgmig_diff::rename`): that `rename_sequence` is skipped, reported with the rename of the table
+//!   or column it follows. A `rename_sequence` a hint asks for is its own kind and unaffected;
 //! - a type whose `rename_enum`, `rename_domain` or `rename_composite_type` is skipped keeps its old
 //!   name: a change whose statement casts to the new one (`::name` or `::schema.name`, as the
 //!   server prints a default or a check) is skipped, matched on text like an enum value;
@@ -175,6 +179,11 @@ fn depends(c: &Change, cd: &Deps, statement: Option<&str>, s: &Change, sd: &Deps
         }
         // A table not renamed: whatever names its new name waits with the rename.
         Change::RenameTable { from, to } if tables_named(c).contains(&&QualName::new(from.schema.clone(), to.clone())) => return true,
+        // A column not renamed: the rename of its sequence that came with it waits too.
+        Change::RenameColumn { table, to, .. } if matches!(c, Change::RenameSequence { follows: Some(o), .. } if o.table == *table && o.column == *to) =>
+        {
+            return true;
+        }
         // A type not renamed: whatever casts to its new name waits with the rename.
         Change::RenameEnum { from, to } | Change::RenameDomain { from, to } | Change::RenameCompositeType { from, to }
             if statement.is_some_and(|st| mentions_type(st, &QualName::new(from.schema.clone(), to.clone()))) =>
@@ -233,7 +242,7 @@ fn mentions_type(statement: &str, name: &QualName) -> bool {
 }
 
 /// The tables a change names: the one it is about, a partition's parent, a referenced table, the
-/// owner of a sequence.
+/// owner of a sequence (also the one a sequence rename follows).
 fn tables_named(c: &Change) -> Vec<&QualName> {
     use Change::*;
     fn references(k: &pgmig_model::Constraint) -> Option<&QualName> {
@@ -271,6 +280,7 @@ fn tables_named(c: &Change) -> Vec<&QualName> {
         AttachPartition { table, partition_of, .. } => vec![table, &partition_of.parent],
         UnsupportedPartitionChange { name, .. } => vec![name],
         CreateSequence(s) | DropSequence(s) | AlterSequence { to: s, .. } => s.owned_by.iter().map(|o| &o.table).collect(),
+        RenameSequence { follows, .. } => follows.iter().map(|o| &o.table).collect(),
         SetSequenceOwner { owned_by, old, .. } => owned_by.iter().chain(old).map(|o| &o.table).collect(),
         RenameTable { from, .. } => vec![from],
         SetComment { target, .. } => match target {
@@ -280,7 +290,11 @@ fn tables_named(c: &Change) -> Vec<&QualName> {
             | CommentTarget::Index { table, .. } => {
                 vec![table]
             }
-            _ => vec![],
+            CommentTarget::Schema(_)
+            | CommentTarget::Type(_)
+            | CommentTarget::Sequence(_)
+            | CommentTarget::DomainConstraint { .. }
+            | CommentTarget::Attribute { .. } => vec![],
         },
         CreateSchema(_)
         | DropSchema(_)
@@ -306,7 +320,6 @@ fn tables_named(c: &Change) -> Vec<&QualName> {
         | AlterAttributeType { .. }
         | UnsupportedCompositeChange { .. }
         | RenameEnum { .. }
-        | RenameSequence { .. }
         | RenameDomain { .. }
         | RenameCompositeType { .. } => vec![],
     }

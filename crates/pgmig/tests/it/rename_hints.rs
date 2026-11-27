@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use pgmig::api::{self, DiffRequest, ErrorCode, PlanApplyRequest};
 use pgmig::{ChangeKind, Error, Options, ShadowSpec, Source, apply};
 
-use crate::support::{TestDb, postgres_dsn};
+use crate::support::{TestDb, backend_name, postgres_dsn};
 
 /// A temporary directory, removed on drop.
 struct Tmp(PathBuf);
@@ -466,4 +466,148 @@ fn a_skipped_enum_rename_leaves_out_what_casts_to_the_new_name() {
         res.skipped
     );
     apply(&db.conninfo, &res.plan).expect("apply");
+}
+
+/// The ids of `accounts`, in order.
+fn ids(conn: &mut pgmig::Conn, table: &str, column: &str) -> Vec<String> {
+    let rows = conn.query(&format!("SELECT {column} FROM {table} ORDER BY 1")).expect("select");
+    rows.into_iter().map(|r| r[0].clone().expect("id")).collect()
+}
+
+#[test]
+fn a_skipped_table_rename_skips_the_rename_of_its_sequence() {
+    let db = TestDb::new();
+    db.connect().batch("CREATE TABLE users (id serial PRIMARY KEY, name text);").expect("load target");
+    let t = Tmp::new();
+    let desired =
+        t.sql("schema.sql", "-- pgmig:rename table public.users accounts\nCREATE TABLE accounts (id serial PRIMARY KEY, name text);\n");
+    let (shadow, _keep) = shadow();
+    let res = api::schema_plan_apply(&PlanApplyRequest {
+        target: db.conninfo.clone(),
+        desired,
+        shadow,
+        options: skipping(&[ChangeKind::RenameTable]),
+        verify: true,
+    })
+    .expect("verified");
+    assert!(res.plan.statements.iter().all(|s| !s.contains("SEQUENCE") && !s.contains("accounts")), "{}", res.sql);
+    let skipped: Vec<String> = res.skipped.iter().map(ToString::to_string).collect();
+    assert_eq!(
+        skipped,
+        [
+            "rename_table public.users (policy)",
+            "rename_sequence public.users_id_seq (because rename_table public.users is skipped)",
+            "rename_constraint public.accounts.users_pkey (because rename_table public.users is skipped)",
+        ]
+    );
+    apply(&db.conninfo, &res.plan).expect("apply");
+}
+
+#[test]
+fn a_skipped_column_rename_skips_the_rename_of_its_sequence() {
+    let from = "CREATE TABLE users (id serial PRIMARY KEY, name text);\n";
+    let to = "-- pgmig:rename column public.users.id user_id\nCREATE TABLE users (user_id serial PRIMARY KEY, name text);\n";
+    let res = diff_with(from, to, skipping(&[ChangeKind::RenameColumn]));
+    assert!(res.plan.statements.iter().all(|s| !s.contains("SEQUENCE")), "{:?}", res.plan.statements);
+    let skipped: Vec<String> = res.skipped.iter().map(ToString::to_string).collect();
+    assert!(skipped.contains(&"rename_column public.users.id (policy)".to_owned()), "{skipped:?}");
+    assert!(
+        skipped.contains(&"rename_sequence public.users_id_seq (because rename_column public.users.id is skipped)".to_owned()),
+        "{skipped:?}"
+    );
+}
+
+#[test]
+fn a_sequence_hint_is_not_skipped_with_the_table_rename() {
+    let from = "CREATE TABLE users (id serial PRIMARY KEY, name text);\n";
+    let to = "-- pgmig:rename table public.users accounts\n-- pgmig:rename sequence public.users_id_seq accounts_id_seq\n\
+              CREATE TABLE accounts (id serial PRIMARY KEY, name text);\n";
+    let res = diff_with(from, to, skipping(&[ChangeKind::RenameTable]));
+    let skipped: Vec<String> = res.skipped.iter().map(ToString::to_string).collect();
+    assert!(!skipped.iter().any(|s| s.starts_with("rename_sequence")), "{skipped:?}");
+    assert!(res.plan.statements.contains(&"ALTER SEQUENCE public.users_id_seq RENAME TO accounts_id_seq".to_owned()), "{:?}", res.plan);
+}
+
+#[test]
+fn a_column_hint_renames_its_serial_sequence_so_the_next_value_carries_on() {
+    let db = TestDb::new();
+    let mut conn = db.connect();
+    conn.batch("CREATE TABLE users (id serial PRIMARY KEY, name text);").expect("load target");
+    conn.batch("INSERT INTO users (name) VALUES ('ada'), ('grace')").expect("insert");
+    let t = Tmp::new();
+    let desired = t
+        .sql("schema.sql", "-- pgmig:rename column public.users.id user_id\nCREATE TABLE users (user_id serial PRIMARY KEY, name text);\n");
+    let (shadow, _keep) = shadow();
+    let res = api::schema_plan_apply(&PlanApplyRequest {
+        target: db.conninfo.clone(),
+        desired: desired.clone(),
+        shadow: shadow.clone(),
+        options: Options::default(),
+        verify: true,
+    })
+    .expect("plan, verified");
+    let mut statements = res.plan.statements.clone();
+    if backend_name() == "pgmem" {
+        // pgmem keeps the old column as the sequence's owner after RENAME COLUMN (kaeawc/pgmem#306), so
+        // the diff adds an OWNED BY that Postgres does not need.
+        statements.retain(|s| !s.contains("OWNED BY"));
+    }
+    assert_eq!(
+        statements,
+        ["ALTER SEQUENCE public.users_id_seq RENAME TO users_user_id_seq", "ALTER TABLE public.users RENAME COLUMN id TO user_id"]
+    );
+    apply(&db.conninfo, &res.plan).expect("apply");
+    conn.batch("INSERT INTO users (name) VALUES ('edsger')").expect("the next insert takes a new id");
+    assert_eq!(ids(&mut conn, "users", "user_id"), ["1", "2", "3"], "the rows survive and the sequence carries on");
+    let again = pgmig::schema_plan_apply(&db.conninfo, &desired, &shadow, &Options::default()).expect("plan again");
+    assert!(again.is_empty(), "{:?}", again.statements);
+}
+
+#[test]
+fn a_sequence_dropped_and_created_for_the_same_column_is_suggested_and_a_hint_keeps_its_value() {
+    let db = TestDb::new();
+    let mut conn = db.connect();
+    // The table was renamed outside pgmig: its sequence still has the old name.
+    conn.batch("CREATE TABLE users (id serial PRIMARY KEY, name text); ALTER TABLE users RENAME TO accounts;").expect("load target");
+    conn.batch("INSERT INTO accounts (name) VALUES ('ada'), ('grace')").expect("insert");
+    let t = Tmp::new();
+    let schema = "CREATE TABLE accounts (id serial PRIMARY KEY, name text);\n";
+    let (shadow, _keep) = shadow();
+
+    let res = api::schema_plan_apply(&PlanApplyRequest {
+        target: db.conninfo.clone(),
+        desired: t.sql("plain.sql", schema),
+        shadow: shadow.clone(),
+        options: Options::default(),
+        verify: false,
+    })
+    .expect("plan");
+    assert!(res.plan.statements.iter().any(|s| s.contains("DROP SEQUENCE") && s.contains("users_id_seq")), "{}", res.sql);
+    assert!(res.plan.statements.iter().all(|s| !s.contains("RENAME TO accounts_id_seq")), "never renamed without the hint: {}", res.sql);
+    let seq_hints: Vec<_> = res.hints.iter().filter(|h| h.directive.contains("rename sequence")).collect();
+    assert_eq!(seq_hints.len(), 1, "{:?}", res.hints);
+    assert_eq!(seq_hints[0].directive, "-- pgmig:rename sequence public.users_id_seq accounts_id_seq");
+    assert_eq!(
+        seq_hints[0].message,
+        "sequence public.users_id_seq is dropped and sequence public.accounts_id_seq is created, both owned by column public.accounts.id; if it is a rename, the hint keeps its current value"
+    );
+
+    // With the suggested hint the sequence is renamed, and the next insert takes the next value.
+    let desired = t.sql("hinted.sql", &format!("{}\n{schema}", seq_hints[0].directive));
+    let res = api::schema_plan_apply(&PlanApplyRequest {
+        target: db.conninfo.clone(),
+        desired: desired.clone(),
+        shadow: shadow.clone(),
+        options: Options::default(),
+        verify: true,
+    })
+    .expect("plan with the hint, verified");
+    assert!(res.plan.statements.contains(&"ALTER SEQUENCE public.users_id_seq RENAME TO accounts_id_seq".to_owned()), "{}", res.sql);
+    assert!(res.plan.statements.iter().all(|s| !s.contains("DROP SEQUENCE") && !s.contains("CREATE SEQUENCE")), "{}", res.sql);
+    assert!(res.hints.iter().all(|h| !h.directive.contains("rename sequence")), "{:?}", res.hints);
+    apply(&db.conninfo, &res.plan).expect("apply");
+    conn.batch("INSERT INTO accounts (name) VALUES ('edsger')").expect("the next insert takes a new id");
+    assert_eq!(ids(&mut conn, "accounts", "id"), ["1", "2", "3"]);
+    let again = pgmig::schema_plan_apply(&db.conninfo, &desired, &shadow, &Options::default()).expect("plan again");
+    assert!(again.is_empty(), "{:?}", again.statements);
 }

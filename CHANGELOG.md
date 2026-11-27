@@ -20,13 +20,16 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
   (`directive`, `file`, `line`, `column`, `reason`) of `schema diff`, `schema apply`, `schema plan`
   and `migrate diff` responses, so hints can stay in the files after they ran. Without a hint
   nothing is renamed: when the diff drops a table and creates another with the same columns, or
-  drops a column and adds another of the same type to one table, a note on stderr and in `hints`
-  (`directive`, `message`) gives the line to write. The new change kinds `rename_table`,
+  drops a column and adds another of the same type to one table, or drops a sequence and creates
+  another owned by the same column, a note on stderr and in `hints` (`directive`, `message`) gives
+  the line to write. The new change kinds `rename_table`,
   `rename_column`, `rename_enum`, `rename_sequence`, `rename_domain`, `rename_composite_type` and
   `rename_index` can be listed in `--skip` (what names the renamed object, or casts to the renamed
   type, is skipped with it). A table or column hint also renames the sequence `OWNED BY` the
   column (a `serial`'s) when the desired state names it after the new table or column, so its
-  current value carries on instead of starting over. `migrate diff` writes the `RENAME` statements into the migration. A hint that applies copies the
+  current value carries on instead of starting over; skipping `rename_table` or `rename_column`
+  skips that sequence rename with it (reported as `rename_sequence`, because of the rename), while
+  a `rename sequence` hint is its own `rename_sequence` and is not. `migrate diff` writes the `RENAME` statements into the migration. A hint that applies copies the
   current schema into a shadow database to diff what is left, as `--verify` does, so objects pgmig
   does not model make it fail with `rename_hint` (`Error::RenameSetup`) rather than guess. A
   malformed hint is a directive error naming file and line, also in `schema validate`. The

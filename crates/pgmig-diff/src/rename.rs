@@ -46,12 +46,19 @@
 //! starting over, and the next row would take a value the table already has. So a table or column
 //! hint also renames the sequences of `a` owned by the renamed column when `b` has one owned by
 //! that column under another name (with the same checks as a `rename sequence` hint, and only if no
-//! hint renames it already): the plan renames the sequence and its current value carries on. An
-//! identity column's sequence needs nothing: its name is never compared.
+//! hint renames it already): the plan renames the sequence and its current value carries on. Such
+//! a change has [`Change::RenameSequence::follows`] set, so that a policy skipping the rename of its
+//! table or column skips it too. An identity column's sequence needs nothing: its name is never
+//! compared.
+//!
+//! When no hint applies (the table was renamed outside pgmig, say), the plan drops the old sequence
+//! and creates the new one, which starts over. [`suggest`] then names the `rename sequence` hint to
+//! write, for a dropped and a created sequence owned by the same column; it is never applied
+//! without the hint.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use pgmig_model::{Model, QualName, quote_ident};
+use pgmig_model::{Model, OwnedBy, QualName, quote_ident};
 use serde::{Deserialize, Serialize};
 
 use crate::Change;
@@ -349,7 +356,8 @@ fn owned_sequences(a: &Model, b: &Model, applied: &mut Vec<(usize, Change)>, fro
         {
             continue;
         }
-        follow.push((hint, Change::RenameSequence { from: seq.name.clone(), to: new.name.name.clone() }));
+        let follows = Some(OwnedBy { table, column });
+        follow.push((hint, Change::RenameSequence { from: seq.name.clone(), to: new.name.name.clone(), follows }));
     }
     // With the other renames of rank 0, before the columns and indexes.
     let at =
@@ -480,7 +488,7 @@ impl Names<'_> {
                     has_relation(a, &t),
                     b.sequences.contains_key(from),
                 )?;
-                Ok((Change::RenameSequence { from: from.clone(), to: to.clone() }, kf, kt))
+                Ok((Change::RenameSequence { from: from.clone(), to: to.clone(), follows: None }, kf, kt))
             }
             Rename::Index { from, to } => {
                 let t = with_schema(from, to);
@@ -516,8 +524,9 @@ pub struct Suggestion {
 }
 
 /// Rename hints to consider for `changes` (the diff from `a`): a table dropped while another
-/// table with the same columns (names and types) is created in its schema, and a column dropped
-/// while another of the same type is added to the same table. Nothing is renamed without the hint.
+/// table with the same columns (names and types) is created in its schema, a column dropped
+/// while another of the same type is added to the same table, and a sequence dropped while another
+/// one owned by the same column is created in its schema. Nothing is renamed without the hint.
 pub fn suggest(changes: &[Change], a: &Model) -> Vec<Suggestion> {
     let mut out = Vec::new();
     fn signature(t: &pgmig_model::Table) -> Vec<(&str, &str)> {
@@ -561,6 +570,28 @@ pub fn suggest(changes: &[Change], a: &Model) -> Vec<Suggestion> {
                     "column {table}.{} is dropped and column {} of the same type ({type_name}) is added; if it is a rename, the hint keeps the data",
                     quote_ident(old),
                     quote_ident(&added.name)
+                ),
+                directive: rename.directive(),
+            });
+        }
+    }
+    // A sequence dropped while another one owned by the same column is created: the table was
+    // renamed outside pgmig (or the sequence was named differently), and the new one starts over.
+    for change in changes {
+        let Change::DropSequence(old) = change else { continue };
+        let Some(owner) = &old.owned_by else { continue };
+        for new in changes.iter().filter_map(|c| match c {
+            Change::CreateSequence(s) if s.name.schema == old.name.schema && s.owned_by.as_ref() == Some(owner) => Some(s),
+            _ => None,
+        }) {
+            let rename = Rename::Sequence { from: old.name.clone(), to: new.name.name.clone() };
+            out.push(Suggestion {
+                message: format!(
+                    "sequence {} is dropped and sequence {} is created, both owned by column {}.{}; if it is a rename, the hint keeps its current value",
+                    old.name,
+                    new.name,
+                    owner.table,
+                    quote_ident(&owner.column)
                 ),
                 directive: rename.directive(),
             });
@@ -777,6 +808,7 @@ mod tests {
             owned_by: Some(pgmig_model::OwnedBy { table: q("public", table), column: column.into() }),
             comment: None,
         };
+        let owner = |table: &str, column: &str| Some(pgmig_model::OwnedBy { table: q("public", table), column: column.into() });
         let with = |mut m: Model, seqs: &[pgmig_model::Sequence]| {
             for s in seqs {
                 m.sequences.insert(s.name.clone(), s.clone());
@@ -798,8 +830,22 @@ mod tests {
             r.applied,
             [
                 (1, Change::RenameTable { from: q("public", "users"), to: "accounts".into() }),
-                (1, Change::RenameSequence { from: q("public", "users_id_seq"), to: "accounts_id_seq".into() }),
-                (1, Change::RenameSequence { from: q("public", "users_n_seq"), to: "accounts_m_seq".into() }),
+                (
+                    1,
+                    Change::RenameSequence {
+                        from: q("public", "users_id_seq"),
+                        to: "accounts_id_seq".into(),
+                        follows: owner("accounts", "id")
+                    }
+                ),
+                (
+                    1,
+                    Change::RenameSequence {
+                        from: q("public", "users_n_seq"),
+                        to: "accounts_m_seq".into(),
+                        follows: owner("accounts", "m")
+                    }
+                ),
                 (0, Change::RenameColumn { table: q("public", "accounts"), from: "n".into(), to: "m".into() }),
             ]
         );
@@ -815,7 +861,7 @@ mod tests {
             r.applied,
             [
                 (0, Change::RenameTable { from: q("public", "users"), to: "accounts".into() }),
-                (1, Change::RenameSequence { from: q("public", "users_id_seq"), to: "other_seq".into() }),
+                (1, Change::RenameSequence { from: q("public", "users_id_seq"), to: "other_seq".into(), follows: None }),
             ]
         );
     }
@@ -835,5 +881,31 @@ mod tests {
         let s = suggest(&crate::diff(&a, &b), &a);
         assert_eq!(s.len(), 1, "{s:?}");
         assert_eq!(s[0].directive, "-- pgmig:rename column public.t.name full_name");
+    }
+
+    #[test]
+    fn a_sequence_dropped_and_created_for_the_same_column_is_suggested() {
+        let seq = |name: &str, table: &str, column: &str| pgmig_model::Sequence {
+            name: q("public", name),
+            data_type: "integer".into(),
+            options: pgmig_model::SequenceOptions::defaults("integer", 1).expect("options"),
+            owned_by: Some(pgmig_model::OwnedBy { table: q("public", table), column: column.into() }),
+            comment: None,
+        };
+        let mut a = model(&[("accounts", &[("id", "integer"), ("n", "integer")])]);
+        let mut b = a.clone();
+        for s in [seq("users_id_seq", "accounts", "id"), seq("users_n_seq", "accounts", "n")] {
+            a.sequences.insert(s.name.clone(), s);
+        }
+        for s in [seq("accounts_id_seq", "accounts", "id"), seq("other_seq", "other", "id")] {
+            b.sequences.insert(s.name.clone(), s);
+        }
+        let s = suggest(&crate::diff(&a, &b), &a);
+        assert_eq!(s.len(), 1, "{s:?}");
+        assert_eq!(s[0].directive, "-- pgmig:rename sequence public.users_id_seq accounts_id_seq");
+        assert_eq!(
+            s[0].message,
+            "sequence public.users_id_seq is dropped and sequence public.accounts_id_seq is created, both owned by column public.accounts.id; if it is a rename, the hint keeps its current value"
+        );
     }
 }
