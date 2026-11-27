@@ -359,3 +359,17 @@ fn migrate_diff_writes_the_renames_and_reports_the_hints() {
     assert!(again.written.is_empty() && again.plan.is_empty(), "{}", again.sql);
     assert_eq!(again.unused_hints.len(), 2);
 }
+
+#[test]
+fn a_rename_with_a_type_change_that_needs_using_still_asks_the_server() {
+    // The cast probe needs the desired state's connection, which a real Postgres shadow gives up
+    // while the renames are made on a copy and takes again afterwards.
+    let res = diff(
+        "CREATE TABLE t (id integer, qty text);\n",
+        "-- pgmig:rename column public.t.qty amount\nCREATE TABLE t (id integer, amount integer);\n",
+    );
+    assert_eq!(
+        res.plan.statements,
+        ["ALTER TABLE public.t RENAME COLUMN qty TO amount", "ALTER TABLE public.t ALTER COLUMN amount TYPE integer USING amount::integer"]
+    );
+}

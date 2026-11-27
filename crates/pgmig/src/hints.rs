@@ -24,7 +24,7 @@ use pgmig_diff::{Change, Rename, Suggestion, resolve, suggest};
 use pgmig_model::Model;
 use serde::{Deserialize, Serialize};
 
-use crate::{Error, Loaded, Options, Result, ShadowSpec, Source, diff_with_casts, files, inspect, open_model, plan, verify};
+use crate::{Error, Loaded, Options, Result, ShadowSpec, Source, assignment_castable, diff, files, inspect, open_model, plan, verify};
 
 /// A rename hint in a file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,23 +106,40 @@ pub(crate) struct Desired<'a> {
 }
 
 /// The changes that turn `a` into `b` (with casts, asked of `loaded`, the connection holding `b`'s
-/// schema), applying the hints that apply. `current` is what a copy of `a` is made from: `a` and
+/// schema), applying the hints that apply. `loaded` is kept when no hint applies. `current` is what a copy of `a` is made from: `a` and
 /// what it needs ([`crate::clean::with_needs`]).
-pub(crate) fn diff_hinted(current: &Model, a: Model, b: &Model, mut loaded: Loaded, desired: &Desired, hints: &[Hint]) -> Result<Hinted> {
+pub(crate) fn diff_hinted(current: &Model, a: Model, b: &Model, loaded: Loaded, desired: &Desired, hints: &[Hint]) -> Result<Hinted> {
     let renames: Vec<Rename> = hints.iter().map(|h| h.rename.clone()).collect();
     let resolution = resolve(&a, b, &renames);
     let mut a = a;
     let mut renamed = Vec::new();
+    let mut loaded = Some(loaded);
     if !resolution.applied.is_empty() {
         renamed = resolution.applied.iter().map(|(_, c)| c.clone()).collect();
-        // A real Postgres shadow holds one database at a time: `b`'s goes before the copy is made,
-        // and comes back for the casts.
-        drop(loaded);
+        // A real Postgres shadow holds one database at a time: `b`'s goes before the copy is made.
+        // It comes back if a type change needs the server's answer about its cast.
+        loaded = None;
         a = desired.opts.managed(&renamed_copy(current, &renamed, desired.shadow)?);
-        loaded = open_model(desired.source, desired.shadow)?.1;
+    }
+    let mut reopen_failed = None;
+    let mut probe = |from: &str, to: &str| {
+        if loaded.is_none() {
+            match open_model(desired.source, desired.shadow) {
+                Ok((_, l)) => loaded = Some(l),
+                Err(e) => {
+                    reopen_failed = Some(e);
+                    return false;
+                }
+            }
+        }
+        assignment_castable(loaded.as_mut().expect("opened above").conn(), from, to)
+    };
+    let diffed = pgmig_diff::add_casts(diff(&a, b), &a, b, &mut probe);
+    if let Some(e) = reopen_failed {
+        return Err(e);
     }
     let mut changes = renamed;
-    changes.extend(diff_with_casts(&a, b, loaded.conn()));
+    changes.extend(diffed);
     let suggestions = suggest(&changes, &a);
     let unused = resolution
         .unused
