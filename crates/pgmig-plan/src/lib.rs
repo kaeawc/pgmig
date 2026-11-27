@@ -90,8 +90,20 @@
 //! reference orders nothing; the plan assumes the object exists.
 //!
 //! Changes Postgres cannot make in place (removing or reordering enum values, a new base type for a
-//! domain something keeps using, a new attribute type for a composite type a table column uses)
-//! fail the plan with [`Error::Unsupported`].
+//! domain something keeps using, a new attribute type for a composite type a table column uses, a
+//! new partition key; see `pgmig_diff` for the partition changes) fail the plan with
+//! [`Error::Unsupported`].
+//!
+//! # Partitions
+//!
+//! A partitioned table is `CREATE TABLE ... PARTITION BY <key>`; a partition is `CREATE TABLE ...
+//! PARTITION OF <parent> [(<its own constraints>)] <bound>` (and `PARTITION BY` when it is
+//! partitioned in turn), created after its parent and dropped before it. `DETACH PARTITION` runs
+//! before the changes to the table standing alone and to its parent's columns (which would reach
+//! it); `ATTACH PARTITION` runs after the table and its parent exist and the table's columns are
+//! those of its parent ([`graph::Object::Partition`] orders a re-bound partition's detach before
+//! its attach). An index on a partitioned table, which Postgres prints `ON ONLY`, is created on its
+//! partitions too.
 //!
 //! # Domains and composite types
 //!
@@ -455,6 +467,7 @@ fn unsupported(change: &Change) -> Option<String> {
             used_by.join(", "),
             if used_by.len() == 1 { "uses" } else { "use" }
         )),
+        Change::UnsupportedPartitionChange { name, detail } => Some(format!("table {name}: {detail}")),
         _ => None,
     }
 }
@@ -464,11 +477,14 @@ fn phase(change: &Change) -> u8 {
     match change {
         // Planned on their own, before everything else (see the module doc).
         Change::AddEnumValue { .. } | Change::UnsupportedEnumChange { .. } => 0,
-        Change::UnsupportedDomainChange { .. } | Change::UnsupportedCompositeChange { .. } => 0,
+        Change::UnsupportedDomainChange { .. } | Change::UnsupportedCompositeChange { .. } | Change::UnsupportedPartitionChange { .. } => 0,
         Change::CreateSchema(_) => 0,
         Change::CreateEnum(_) | Change::CreateSequence(_) | Change::CreateDomain(_) | Change::CreateCompositeType(_) => 1,
         // Before defaults that print the new name are set.
         Change::RenameEnumValue { .. } | Change::AlterSequence { .. } => 2,
+        // Before the changes to the table standing alone, and to its parent's columns, which would
+        // otherwise reach it.
+        Change::DetachPartition { .. } => 2,
         Change::CreateTable(_) => 3,
         Change::AddColumn { .. } | Change::AddAttribute { .. } => 4,
         // A column cannot have a default and an identity at once. A constraint goes before the
@@ -493,7 +509,8 @@ fn phase(change: &Change) -> u8 {
         | Change::AddDomainConstraint { .. }
         | Change::ValidateDomainConstraint { .. } => 10,
         Change::DropColumn { .. } | Change::DropAttribute { .. } => 11,
-        Change::DropTable { .. } => 12,
+        // After the table's columns match the parent's.
+        Change::DropTable { .. } | Change::AttachPartition { .. } => 12,
         Change::DropSequence(_) => 13,
         Change::DropEnum(_) | Change::DropDomain(_) | Change::DropCompositeType(_) => 14,
         Change::DropSchema(_) => 15,
@@ -535,6 +552,10 @@ fn object_deps(change: &Change) -> Deps {
             creates.extend(t.columns.iter().filter_map(|c| Some(identity_sequence(&t.name, &c.name, c.identity.as_ref()?))));
             creates.extend(t.constraints.iter().map(|c| constraint(&t.name, &c.name)));
             creates.extend(table_indexes(t));
+            if let Some(p) = &t.partition_of {
+                requires.push(in_table(&p.parent));
+                creates.push(Object::Partition(t.name.clone()));
+            }
             Deps { creates, requires, ..Deps::default() }
         }
         Change::DropTable { table: t, owned_sequences } => {
@@ -549,7 +570,34 @@ fn object_deps(change: &Change) -> Deps {
             drops.extend(t.constraints.iter().map(|c| constraint(&t.name, &c.name)));
             drops.extend(table_indexes(t));
             releases.extend(t.constraints.iter().flat_map(referenced).filter(|o| !is_of_table(o, &t.name)));
+            // A partition is dropped before its parent.
+            if let Some(p) = &t.partition_of {
+                releases.push(in_table(&p.parent));
+                drops.push(Object::Partition(t.name.clone()));
+            }
             Deps { drops, releases, ..Deps::default() }
+        }
+        Change::DetachPartition { table, parent, columns } => {
+            let of = |t: &QualName| columns.iter().map(|c| column(t, c)).collect::<Vec<_>>();
+            Deps {
+                drops: vec![Object::Partition(table.clone())],
+                // Before the table standing alone changes, and before the parent's columns change
+                // (which would reach the partition) or go.
+                alters: [of(table), of(parent)].concat(),
+                requires: vec![in_table(table), in_table(parent)],
+                releases: [vec![in_table(parent)], of(parent)].concat(),
+                ..Deps::default()
+            }
+        }
+        Change::AttachPartition { table, partition_of, columns } => {
+            let of = |t: &QualName| columns.iter().map(|c| column(t, c)).collect::<Vec<_>>();
+            Deps {
+                creates: vec![Object::Partition(table.clone())],
+                // After the table's columns are added and set as the parent's.
+                alters: of(table),
+                requires: [vec![in_table(table), in_table(&partition_of.parent)], of(table), of(&partition_of.parent)].concat(),
+                ..Deps::default()
+            }
         }
         Change::CreateSequence(s) => Deps {
             creates: vec![Object::Sequence(s.name.clone())],
@@ -597,9 +645,10 @@ fn object_deps(change: &Change) -> Deps {
         Change::AddEnumValue { name, .. } | Change::RenameEnumValue { name, .. } => {
             Deps { alters: vec![Object::Type(name.clone())], ..Deps::default() }
         }
-        Change::UnsupportedEnumChange { .. } | Change::UnsupportedDomainChange { .. } | Change::UnsupportedCompositeChange { .. } => {
-            Deps::default()
-        }
+        Change::UnsupportedEnumChange { .. }
+        | Change::UnsupportedDomainChange { .. }
+        | Change::UnsupportedCompositeChange { .. }
+        | Change::UnsupportedPartitionChange { .. } => Deps::default(),
         Change::CreateDomain(d) => {
             let mut creates = vec![Object::Type(d.name.clone())];
             creates.extend(d.constraints.iter().map(|c| constraint(&d.name, &c.name)));
@@ -957,13 +1006,25 @@ fn statement(change: &Change, opts: &PlanOptions) -> String {
         Change::CreateTable(t) => {
             let mut cols: Vec<String> = t.columns.iter().map(|c| format!("    {}", column_def(c))).collect();
             cols.extend(t.constraints.iter().map(|c| format!("    {}", constraint_def(c))));
-            if cols.is_empty() {
-                format!("CREATE TABLE {} ()", n(&t.name))
-            } else {
-                format!("CREATE TABLE {} (\n{}\n)", n(&t.name), cols.join(",\n"))
+            let body = if cols.is_empty() { String::new() } else { format!("(\n{}\n)", cols.join(",\n")) };
+            // A partition has its parent's columns: only its own constraints are written.
+            let mut s = match &t.partition_of {
+                Some(p) if body.is_empty() => format!("CREATE TABLE {} PARTITION OF {} {}", n(&t.name), n(&p.parent), p.bound),
+                Some(p) => format!("CREATE TABLE {} PARTITION OF {} {body} {}", n(&t.name), n(&p.parent), p.bound),
+                None if body.is_empty() => format!("CREATE TABLE {} ()", n(&t.name)),
+                None => format!("CREATE TABLE {} {body}", n(&t.name)),
+            };
+            if let Some(key) = &t.partition_key {
+                s.push_str(&format!(" PARTITION BY {key}"));
             }
+            s
         }
         Change::DropTable { table: t, .. } => format!("DROP TABLE {}", n(&t.name)),
+        Change::DetachPartition { table, parent, .. } => format!("ALTER TABLE {} DETACH PARTITION {}", n(parent), n(table)),
+        Change::AttachPartition { table, partition_of: p, .. } => {
+            format!("ALTER TABLE {} ATTACH PARTITION {} {}", n(&p.parent), n(table), p.bound)
+        }
+        Change::UnsupportedPartitionChange { name, .. } => format!("-- unsupported change to the partitioning of table {}", n(name)),
         Change::CreateEnum(e) => {
             let labels: Vec<String> = e.labels.iter().map(|l| quote_literal(l)).collect();
             format!("CREATE TYPE {} AS ENUM ({})", n(&e.name), labels.join(", "))
@@ -1110,6 +1171,9 @@ fn statement(change: &Change, opts: &PlanOptions) -> String {
             };
             format!("ALTER TABLE {} ALTER CONSTRAINT {} {timing}", n(table), quote_ident(&to.name))
         }
+        // Postgres prints a partitioned table's index `ON ONLY`, which would build it without its
+        // partitions' indexes (and leave it invalid): the plan builds it on all of them. pgmem prints no `ONLY` (kaeawc/pgmem#287).
+        Change::CreateIndex { index, .. } if index.on_partitioned_table => index.definition.replacen(" ON ONLY ", " ON ", 1),
         Change::CreateIndex { index, .. } => index.definition.clone(),
         Change::DropIndex { table, index } => format!("DROP INDEX {}", n(&QualName::new(table.schema.clone(), index.name.clone()))),
         Change::SetComment { target, comment } => {
@@ -1194,7 +1258,15 @@ mod tests {
     }
 
     fn table(schema: &str, name: &str, columns: Vec<Column>) -> Table {
-        Table { name: QualName::new(schema, name), columns, comment: None, constraints: vec![], indexes: vec![] }
+        Table {
+            name: QualName::new(schema, name),
+            columns,
+            comment: None,
+            constraints: vec![],
+            indexes: vec![],
+            partition_key: None,
+            partition_of: None,
+        }
     }
 
     fn row_type(schema: &str, name: &str) -> Option<QualName> {
@@ -2669,5 +2741,127 @@ mod tests {
         assert_eq!(opts, PlanOptions { unqualified_schema: Some("app".into()), concurrent_indexes: false });
         let opts: PlanOptions = serde_json::from_str(r#"{"unqualified_schema":null,"concurrent_indexes":true}"#).expect("new shape");
         assert!(opts.concurrent_indexes);
+    }
+
+    fn partition(name: &str, parent: &str, bound: &str) -> Table {
+        let of = pgmig_model::PartitionOf { parent: QualName::new("public", parent), bound: bound.into() };
+        Table { partition_of: Some(of), ..table("public", name, vec![]) }
+    }
+
+    fn partitioned(name: &str) -> Table {
+        Table { partition_key: Some("RANGE (id)".into()), ..table("public", name, vec![col("id", None)]) }
+    }
+
+    #[test]
+    fn partitions_are_created_after_their_parent_and_dropped_before_it() {
+        let (p, c, d) = (partitioned("p"), partition("c", "p", "FOR VALUES FROM (1) TO (10)"), partition("d", "p", "DEFAULT"));
+        // A sub-partition: a partition that is partitioned.
+        let s = Table { partition_key: Some("LIST (id)".into()), ..partition("s", "p", "FOR VALUES FROM (10) TO (20)") };
+        let s1 = partition("s1", "s", "FOR VALUES IN (10)");
+        let created = sql(&[
+            Change::CreateTable(s1.clone()),
+            Change::CreateTable(c.clone()),
+            Change::CreateTable(s.clone()),
+            Change::CreateTable(p.clone()),
+            Change::CreateTable(d.clone()),
+        ]);
+        assert_eq!(
+            created,
+            [
+                "CREATE TABLE public.p (\n    id integer\n) PARTITION BY RANGE (id)",
+                "CREATE TABLE public.c PARTITION OF public.p FOR VALUES FROM (1) TO (10)",
+                "CREATE TABLE public.s PARTITION OF public.p FOR VALUES FROM (10) TO (20) PARTITION BY LIST (id)",
+                "CREATE TABLE public.s1 PARTITION OF public.s FOR VALUES IN (10)",
+                "CREATE TABLE public.d PARTITION OF public.p DEFAULT",
+            ]
+        );
+        let dropped = sql(&[drop_table(p), drop_table(s), drop_table(c), drop_table(s1)]);
+        assert_eq!(dropped, ["DROP TABLE public.c", "DROP TABLE public.s1", "DROP TABLE public.s", "DROP TABLE public.p"]);
+    }
+
+    #[test]
+    fn a_partition_with_constraints_of_its_own_writes_only_those() {
+        let c = Table {
+            constraints: vec![constraint("c_v", ConstraintKind::Check, "CHECK ((v > 0))", &["v"])],
+            ..partition("c", "p", "DEFAULT")
+        };
+        assert_eq!(
+            sql(&[Change::CreateTable(c)]),
+            ["CREATE TABLE public.c PARTITION OF public.p (\n    CONSTRAINT c_v CHECK ((v > 0))\n) DEFAULT"]
+        );
+    }
+
+    #[test]
+    fn a_rebound_partition_is_detached_before_it_is_attached_again() {
+        let (c, p) = (QualName::new("public", "c"), QualName::new("public", "p"));
+        let columns = vec!["id".to_owned()];
+        let of = pgmig_model::PartitionOf { parent: p.clone(), bound: "FOR VALUES FROM (1) TO (20)".into() };
+        let changes = [
+            Change::AttachPartition { table: c.clone(), partition_of: of, columns: columns.clone() },
+            Change::DetachPartition { table: c, parent: p, columns },
+        ];
+        assert_eq!(
+            sql(&changes),
+            [
+                "ALTER TABLE public.p DETACH PARTITION public.c",
+                "ALTER TABLE public.p ATTACH PARTITION public.c FOR VALUES FROM (1) TO (20)"
+            ]
+        );
+        // The two stay together under a policy.
+        let kinds = [pgmig_diff::ChangeKind::DetachPartition].into_iter().collect();
+        let (kept, skipped) = skip(&changes, &kinds, &PlanOptions::default());
+        assert!(kept.is_empty(), "{kept:?}");
+        assert_eq!(skipped.len(), 2);
+    }
+
+    #[test]
+    fn a_table_is_attached_after_its_columns_match_and_detached_before_they_change() {
+        let (c, p) = (QualName::new("public", "c"), QualName::new("public", "p"));
+        let columns = vec!["id".to_owned()];
+        let of = pgmig_model::PartitionOf { parent: p.clone(), bound: "DEFAULT".into() };
+        let attach = Change::AttachPartition { table: c.clone(), partition_of: of, columns: columns.clone() };
+        let add = Change::AddColumn { table: c.clone(), column: col("id", None) };
+        let not_null = Change::SetNotNull { table: c.clone(), column: "id".into() };
+        assert_eq!(
+            sql(&[attach, not_null.clone(), add]),
+            [
+                "ALTER TABLE public.c ADD COLUMN id integer",
+                "ALTER TABLE public.c ALTER COLUMN id SET NOT NULL",
+                "ALTER TABLE public.p ATTACH PARTITION public.c DEFAULT"
+            ]
+        );
+        let detach = Change::DetachPartition { table: c.clone(), parent: p.clone(), columns };
+        let drop_parent_column =
+            Change::DropColumn { table: p.clone(), column: "id".into(), type_ref: None, sequences: vec![], owned_sequences: vec![] };
+        let drop_parent = drop_table(partitioned("p"));
+        assert_eq!(
+            sql(&[drop_parent, drop_parent_column, not_null, detach]),
+            [
+                "ALTER TABLE public.p DETACH PARTITION public.c",
+                "ALTER TABLE public.c ALTER COLUMN id SET NOT NULL",
+                "ALTER TABLE public.p DROP COLUMN id",
+                "DROP TABLE public.p"
+            ]
+        );
+    }
+
+    #[test]
+    fn unsupported_partition_changes_fail_the_plan_naming_the_table() {
+        let change =
+            Change::UnsupportedPartitionChange { name: QualName::new("public", "p"), detail: "the partitioning cannot change".into() };
+        assert_eq!(plan(&[change]), Err(Error::Unsupported(vec!["table public.p: the partitioning cannot change".into()])));
+    }
+
+    #[test]
+    fn an_index_on_a_partitioned_table_is_built_on_its_partitions_too() {
+        let i = pgmig_model::Index {
+            definition: "CREATE INDEX p_x_idx ON ONLY public.p USING btree (x)".into(),
+            on_partitioned_table: true,
+            ..index("p", "p_x_idx", "(x)", &["x"])
+        };
+        assert_eq!(
+            sql(&[Change::CreateIndex { table: QualName::new("public", "p"), index: i }]),
+            ["CREATE INDEX p_x_idx ON public.p USING btree (x)"]
+        );
     }
 }

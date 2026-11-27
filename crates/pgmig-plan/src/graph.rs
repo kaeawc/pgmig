@@ -43,6 +43,10 @@ pub enum Object {
     /// exclusion constraint's (named like the constraint). A foreign key requires the index it
     /// uses; a table's drop drops its indexes.
     Index(QualName),
+    /// A table's place among its parent's partitions: creating a partition or attaching a table
+    /// creates it, dropping a partition or detaching it drops it, so a re-bound partition is
+    /// detached before it is attached again.
+    Partition(QualName),
     /// A relation name (`pg_class`): tables, sequences and indexes share one namespace per schema.
     /// A step creating or dropping a [`Object::Table`], [`Object::Sequence`] or [`Object::Index`]
     /// creates or drops the relation of its name too, so dropping index `foo` runs before creating

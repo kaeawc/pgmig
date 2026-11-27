@@ -8,7 +8,8 @@ use std::collections::BTreeMap;
 
 use pgmig_model::{
     Attribute, Column, Composite, Constraint, ConstraintKind, Domain, DomainConstraint, Enum, Generated, Identity, Index, Model, OwnedBy,
-    QualName, References, Schema, Sequence, SequenceOptions, Table, quote_literal,
+    PartitionOf, QualName, References, Schema, Sequence, SequenceOptions, Table, inherited_constraint, inherited_index,
+    partition_column_differs, quote_literal,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -85,15 +86,35 @@ fn inspect_catalog(conn: &mut Conn) -> Result<Model> {
         model.schemas.insert(name.clone(), Schema { name, comment: row.get(1).cloned().flatten() });
     }
 
+    // A partition's parent is its one `pg_inherits` row; `pg_get_partkeydef` is NULL for a table
+    // that is not partitioned.
     let tables = format!(
-        "SELECT n.nspname, c.relname, obj_description(c.oid, 'pg_class') FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+        "SELECT n.nspname, c.relname, obj_description(c.oid, 'pg_class'), pg_get_partkeydef(c.oid), pn.nspname, pc.relname, \
+                pg_get_expr(c.relpartbound, c.oid) \
+         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+         LEFT JOIN pg_inherits h ON c.relispartition AND h.inhrelid = c.oid \
+         LEFT JOIN pg_class pc ON pc.oid = h.inhparent \
+         LEFT JOIN pg_namespace pn ON pn.oid = pc.relnamespace \
          WHERE c.relkind IN ('r', 'p') AND {USER_SCHEMA} ORDER BY 1, 2"
     );
     for row in run(conn, "tables", &tables)? {
-        let name = QualName::new(text(&row, 0, "tables")?, text(&row, 1, "tables")?);
+        let what = "tables";
+        let name = QualName::new(text(&row, 0, what)?, text(&row, 1, what)?);
+        let partition_of = match (qual_name(&row, 4, 5), row.get(6).cloned().flatten()) {
+            (Some(parent), Some(bound)) => Some(PartitionOf { parent, bound }),
+            _ => None,
+        };
         model.tables.insert(
             name.clone(),
-            Table { name, columns: Vec::new(), comment: row.get(2).cloned().flatten(), constraints: Vec::new(), indexes: Vec::new() },
+            Table {
+                name,
+                columns: Vec::new(),
+                comment: row.get(2).cloned().flatten(),
+                constraints: Vec::new(),
+                indexes: Vec::new(),
+                partition_key: row.get(3).cloned().flatten(),
+                partition_of,
+            },
         );
     }
 
@@ -279,8 +300,27 @@ fn inspect_catalog(conn: &mut Conn) -> Result<Model> {
     }
 
     inspect_indexes(conn, &mut model, &attnames)?;
+    keep_partitions_own(&mut model);
 
     Ok(model)
+}
+
+/// Leaves each partition with only what is its own (see [`Table::partition_of`]): the columns that
+/// differ from its parent's, and the constraints and indexes that are not the ones it has from its
+/// parent. The catalog marks some of those (`attislocal`, `conislocal`, an index attached in
+/// `pg_inherits`), but not the same way for a partition created with `PARTITION OF` as for one
+/// attached (an attached table keeps its columns local), and pgmem leaves the marks unset
+/// (kaeawc/pgmem#205, #288, #289). So a partition is compared with its parent as the catalog holds both, and
+/// the model is the same however the partition was made.
+fn keep_partitions_own(model: &mut Model) {
+    let full = model.tables.clone();
+    for t in model.tables.values_mut() {
+        let Some(parent) = t.partition_of.as_ref().and_then(|p| full.get(&p.parent)) else { continue };
+        t.columns.retain(|c| parent.column(&c.name).is_none_or(|pc| partition_column_differs(c, pc)));
+        t.constraints.retain(|c| !parent.constraints.iter().any(|pc| inherited_constraint(pc, c)));
+        let name = t.name.clone();
+        t.indexes.retain(|i| !parent.indexes.iter().any(|pi| inherited_index(&parent.name, pi, &name, i)));
+    }
 }
 
 /// The indexes of the model's tables that no constraint owns: not a primary key, unique or

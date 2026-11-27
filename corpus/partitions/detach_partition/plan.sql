@@ -1,0 +1,3 @@
+ALTER TABLE public.t DETACH PARTITION public.t_2;
+ALTER TABLE public.t_2 ALTER COLUMN v DROP DEFAULT;
+COMMENT ON TABLE public.t_2 IS 'archived';

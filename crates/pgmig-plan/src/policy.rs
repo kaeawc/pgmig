@@ -246,7 +246,15 @@ mod tests {
     }
 
     fn table(schema: &str, name: &str) -> Table {
-        Table { name: QualName::new(schema, name), columns: vec![col("id")], comment: None, constraints: vec![], indexes: vec![] }
+        Table {
+            name: QualName::new(schema, name),
+            columns: vec![col("id")],
+            comment: None,
+            constraints: vec![],
+            indexes: vec![],
+            partition_key: None,
+            partition_of: None,
+        }
     }
 
     fn kinds(k: &[ChangeKind]) -> BTreeSet<ChangeKind> {
