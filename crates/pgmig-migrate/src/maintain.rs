@@ -59,8 +59,9 @@ pub fn rebase_moves(dir: &Dir, names: &[&str], now: SystemTime) -> Vec<Move> {
         .collect()
 }
 
-/// Move the files `names` of `dir` after every other file ([`rebase_moves`]): rename them, then
-/// write the sum file. A file already at a new name is never overwritten.
+/// Move the files `names` of `dir` after every other file ([`rebase_moves`]): move them, then
+/// write the sum file. A file already at a new name is never overwritten. The caller holds the
+/// [`DirLock`](crate::DirLock) of the directory from before `dir` was read.
 pub fn rebase(dir: &Dir, names: &[&str], now: SystemTime) -> Result<(Vec<Move>, SumFile)> {
     let moves = rebase_moves(dir, names, now);
     for m in &moves {
@@ -69,22 +70,35 @@ pub fn rebase(dir: &Dir, names: &[&str], now: SystemTime) -> Result<(Vec<Move>, 
             return Err(Error::Exists { path: to });
         }
     }
+    let mut synced = false;
     let mut files = dir.without(names).files().to_vec();
     for f in dir.files().iter().filter(|f| names.contains(&f.name.as_str())) {
         match moves.iter().find(|m| m.from == f.name) {
             Some(m) => {
                 rename(&dir.path, &m.from, &m.to)?;
+                synced = true;
                 files.push(File::new(&m.to, f.bytes.clone()).map_err(|reason| Error::Name { path: dir.path.join(&m.to), reason })?);
             }
             None => files.push(f.clone()),
         }
     }
+    if synced {
+        sync_dir(&dir.path)?;
+    }
     let (sum, _) = Dir::from_files(&dir.path, files)?.write_sum()?;
     Ok((moves, sum))
 }
 
+/// Move `from` to `to` in `dir` without overwriting: a `to` that exists is [`Error::Exists`].
 fn rename(dir: &Path, from: &str, to: &str) -> Result<()> {
-    std::fs::rename(dir.join(from), dir.join(to)).map_err(|source| Error::Io { path: dir.join(from), source })
+    match crate::move_no_overwrite(&dir.join(from), &dir.join(to)) {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(Error::Exists { path: dir.join(to) }),
+        r => r.map_err(|source| Error::Io { path: dir.join(from), source }),
+    }
+}
+
+fn sync_dir(dir: &Path) -> Result<()> {
+    crate::sync_parent(&dir.join("x")).map_err(|source| Error::Io { path: dir.to_owned(), source })
 }
 
 #[cfg(test)]

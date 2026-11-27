@@ -73,6 +73,9 @@ pub enum Error {
     /// A `migrate diff` or `migrate new` name with no ASCII letters or digits.
     #[error("migration name {name:?} has no letters or digits; names are made of a-z, 0-9 and _")]
     MigrationDescription { name: String },
+    /// The migration directory changed between planning and writing: another run wrote to it.
+    #[error("{} changed while planning (another run wrote to it); run again", path.display())]
+    MigrationDirChanged { path: PathBuf },
     /// Options that cannot be used together or at all.
     #[error("{0}")]
     Options(String),
@@ -407,6 +410,8 @@ fn exec_file(conn: &mut Conn, path: &Path, file: &pgmig_sql::File) -> Result<()>
 /// `migrate hash`: write the sum file of the migration directory at `dir`. Returns it, and whether
 /// the file changed (it is left alone when it already matches).
 pub fn migrate_hash(dir: &Path) -> Result<(SumFile, bool)> {
+    // A missing directory is left for `open` to report.
+    let _lock = if dir.is_dir() { lock_dir(dir)? } else { None };
     Ok(MigrationDir::open(dir)?.write_sum()?)
 }
 
@@ -507,7 +512,7 @@ fn migrate_diff_at(
         return Err(Error::Options("no editor: set VISUAL or EDITOR".into()));
     }
     // A directory that does not exist yet is an empty one; it is created when a file is written.
-    let existing = if dir.exists() { Some(open_checked(dir)?) } else { None };
+    let (lock, existing) = open_locked(dir)?;
     // The replay's shadow is wiped (dropped) before `to`'s opens: a real Postgres shadow must start
     // empty.
     let a = {
@@ -530,7 +535,7 @@ fn migrate_diff_at(
         sql = edit_sql(&sql, editor)?;
         statements = edit::check_migration_sql(&sql, EDITED_MIGRATION)?;
     }
-    let written = if statements == 0 { None } else { Some(write_migration(dir, existing, &description, sql.clone(), now)?) };
+    let written = if statements == 0 { None } else { Some(write_migration(dir, lock, existing, &description, sql.clone(), now)?) };
     Ok(MigrateDiff { written, changes, skipped, plan, sql, edited })
 }
 
@@ -542,29 +547,77 @@ pub fn migrate_new(dir: &Path, name: &str) -> Result<NewMigration> {
 
 fn migrate_new_at(dir: &Path, name: &str, now: SystemTime) -> Result<NewMigration> {
     let description = description(name)?;
-    let existing = if dir.exists() { Some(open_checked(dir)?) } else { None };
-    write_migration(dir, existing, &description, String::new(), now)
+    // Nothing is planned from the directory's contents, so it is created first and read under the
+    // lock: concurrent runs into a new directory all succeed.
+    std::fs::create_dir_all(dir).map_err(|source| Error::Io { path: dir.to_owned(), source })?;
+    let (lock, existing) = open_locked(dir)?;
+    write_migration(dir, lock, existing, &description, String::new(), now)
 }
 
 fn description(name: &str) -> Result<String> {
     pgmig_migrate::sanitize_description(name).ok_or_else(|| Error::MigrationDescription { name: name.to_owned() })
 }
 
+/// Lock the directory `dir`, which must exist. `None` when the lock file cannot be created because
+/// the directory is read-only: commands that only read go on without it, and one that writes locks
+/// it again then ([`write_migration`]), where a failure is the real error.
+fn lock_dir(dir: &Path) -> Result<Option<pgmig_migrate::DirLock>> {
+    use std::io::ErrorKind::{PermissionDenied, ReadOnlyFilesystem};
+    match pgmig_migrate::DirLock::acquire(dir) {
+        Ok(l) => Ok(Some(l)),
+        Err(pgmig_migrate::Error::Io { source, .. }) if matches!(source.kind(), PermissionDenied | ReadOnlyFilesystem) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Lock the migration directory `dir` (when it can be locked, see [`lock_dir`]) and open it
+/// checked. A directory that does not exist yet is an empty one, left uncreated and unlocked until
+/// a file is written ([`write_migration`] then locks it and reads it again).
+fn open_locked(dir: &Path) -> Result<(Option<pgmig_migrate::DirLock>, Option<MigrationDir>)> {
+    if !dir.exists() {
+        return Ok((None, None));
+    }
+    let lock = lock_dir(dir)?;
+    Ok((lock, Some(open_checked(dir)?)))
+}
+
 /// Write the next migration after the checked files of `existing`, then the sum file for those
 /// files and the new one only: a file that appeared in the meantime is left unhashed, so the
-/// next check reports it instead of hashing it unseen.
-fn write_migration(path: &Path, existing: Option<MigrationDir>, description: &str, sql: String, now: SystemTime) -> Result<NewMigration> {
+/// next check reports it instead of hashing it unseen. `lock` is the lock `existing` was read
+/// under (`None` for a missing directory). Without one the directory is created if needed, locked
+/// and read again here, and the write is refused with [`Error::MigrationDirChanged`] when it holds
+/// anything other than `existing` (`None` is an empty directory): the caller planned against
+/// something else. The lock is held until the sum file is written, so concurrent runs get distinct
+/// versions.
+fn write_migration(
+    path: &Path,
+    lock: Option<pgmig_migrate::DirLock>,
+    existing: Option<MigrationDir>,
+    description: &str,
+    sql: String,
+    now: SystemTime,
+) -> Result<NewMigration> {
+    let (_lock, existing) = match lock {
+        Some(l) => (l, existing),
+        None => {
+            std::fs::create_dir_all(path).map_err(|source| Error::Io { path: path.to_owned(), source })?;
+            let lock = pgmig_migrate::DirLock::acquire(path)?;
+            let fresh = open_checked(path)?;
+            let planned = existing.as_ref().map(|d| d.files()).unwrap_or_default();
+            if fresh.files() != planned {
+                return Err(Error::MigrationDirChanged { path: path.to_owned() });
+            }
+            (lock, existing)
+        }
+    };
     let files = existing.map(|d| d.files().to_vec()).unwrap_or_default();
     let version = pgmig_migrate::next_version(files.last().map(|f| f.version.as_str()), now);
     let name = format!("{version}_{description}.sql");
-    std::fs::create_dir_all(path).map_err(|source| Error::Io { path: path.to_owned(), source })?;
     let file = path.join(&name);
-    let io = |source| Error::Io { path: file.clone(), source };
-    {
-        use std::io::Write as _;
-        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&file).map_err(io)?;
-        f.write_all(sql.as_bytes()).map_err(io)?;
+    if files.iter().any(|f| pgmig_migrate::compare_versions(&f.version, &version).is_eq()) {
+        return Err(pgmig_migrate::Error::Exists { path: file }.into());
     }
+    pgmig_migrate::write_new(&file, sql.as_bytes())?;
     let new = pgmig_migrate::File::new(&name, sql).map_err(|reason| pgmig_migrate::Error::Name { path: file.clone(), reason })?;
     let mut all = files;
     all.push(new);
@@ -598,7 +651,7 @@ pub fn migrate_baseline(dir: &Path, name: &str, target: &str, opts: &Options) ->
 fn migrate_baseline_at(dir: &Path, name: &str, target: &str, opts: &Options, now: SystemTime) -> Result<NewMigration> {
     opts.validate()?;
     let description = description(name)?;
-    let existing = if dir.exists() { Some(open_checked(dir)?) } else { None };
+    let (lock, existing) = open_locked(dir)?;
     if let Some(d) = existing.as_ref().filter(|d| !d.files().is_empty()) {
         return Err(Error::Options(format!(
             "{} already holds {} migration(s); a baseline must be the directory's first file (a fresh database replays every file in order)",
@@ -610,7 +663,7 @@ fn migrate_baseline_at(dir: &Path, name: &str, target: &str, opts: &Options, now
     let model = opts.managed(&inspect(&mut conn)?);
     drop(conn);
     let plan = plan_with(&diff(&opts.empty_database(), &model), &PlanOptions::default())?;
-    write_migration(dir, existing, &description, plan.to_sql(), now)
+    write_migration(dir, lock, existing, &description, plan.to_sql(), now)
 }
 
 /// Reject any `-- pgmig:import` in a migration, file-level or on a statement: migrations are
@@ -812,6 +865,117 @@ mod tests {
         assert!(apply_message(&None, "COMMIT", &server, &0).contains("rolled back; nothing was committed"));
         assert!(apply_message(&None, "BEGIN", &lost, &1).contains("did not start; 1 earlier batch was committed"));
         assert!(apply_message(&Some(2), "SELECT 1", &server, &0).starts_with("statement 3 failed: SELECT 1"));
+    }
+
+    #[test]
+    fn concurrent_migrate_new_gets_distinct_versions() {
+        let dir = std::env::temp_dir().join(format!("pgmig-concurrent-new-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_795_689_000);
+        let barrier = std::sync::Barrier::new(8);
+        let results: Vec<Result<NewMigration>> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8)
+                .map(|i| {
+                    let (dir, barrier) = (&dir, &barrier);
+                    s.spawn(move || {
+                        barrier.wait();
+                        migrate_new_at(dir, &format!("m{i}"), now)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().expect("thread")).collect()
+        });
+        let mut versions: Vec<String> = results.into_iter().map(|r| r.expect("migrate new").version).collect();
+        versions.sort();
+        versions.dedup();
+        assert_eq!(versions.len(), 8);
+        let opened = MigrationDir::open(&dir).expect("open");
+        assert_eq!(opened.files().len(), 8);
+        pgmig_migrate::validate(&opened).expect("sum matches");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_migrate_new_in_an_existing_directory() {
+        let dir = std::env::temp_dir().join(format!("pgmig-concurrent-existing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(dir.join("20200101000000_first.sql"), "SELECT 1;\n").expect("file");
+        migrate_hash(&dir).expect("hash");
+        let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_795_689_000);
+        let barrier = std::sync::Barrier::new(8);
+        let results: Vec<Result<NewMigration>> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8)
+                .map(|i| {
+                    let (dir, barrier) = (&dir, &barrier);
+                    s.spawn(move || {
+                        barrier.wait();
+                        migrate_new_at(dir, &format!("m{i}"), now)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().expect("thread")).collect()
+        });
+        let mut versions: Vec<String> = results.into_iter().map(|r| r.expect("migrate new").version).collect();
+        versions.sort();
+        versions.dedup();
+        assert_eq!(versions.len(), 8);
+        let opened = MigrationDir::open(&dir).expect("open");
+        assert_eq!(opened.files().len(), 9);
+        pgmig_migrate::validate(&opened).expect("sum matches");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_migration_without_a_lock_refuses_a_changed_directory() {
+        let dir = std::env::temp_dir().join(format!("pgmig-changed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_795_689_000);
+        // Planned against a missing directory; another run wrote a file meanwhile.
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(dir.join("20200101000000_other.sql"), "SELECT 1;\n").expect("file");
+        migrate_hash(&dir).expect("hash");
+        let err = write_migration(&dir, None, None, "mine", String::new(), now).expect_err("changed");
+        assert!(matches!(err, Error::MigrationDirChanged { .. }), "{err}");
+        assert!(err.to_string().contains("changed while planning"), "{err}");
+        // Planned against one file; another appeared.
+        std::fs::remove_file(dir.join("20200101000000_other.sql")).expect("rm");
+        std::fs::write(dir.join("20200101000000_a.sql"), "SELECT 1;\n").expect("a");
+        migrate_hash(&dir).expect("hash");
+        let planned = MigrationDir::open(&dir).expect("open");
+        std::fs::write(dir.join("20200102000000_b.sql"), "SELECT 2;\n").expect("b");
+        migrate_hash(&dir).expect("hash");
+        let err = write_migration(&dir, None, Some(planned), "mine", String::new(), now).expect_err("changed");
+        assert!(matches!(err, Error::MigrationDirChanged { .. }), "{err}");
+        // Unchanged: written.
+        migrate_hash(&dir).expect("hash");
+        let planned = MigrationDir::open(&dir).expect("open");
+        write_migration(&dir, None, Some(planned), "mine", String::new(), now).expect("written");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_locked_works_in_a_read_only_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("pgmig-readonly-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(dir.join("20200101000000_a.sql"), "SELECT 1;\n").expect("a");
+        migrate_hash(&dir).expect("hash");
+        // `migrate diff` and friends only read: the lock file need not exist.
+        std::fs::remove_file(dir.join(pgmig_migrate::LOCK_FILE)).expect("rm lock");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+        let root = std::fs::write(dir.join("probe"), "").is_ok();
+        if !root {
+            let (lock, existing) = open_locked(&dir).expect("open_locked");
+            assert!(lock.is_none());
+            assert_eq!(existing.expect("dir").files().len(), 1);
+            let err = write_migration(&dir, None, open_locked(&dir).expect("open").1, "x", String::new(), SystemTime::now());
+            assert!(err.is_err());
+        }
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
