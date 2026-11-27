@@ -5,6 +5,7 @@ mod casts;
 mod clean;
 mod concurrent_indexes;
 mod corpus;
+mod drift;
 mod filters;
 mod fingerprint;
 mod import;
