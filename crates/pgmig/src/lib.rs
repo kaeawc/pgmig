@@ -235,9 +235,15 @@ pub enum Error {
     /// `schema apply --plan`: the target's managed schema is not what the plan was made from.
     #[error(
         "the plan is stale: it was made from a schema with fingerprint {expected}, but the target's managed schema now has {actual}; \
-         nothing was applied; plan again to review what would change now"
+         nothing was applied; plan again to review what would change now{note}"
     )]
-    PlanStale { expected: String, actual: String },
+    PlanStale {
+        expected: String,
+        actual: String,
+        /// Empty, or why the fingerprint may differ without the schema changing: the plan was made
+        /// by another version of pgmig.
+        note: String,
+    },
     /// `schema apply --plan`: the plan was applied, and the target's managed schema is not the one
     /// it was planned to make.
     #[error(

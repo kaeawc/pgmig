@@ -123,7 +123,11 @@ reviewing).
 `pgmig schema apply --url <db> --plan plan.json` runs it only if the database still matches. It
 reads the file, fingerprints the database's managed objects under the file's own options and, when
 that is not `from`, stops with a `plan_stale` error naming both fingerprints and applies nothing;
-a change outside the planned scope (another schema, an excluded table) does not make a plan stale.
+a change outside the planned scope (another schema, an excluded table) does not make a plan stale,
+and is not checked either: a plan that needs an object outside the scope (a foreign key to an
+excluded table) can still fail part way when that object changed. `options` itself is not covered
+by these checks, and a plan made by another version of pgmig is refused (its fingerprints or SQL may
+differ) with a note saying to plan again with this version.
 It also refuses a file whose `sql` is not the script of its `plan` (`saved_plan`), so the SQL that
 was reviewed is the SQL that runs. Otherwise it shows the SQL and asks as `schema apply` does
 (`--auto-approve`, `--dry-run`, `--exit-code`, `--format json`, no prompt without a terminal), runs

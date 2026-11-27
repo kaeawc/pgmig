@@ -28,7 +28,7 @@ pub const FORMAT: u32 = 1;
 pub struct SavedPlan {
     /// Always [`FORMAT`] for a file this version writes.
     pub format: u32,
-    /// The version of pgmig that wrote the file. Informational.
+    /// The version of pgmig that wrote the file. A refusal by another version says so.
     pub pgmig_version: String,
     /// The fingerprint ([`pgmig_model::fingerprint`]) of the target's managed objects when planned.
     pub from: String,
@@ -83,11 +83,23 @@ impl SavedPlan {
             return Err(Error::SavedPlan(format!("format {} is not supported (this pgmig reads format {FORMAT})", self.format)));
         }
         if self.sql != self.plan.to_sql() {
-            return Err(Error::SavedPlan(
-                "`sql` is not the SQL of `plan`: the file was edited, and what is shown would not be what runs".into(),
-            ));
+            return Err(Error::SavedPlan(format!(
+                "`sql` is not the SQL of `plan`: the file was edited, and what is shown would not be what runs{}",
+                self.version_note()
+            )));
         }
         Ok(())
+    }
+
+    /// When another version of pgmig wrote the file, a note saying so: that version may print SQL or
+    /// fingerprint a schema differently, so a refusal is no sign the file or the target changed.
+    fn version_note(&self) -> String {
+        let this = env!("CARGO_PKG_VERSION");
+        if self.pgmig_version == this {
+            String::new()
+        } else {
+            format!(" (the plan was made with pgmig {}, this is pgmig {this}: plan again with this version)", self.pgmig_version)
+        }
     }
 }
 
@@ -123,7 +135,7 @@ pub fn check_saved(target: &str, saved: &SavedPlan) -> Result<()> {
     saved.options.validate()?;
     let actual = target_fingerprint(target, &saved.options)?;
     if actual != saved.from {
-        return Err(Error::PlanStale { expected: saved.from.clone(), actual });
+        return Err(Error::PlanStale { expected: saved.from.clone(), actual, note: saved.version_note() });
     }
     Ok(())
 }
