@@ -234,7 +234,15 @@ fn api_reports_the_file_written() {
     let t = Tmp::new();
     let (spec, _db) = shadow();
     let to = t.desired(SCHEMA);
-    let req = api::MigrateDiffRequest { dir: t.dir(), name: "init".into(), to, shadow: spec, options: Options::default(), editor: None };
+    let req = api::MigrateDiffRequest {
+        dir: t.dir(),
+        name: "init".into(),
+        to,
+        shadow: spec,
+        options: Options::default(),
+        editor: None,
+        verify: false,
+    };
     let res = api::migrate_diff(&req).expect("diff");
     let file = res.file.clone().expect("written");
     assert_eq!(std::fs::read_to_string(&file).expect("read"), res.sql);

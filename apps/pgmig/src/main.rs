@@ -33,7 +33,7 @@ diff`), `include`, `exclude`, `schema`,
 `format`, and the `migrate apply` flags under `[migrations]`: `dir`, `tx_mode`, `exec_order`,
 `lock_name`, `lock_timeout`, `before_sql`, `after_sql`. `[migrations] revisions_schema` (default
 `pgmig`) names the schema of the revisions table; pgmig never manages that schema. `[diff] skip`
-is --skip. `[env.NAME]` sections, selected with --env NAME,
+is --skip, `[diff] verify = true` is --verify. `[env.NAME]` sections, selected with --env NAME,
 override the top level. A flag wins over both. `${KEY}` in a value is replaced by --var KEY=VALUE,
 or else by the environment variable KEY; `$${` is a literal `${`.";
 
@@ -109,6 +109,8 @@ enum MigrateCommand {
         /// --format json.
         #[arg(long)]
         edit: bool,
+        #[command(flatten)]
+        verify: VerifyArg,
         #[command(flatten)]
         format: FormatArg,
     },
@@ -457,6 +459,8 @@ enum SchemaCommand {
         #[arg(long)]
         edit: bool,
         #[command(flatten)]
+        verify: VerifyArg,
+        #[command(flatten)]
         format: FormatArg,
         /// With --dry-run, exit with status 3 when there are changes.
         #[arg(long, requires = "dry_run")]
@@ -576,6 +580,35 @@ impl SkipArg {
             self.skip
         };
         Ok(options)
+    }
+}
+
+#[derive(clap::Args)]
+struct VerifyArg {
+    /// Check the plan first (with --edit, as edited): apply it in the shadow database to a copy of
+    /// the current state and compare the result with the desired state (changes --skip leaves out
+    /// may remain). A failure stops before the target is changed or a migration written (config:
+    /// `[diff] verify`). The copy is schema only, with no rows: failures that depend on data (SET NOT
+    /// NULL over NULLs, a unique index over duplicates, a USING cast) are not caught. `migrate diff`
+    /// replays the directory; `schema apply` rebuilds the copy from what pgmig models (tables, types,
+    /// sequences, constraints, indexes, comments), without extensions, functions or views.
+    /// Statements outside any schema (CREATE ROLE, ALTER SYSTEM, ...) in an edited plan or a
+    /// migration really run, on the shadow's server.
+    #[arg(long, overrides_with = "no_verify")]
+    verify: bool,
+    /// Do not check the plan, whatever `[diff] verify` says.
+    #[arg(long)]
+    no_verify: bool,
+}
+
+impl VerifyArg {
+    /// The flags, or where neither is given, `[diff] verify`.
+    fn on(self, settings: &Settings) -> bool {
+        match (self.verify, self.no_verify) {
+            (true, _) => true,
+            (_, true) => false,
+            _ => settings.diff_verify.unwrap_or(false),
+        }
     }
 }
 
@@ -817,7 +850,7 @@ fn run(cli: Cli, loaded: &Loaded, format: Format) -> anyhow::Result<ExitCode> {
     };
     let s = settings;
     match command {
-        SchemaCommand::Apply { url, to, shadow, scope, skip, dry_run, auto_approve, edit, format: _, exit_code } => {
+        SchemaCommand::Apply { url, to, shadow, scope, skip, dry_run, auto_approve, edit, verify, format: _, exit_code } => {
             if edit {
                 check_edit(format)?;
             }
@@ -832,8 +865,9 @@ fn run(cli: Cli, loaded: &Loaded, format: Format) -> anyhow::Result<ExitCode> {
                 desired: Source::parse(&need(to, s.to.clone(), "--to", "to")?),
                 shadow: shadow.spec(s),
                 options: skip.add_to(scope.options(s)?, s)?,
+                verify: false,
             };
-            let flags = ApplyFlags { dry_run, auto_approve, edit, exit_code };
+            let flags = ApplyFlags { dry_run, auto_approve, edit, verify: verify.on(s), exit_code };
             return schema_apply(req, &shown, flags, format);
         }
         SchemaCommand::Clean { url, scope, dry_run, auto_approve, format: _ } => {
@@ -918,7 +952,7 @@ fn migrate(command: MigrateCommand, s: &Settings, format: Format) -> anyhow::Res
                 Format::Json => print_json(&res)?,
             }
         }
-        MigrateCommand::Diff { name, dir: d, to, shadow, scope, skip, edit, format: _ } => {
+        MigrateCommand::Diff { name, dir: d, to, shadow, scope, skip, edit, verify, format: _ } => {
             if edit {
                 check_edit(format)?;
             }
@@ -929,23 +963,9 @@ fn migrate(command: MigrateCommand, s: &Settings, format: Format) -> anyhow::Res
                 shadow: shadow.spec(s),
                 options: skip.add_to(scope.options(s)?, s)?,
                 editor: edit.then(editor),
+                verify: verify.on(s),
             };
-            let res = api::migrate_diff(&req)?;
-            if format == Format::Text {
-                print_skipped(&res.skipped);
-            }
-            match format {
-                Format::Text => match &res.file {
-                    Some(file) if res.edited => eprintln!("wrote {} (as edited)", file.display()),
-                    Some(file) => {
-                        let n = res.plan.statements.len();
-                        eprintln!("wrote {} ({n} statement{})", file.display(), if n == 1 { "" } else { "s" });
-                    }
-                    None if res.edited => eprintln!("the edited migration has no statements: nothing written"),
-                    None => eprintln!("no changes"),
-                },
-                Format::Json => print_json(&res)?,
-            }
+            migrate_diff(&req, format)?;
         }
         MigrateCommand::Baseline { name, url, dir: d, scope, format: _ } => {
             let req = api::MigrateBaselineRequest {
@@ -1066,6 +1086,28 @@ fn migrate(command: MigrateCommand, s: &Settings, format: Format) -> anyhow::Res
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `migrate diff`: what was skipped, verified and written on stderr, or the response as JSON.
+fn migrate_diff(req: &api::MigrateDiffRequest, format: Format) -> anyhow::Result<()> {
+    let res = api::migrate_diff(req)?;
+    if format == Format::Json {
+        return print_json(&res);
+    }
+    print_skipped(&res.skipped);
+    if req.verify && res.file.is_some() {
+        eprintln!("verified: in the shadow database the migration makes the desired state");
+    }
+    match &res.file {
+        Some(file) if res.edited => eprintln!("wrote {} (as edited)", file.display()),
+        Some(file) => {
+            let n = res.plan.statements.len();
+            eprintln!("wrote {} ({n} statement{})", file.display(), if n == 1 { "" } else { "s" });
+        }
+        None if res.edited => eprintln!("the edited migration has no statements: nothing written"),
+        None => eprintln!("no changes"),
+    }
+    Ok(())
 }
 
 /// What `migrate apply --format json` prints: the target and the report.
@@ -1233,14 +1275,17 @@ struct ApplyFlags {
     dry_run: bool,
     auto_approve: bool,
     edit: bool,
+    verify: bool,
     exit_code: bool,
 }
 
 /// Shows the plan (with --edit, as edited), asks (unless told not to), then applies it. In JSON
 /// mode it never asks and prints one document at the end.
 fn schema_apply(req: api::PlanApplyRequest, target: &Target, flags: ApplyFlags, format: Format) -> anyhow::Result<ExitCode> {
-    let ApplyFlags { dry_run, auto_approve, edit, exit_code } = flags;
+    let ApplyFlags { dry_run, auto_approve, edit, verify, exit_code } = flags;
     let json = format == Format::Json;
+    // An edited plan is checked once edited, below; otherwise as it is planned.
+    let req = api::PlanApplyRequest { verify: verify && !edit, ..req };
     let mut res = api::schema_plan_apply(&req)?;
     if !json {
         print_skipped(&res.skipped);
@@ -1262,6 +1307,18 @@ fn schema_apply(req: api::PlanApplyRequest, target: &Target, flags: ApplyFlags, 
         }
         res.sql = edited.plan.to_sql();
         res.plan = edited.plan;
+        if verify {
+            api::schema_verify(&api::VerifyRequest {
+                target: req.target.clone(),
+                desired: req.desired.clone(),
+                plan: res.plan.clone(),
+                shadow: req.shadow.clone(),
+                options: req.options.clone(),
+            })?;
+        }
+    }
+    if verify && !json {
+        eprintln!("verified: in the shadow database the plan makes the desired state");
     }
     let dry_code = if dry_run && exit_code { ExitCode::from(CHANGES) } else { ExitCode::SUCCESS };
     if !json {

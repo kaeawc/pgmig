@@ -19,6 +19,7 @@ pub mod filter;
 pub mod migrate_apply;
 pub mod migrate_maintain;
 pub mod migrate_status;
+pub mod verify;
 
 pub use clean::{Kept, SchemaClean, clean_confirmed, clean_desired, schema_plan_clean};
 pub use edit::{EDITED_PLAN, edit_sql, plan_from_sql};
@@ -46,6 +47,7 @@ pub use pgmig_migrate::{Dir as MigrationDir, SUM_FILE, SumFile, SumLine, Validat
 pub use pgmig_model::{Model, fingerprint};
 pub use pgmig_plan::{Cause as SkipCause, Plan, PlanOptions, Skipped, plan, plan_with};
 pub use pgmig_shadow::{PUBLIC_COMMENT as PUBLIC_SCHEMA_COMMENT_SQL, Shadow};
+pub use verify::{Current, verify_migration_sql, verify_plan};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -189,6 +191,33 @@ pub enum Error {
     /// `migrate set` would drop or overwrite history that records a complete migration.
     #[error("{table}: `migrate set {version}` would {}; pass --force to do it anyway", .reasons.join("; "))]
     NeedsForce { table: String, version: String, reasons: Vec<String> },
+    /// `--verify`: the plan, applied in a shadow database to a copy of the current state, leaves
+    /// changes to make (other than those the policy skips).
+    #[error("{}", verify::remaining_message(.remaining))]
+    VerifyFailed {
+        /// What is left between the result and the desired state, as the diff finds it.
+        remaining: Vec<Change>,
+    },
+    /// `--verify`: a statement of the plan failed in the shadow database (its transaction was
+    /// rolled back there; the target was not changed and no migration was written).
+    #[error("{}", verify::statement_message(.statement_index, .statement, .source))]
+    VerifyStatement {
+        /// 0-based index into the plan's statements (or the migration's); `None` for `BEGIN` or
+        /// `COMMIT`.
+        statement_index: Option<usize>,
+        statement: String,
+        /// The server's error, verbatim with its SQLSTATE.
+        source: pgmig_conn::Error,
+    },
+    /// `--verify`: the current state could not be rebuilt from pgmig's model in the shadow database
+    /// ([`Current::Model`]), so the plan was not checked.
+    #[error(
+        "verification could not start: recreating the current state in the shadow database failed at: {statement}\n{source}\n\
+         the copy is rebuilt from what pgmig models (tables, enums, sequences, domains, composite types, constraints, indexes, \
+         comments); objects outside that (extensions, functions, views, ...) are not copied, so a statement that needs one fails\n\
+         the target was not changed"
+    )]
+    VerifySetup { statement: String, source: pgmig_conn::Error },
 }
 
 fn apply_message(index: &Option<usize>, statement: &str, source: &pgmig_conn::Error, committed: &usize) -> String {
@@ -479,7 +508,7 @@ pub const EDITED_MIGRATION: &str = "edited migration";
 /// [`schema_plan_apply`]). The version is the UTC time, or one more than the newest file's when
 /// that is not greater ([`pgmig_migrate::next_version`]); `name` is sanitized to `[a-z0-9_]`.
 pub fn migrate_diff(dir: &Path, name: &str, to: &Source, shadow: &ShadowSpec, opts: &Options) -> Result<MigrateDiff> {
-    migrate_diff_at(dir, name, to, shadow, opts, None, SystemTime::now())
+    migrate_diff_at(dir, name, to, shadow, opts, None, false, SystemTime::now())
 }
 
 /// [`migrate_diff`], opening the plan in `editor` ([`edit_sql`]) before it is written: the file
@@ -494,9 +523,27 @@ pub fn migrate_diff_edited(
     opts: &Options,
     editor: &[String],
 ) -> Result<MigrateDiff> {
-    migrate_diff_at(dir, name, to, shadow, opts, Some(editor), SystemTime::now())
+    migrate_diff_at(dir, name, to, shadow, opts, Some(editor), false, SystemTime::now())
 }
 
+/// [`migrate_diff`] ([`migrate_diff_edited`] with an `editor`), and with `verify`, `--verify`:
+/// before the file is written, what it holds is applied in a fresh shadow database to the directory
+/// replayed again ([`Current::Migrations`]) and checked to make the desired state but for the changes the policy skips (the plan
+/// with [`verify_plan`]; an edited file with [`verify_migration_sql`], as `migrate apply` runs it).
+/// On failure nothing is written.
+pub fn migrate_diff_with(
+    dir: &Path,
+    name: &str,
+    to: &Source,
+    shadow: &ShadowSpec,
+    opts: &Options,
+    editor: Option<&[String]>,
+    verify: bool,
+) -> Result<MigrateDiff> {
+    migrate_diff_at(dir, name, to, shadow, opts, editor, verify, SystemTime::now())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn migrate_diff_at(
     dir: &Path,
     name: &str,
@@ -504,6 +551,7 @@ fn migrate_diff_at(
     shadow: &ShadowSpec,
     opts: &Options,
     editor: Option<&[String]>,
+    verify: bool,
     now: SystemTime,
 ) -> Result<MigrateDiff> {
     opts.validate()?;
@@ -516,10 +564,7 @@ fn migrate_diff_at(
     // The replay's shadow is wiped (dropped) before `to`'s opens: a real Postgres shadow must start
     // empty.
     let a = {
-        let mut sh = match &existing {
-            Some(d) => replay(d, shadow)?,
-            None => shadow.open()?,
-        };
+        let mut sh = replay_or_empty(existing.as_ref(), shadow)?;
         opts.managed(&inspect(sh.conn())?)
     };
     let (b, mut loaded) = open_model(to, shadow)?;
@@ -534,6 +579,16 @@ fn migrate_diff_at(
     if let (Some(editor), true) = (editor, edited) {
         sql = edit_sql(&sql, editor)?;
         statements = edit::check_migration_sql(&sql, EDITED_MIGRATION)?;
+    }
+    // `to`'s shadow is gone (dropped above): verification opens its own and replays the directory
+    // into it again, so the copy holds what the files made, unmodelled objects included.
+    if verify && statements > 0 {
+        let current = Current::Migrations(existing.as_ref());
+        if edited {
+            verify_migration_sql(current, &sql, EDITED_MIGRATION, &b, shadow, opts)?;
+        } else {
+            verify_plan(current, &plan, &b, shadow, opts)?;
+        }
     }
     let written = if statements == 0 { None } else { Some(write_migration(dir, lock, existing, &description, sql.clone(), now)?) };
     Ok(MigrateDiff { written, changes, skipped, plan, sql, edited })
@@ -693,6 +748,14 @@ fn replay(dir: &MigrationDir, shadow: &ShadowSpec) -> Result<Shadow> {
     Ok(sh)
 }
 
+/// [`replay`] of `dir`, or a fresh shadow database for a directory that does not exist yet.
+fn replay_or_empty(dir: Option<&MigrationDir>, shadow: &ShadowSpec) -> Result<Shadow> {
+    match dir {
+        Some(d) => replay(d, shadow),
+        None => shadow.open(),
+    }
+}
+
 /// `schema validate`: load SQL files into the shadow database and report the first error.
 /// A database source has nothing to load and is rejected.
 pub fn schema_validate(source: &Source, shadow: &ShadowSpec) -> Result<()> {
@@ -716,6 +779,11 @@ struct Diffed {
     /// The changes the policy left out.
     skipped: Vec<Skipped>,
     plan: Plan,
+    /// `from`'s model, all of it but the revisions schema: what `--verify` copies
+    /// ([`Current::Model`]).
+    current: Model,
+    /// `to`'s model, as the options manage it: what `--verify` checks the result against.
+    to: Model,
 }
 
 /// The changes that turn `from` into `to` for the objects `opts` manages, under its policy, and
@@ -723,12 +791,13 @@ struct Diffed {
 fn diff_sources(from: &Source, to: &Source, shadow: &ShadowSpec, opts: &Options, names: &PlanOptions) -> Result<Diffed> {
     opts.validate()?;
     // `from`'s shadow is wiped before `to`'s opens: a real Postgres shadow must start empty.
-    let a = opts.managed(&load_model(from, shadow)?);
+    let current = without_schema(&load_model(from, shadow)?, &opts.revisions_schema);
+    let a = opts.managed(&current);
     let (b, mut loaded) = open_model(to, shadow)?;
     let b = opts.managed(&b);
     let (changes, skipped) = opts.apply_policy(&diff_with_casts(&a, &b, loaded.conn()), names);
     let plan = plan_with(&changes, names)?;
-    Ok(Diffed { changes, skipped, plan })
+    Ok(Diffed { changes, skipped, plan, current, to: b })
 }
 
 /// `diff(a, b)`, with each type change that has no assignment cast converting `USING` an explicit
@@ -791,6 +860,19 @@ pub fn schema_plan_apply(target: &str, desired: &Source, shadow: &ShadowSpec, op
 fn plan_apply_changes(target: &str, desired: &Source, shadow: &ShadowSpec, opts: &Options) -> Result<Diffed> {
     opts.validate()?;
     diff_sources(&Source::Database(target.to_owned()), desired, shadow, opts, &PlanOptions::default())
+}
+
+/// `schema apply --verify`: check that `plan` (as planned or edited), applied in a fresh shadow
+/// database to a copy of the database at `target`, makes it `desired` but for the changes the policy
+/// skips ([`verify_plan`]). The copy is rebuilt from the target's model, all of it but the
+/// revisions schema ([`Current::Model`]). `target` is only read.
+pub fn schema_verify(target: &str, desired: &Source, plan: &Plan, shadow: &ShadowSpec, opts: &Options) -> Result<()> {
+    opts.validate()?;
+    let mut conn = Conn::connect(target)?;
+    let current = without_schema(&inspect(&mut conn)?, &opts.revisions_schema);
+    drop(conn);
+    let to = opts.managed(&load_model(desired, shadow)?);
+    verify_plan(Current::Model(&current), plan, &to, shadow, opts)
 }
 
 /// What [`apply`] did.

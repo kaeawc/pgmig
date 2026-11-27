@@ -112,6 +112,11 @@ pub struct PlanApplyRequest {
     pub shadow: ShadowSpec,
     #[serde(default)]
     pub options: Options,
+    /// Check the plan before returning it ([`crate::verify_plan`]): applied in a fresh shadow
+    /// database to a copy of the target, it must make the desired state but for the changes the
+    /// policy skips. A failure is a `verify_failed` error.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub verify: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -186,6 +191,21 @@ pub struct ApplyRequest {
 }
 
 pub type ApplyResponse = ApplyReport;
+
+/// `schema apply --verify` of a plan the caller has (an edited one, say): applied in a fresh shadow
+/// database to a copy of `target` (only read), it must make `desired` but for the changes the
+/// policy skips ([`crate::schema_verify`]). A failure is a `verify_failed` error.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifyRequest {
+    pub target: String,
+    pub desired: Source,
+    pub plan: Plan,
+    #[serde(default)]
+    pub shadow: ShadowSpec,
+    #[serde(default)]
+    pub options: Options,
+}
 
 /// `migrate hash`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -273,6 +293,11 @@ pub struct MigrateDiffRequest {
     /// needs a terminal: null (the default) never runs one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub editor: Option<Vec<String>>,
+    /// Check the file before writing it ([`crate::migrate_diff_with`]): applied in a fresh shadow
+    /// database to the replayed directory, it must make the desired state but for the changes the
+    /// policy skips. On failure (a `verify_failed` error) nothing is written.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub verify: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -576,6 +601,9 @@ pub enum ErrorCode {
     DirtyDatabase,
     /// `migrate set` would drop or overwrite a complete migration's history without `force`.
     NeedsForce,
+    /// `verify`: the plan, applied in a shadow database to a copy of the current state, failed or
+    /// did not make the desired state; the target was not changed and no migration was written. `verify` says which.
+    VerifyFailed,
 }
 
 impl ErrorCode {
@@ -625,6 +653,7 @@ impl ErrorCode {
             ErrorCode::Editor => "editor",
             ErrorCode::DirtyDatabase => "dirty_database",
             ErrorCode::NeedsForce => "needs_force",
+            ErrorCode::VerifyFailed => "verify_failed",
         }
     }
 }
@@ -648,6 +677,29 @@ pub struct ApiError {
     /// Set for `migration` failures; left out otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub migration: Option<Box<MigrationFailure>>,
+    /// Set for `verify_failed`; left out otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify: Option<Box<VerifyFailure>>,
+}
+
+/// Why verification failed: changes left to make, or a statement that failed in the shadow
+/// database (`statement`, with `sqlstate` on the error), or the current state could not be
+/// recreated there (`setup`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifyFailure {
+    /// What is left between the result and the desired state; empty when a statement failed.
+    #[serde(default)]
+    pub remaining: Vec<Change>,
+    /// 0-based index of the failing statement in the plan (or the migration); null for `BEGIN`,
+    /// `COMMIT`, and when no statement failed.
+    #[serde(default)]
+    pub statement_index: Option<usize>,
+    /// The failing statement; null when none failed.
+    #[serde(default)]
+    pub statement: Option<String>,
+    /// Whether the failure was in recreating the current state, before the plan ran.
+    #[serde(default)]
+    pub setup: bool,
 }
 
 /// Where a `migrate apply` stopped and what became of the work.
@@ -695,7 +747,17 @@ pub type Diagnostic = ApiError;
 
 impl ApiError {
     fn new(code: ErrorCode, e: &impl std::fmt::Display) -> ApiError {
-        ApiError { code, message: e.to_string(), sqlstate: None, file: None, line: None, col: None, apply: None, migration: None }
+        ApiError {
+            code,
+            message: e.to_string(),
+            sqlstate: None,
+            file: None,
+            line: None,
+            col: None,
+            apply: None,
+            migration: None,
+            verify: None,
+        }
     }
 
     /// A command line that cannot be run as given.
@@ -709,6 +771,7 @@ impl ApiError {
             col: None,
             apply: None,
             migration: None,
+            verify: None,
         }
     }
 
@@ -755,6 +818,32 @@ impl From<&Error> for ApiError {
             Error::Editor { .. } => err(ErrorCode::Editor),
             Error::DirtyDatabase { .. } => err(ErrorCode::DirtyDatabase),
             Error::NeedsForce { .. } => err(ErrorCode::NeedsForce),
+            Error::VerifyFailed { remaining } => {
+                let mut e = err(ErrorCode::VerifyFailed);
+                e.verify =
+                    Some(Box::new(VerifyFailure { remaining: remaining.clone(), statement_index: None, statement: None, setup: false }));
+                e
+            }
+            Error::VerifyStatement { statement_index, statement, source } => {
+                let mut e = err(ErrorCode::VerifyFailed).sqlstate(source);
+                e.verify = Some(Box::new(VerifyFailure {
+                    remaining: Vec::new(),
+                    statement_index: *statement_index,
+                    statement: Some(statement.clone()),
+                    setup: false,
+                }));
+                e
+            }
+            Error::VerifySetup { statement, source } => {
+                let mut e = err(ErrorCode::VerifyFailed).sqlstate(source);
+                e.verify = Some(Box::new(VerifyFailure {
+                    remaining: Vec::new(),
+                    statement_index: None,
+                    statement: Some(statement.clone()),
+                    setup: true,
+                }));
+                e
+            }
             Error::Checksum(c) => {
                 let code = match c {
                     ChecksumError::MissingSum { .. } => ErrorCode::SumMissing,
@@ -942,7 +1031,10 @@ fn is_diagnostic(e: &Error) -> bool {
         | Error::MigrationApplied { .. }
         | Error::Editor { .. }
         | Error::DirtyDatabase { .. }
-        | Error::NeedsForce { .. } => false,
+        | Error::NeedsForce { .. }
+        | Error::VerifyFailed { .. }
+        | Error::VerifyStatement { .. }
+        | Error::VerifySetup { .. } => false,
     }
 }
 
@@ -991,10 +1083,7 @@ pub fn migrate_validate(req: &MigrateValidateRequest) -> Result<MigrateValidateR
 
 /// [`crate::migrate_diff`].
 pub fn migrate_diff(req: &MigrateDiffRequest) -> Result<MigrateDiffResponse, ApiError> {
-    let res = match &req.editor {
-        Some(editor) => crate::migrate_diff_edited(&req.dir, &req.name, &req.to, &req.shadow, &req.options, editor)?,
-        None => crate::migrate_diff(&req.dir, &req.name, &req.to, &req.shadow, &req.options)?,
-    };
+    let res = crate::migrate_diff_with(&req.dir, &req.name, &req.to, &req.shadow, &req.options, req.editor.as_deref(), req.verify)?;
     let (file, version) = res.written.map(|w| (w.path, w.version)).unzip();
     Ok(MigrateDiffResponse { file, version, sql: res.sql, plan: res.plan, changes: res.changes, skipped: res.skipped, edited: res.edited })
 }
@@ -1062,6 +1151,9 @@ pub fn config_validate(req: &ConfigValidateRequest) -> Result<ConfigValidateResp
 /// [`crate::schema_plan_apply`].
 pub fn schema_plan_apply(req: &PlanApplyRequest) -> Result<PlanApplyResponse, ApiError> {
     let d = crate::plan_apply_changes(&req.target, &req.desired, &req.shadow, &req.options)?;
+    if req.verify {
+        crate::verify_plan(crate::Current::Model(&d.current), &d.plan, &d.to, &req.shadow, &req.options)?;
+    }
     Ok(PlanApplyResponse { sql: d.plan.to_sql(), plan: d.plan, changes: d.changes, skipped: d.skipped })
 }
 
@@ -1083,6 +1175,11 @@ pub fn schema_plan_clean(req: &CleanPlanRequest) -> Result<CleanPlanResponse, Ap
 pub fn edit_plan(req: &EditPlanRequest) -> Result<EditPlanResponse, ApiError> {
     let sql = crate::edit_sql(&req.plan.to_sql(), &req.editor)?;
     Ok(EditPlanResponse { plan: crate::plan_from_sql(&sql)?, sql })
+}
+
+/// [`crate::schema_verify`].
+pub fn schema_verify(req: &VerifyRequest) -> Result<(), ApiError> {
+    Ok(crate::schema_verify(&req.target, &req.desired, &req.plan, &req.shadow, &req.options)?)
 }
 
 /// [`crate::apply`].
@@ -1122,7 +1219,21 @@ mod tests {
         let req: FingerprintRequest = serde_json::from_str(r#"{"source":{"kind":"sql","data":"s.sql"}}"#).expect("request");
         assert_eq!((req.shadow, req.options), (ShadowSpec::Pgmem, Options::default()));
         round_trip(&ValidateRequest { source: sql.clone(), shadow: pg.clone() });
-        round_trip(&PlanApplyRequest { target: "host=localhost".into(), desired: sql, shadow: pg, options: options() });
+        round_trip(&PlanApplyRequest { target: "host=localhost".into(), desired: sql, shadow: pg, options: options(), verify: false });
+        round_trip(&PlanApplyRequest {
+            target: "t".into(),
+            desired: Source::Sql("s.sql".into()),
+            shadow: ShadowSpec::Pgmem,
+            options: Options::default(),
+            verify: true,
+        });
+        round_trip(&VerifyRequest {
+            target: "t".into(),
+            desired: Source::Sql("s.sql".into()),
+            plan: plan(),
+            shadow: ShadowSpec::Pgmem,
+            options: Options::default(),
+        });
         round_trip(&ApplyRequest { target: "host=localhost".into(), plan: plan() });
         round_trip(&CleanPlanRequest { target: "host=localhost".into(), options: options() });
         let req: CleanPlanRequest = serde_json::from_str(r#"{"target":"host=localhost"}"#).expect("request");
@@ -1138,8 +1249,9 @@ mod tests {
             shadow: pg_spec(),
             options: options(),
             editor: None,
+            verify: false,
         });
-        assert!(!json.contains("editor"), "{json}");
+        assert!(!json.contains("editor") && !json.contains("verify"), "{json}");
         round_trip(&MigrateDiffRequest {
             dir: "m".into(),
             name: "x".into(),
@@ -1147,6 +1259,7 @@ mod tests {
             shadow: ShadowSpec::Pgmem,
             options: Options::default(),
             editor: Some(vec!["code".into(), "-w".into()]),
+            verify: true,
         });
         round_trip(&EditPlanRequest { plan: plan(), editor: vec!["vi".into()] });
         assert!(json.contains(r#""to":{"kind":"migrations","data":"migrations"}"#), "{json}");
@@ -1225,6 +1338,7 @@ mod tests {
             col: Some(1),
             apply: None,
             migration: None,
+            verify: None,
         };
         round_trip(&ValidateResponse { diagnostics: vec![load.clone()] });
         round_trip(&MigrateValidateResponse { diagnostics: vec![load.clone()], replayed: false });

@@ -63,3 +63,25 @@ fn a_failing_statement_exits_non_zero_and_names_it() {
         "{err}"
     );
 }
+
+#[test]
+fn verify_checks_the_plan_before_applying() {
+    let (db, desired, (shadow, _keep)) = setup();
+    let args = ["schema", "apply", "--url", &db.conninfo, "--to", &desired.path(), "--shadow", &shadow, "--auto-approve"];
+    let out = pgmig(&[&args[..], &["--dry-run", "--verify"]].concat());
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(text(&out.stderr).starts_with("verified: in the shadow database the plan makes the desired state\n"), "{}", text(&out.stderr));
+    assert_eq!(columns(&db), "1");
+
+    // `[diff] verify` turns it on; --no-verify off.
+    let config = std::env::temp_dir().join(format!("pgmig_cli_verify_{}.toml", std::process::id()));
+    std::fs::write(&config, "[diff]\nverify = true\n").expect("write config");
+    let config_arg = config.to_string_lossy().into_owned();
+    let out = pgmig(&[&args[..], &["--config", &config_arg, "--no-verify", "--dry-run"]].concat());
+    assert!(out.status.success() && !text(&out.stderr).contains("verified"), "{}", text(&out.stderr));
+    let out = pgmig(&[&args[..], &["--config", &config_arg]].concat());
+    let _ = std::fs::remove_file(&config);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(text(&out.stderr).contains("verified:") && text(&out.stderr).contains("applied 1 statements"), "{}", text(&out.stderr));
+    assert_eq!(columns(&db), "2");
+}

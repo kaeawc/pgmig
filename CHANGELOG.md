@@ -8,6 +8,18 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
 
 ### Added
 
+- `--verify` on `schema apply` and `migrate diff` (or `[diff] verify = true`; `--no-verify`
+  overrides): the plan, or the edited SQL, first runs in the shadow database on a copy of the
+  current schema, and the result must equal the desired schema (changes the diff policy skips
+  aside). A failing statement or a remaining difference aborts before the target is changed or a
+  migration written; JSON errors carry code `verify_failed` and a `verify` object. The copy is
+  schema only (no rows), so failures that depend on data (`SET NOT NULL` over NULLs, a unique
+  index over duplicates, `USING` casts) are not caught. `migrate diff` replays the migration
+  directory for it; `schema apply` rebuilds it from what pgmig models (the whole target but the
+  revisions schema; extensions, functions and views are not copied). Statements outside any
+  schema (`CREATE ROLE`, `ALTER SYSTEM`, ...) in an edited plan or a migration really run, on the
+  shadow's server.
+
 - Domains and composite types: inspected (base type, collation, default, `NOT NULL`, named checks
   with `NOT VALID`, attributes, comments) and planned in dependency order with the tables, enums,
   domains and composites that use them: create, drop, `ALTER DOMAIN` defaults, `NOT NULL`, checks
