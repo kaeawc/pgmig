@@ -602,7 +602,7 @@ pub enum ErrorCode {
     /// `migrate set` would drop or overwrite a complete migration's history without `force`.
     NeedsForce,
     /// `verify`: the plan, applied in a shadow database to a copy of the current state, failed or
-    /// did not make the desired state; nothing was applied or written. `verify` says which.
+    /// did not make the desired state; the target was not changed and no migration was written. `verify` says which.
     VerifyFailed,
 }
 
@@ -1152,7 +1152,7 @@ pub fn config_validate(req: &ConfigValidateRequest) -> Result<ConfigValidateResp
 pub fn schema_plan_apply(req: &PlanApplyRequest) -> Result<PlanApplyResponse, ApiError> {
     let d = crate::plan_apply_changes(&req.target, &req.desired, &req.shadow, &req.options)?;
     if req.verify {
-        crate::verify_plan(&d.from, &d.plan, &d.to, &req.shadow, &req.options)?;
+        crate::verify_plan(crate::Current::Model(&d.current), &d.plan, &d.to, &req.shadow, &req.options)?;
     }
     Ok(PlanApplyResponse { sql: d.plan.to_sql(), plan: d.plan, changes: d.changes, skipped: d.skipped })
 }

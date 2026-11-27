@@ -1,18 +1,44 @@
 //! `--verify`: before a plan runs for real, apply it in a fresh shadow database to a copy of the
 //! current state and check that the result is the desired state.
 //!
-//! The copy is made the way `migrate baseline` writes a schema: the plan from a new database to the
-//! current state's model, for the objects the options manage. Then the plan under test runs as it
-//! would for real: a [`Plan`] batch by batch, each in its own transaction (as [`crate::apply`]); a
-//! migration file as `migrate apply` runs it, in one transaction committed at each
-//! `-- pgmig:commit`, or statement by statement with `-- pgmig:txmode none`. The result is
-//! inspected and diffed against the desired state. Changes the policy skips ([`Options::skip`])
-//! are expected to remain, with those that depend on them; any other change left is an error. The
-//! shadow is wiped (dropped) before returning, whatever the outcome.
+//! The copy is schema only: no rows. A change that fails or misbehaves only because of the data
+//! (`SET NOT NULL` over NULLs, a unique index over duplicates, a `USING` cast a value does not
+//! survive) is not caught. How the copy is made depends on the current state ([`Current`]):
+//!
+//! - A migration directory (`migrate diff`) is replayed, every file executed as written, so the
+//!   copy is faithful: extensions, functions, views and anything else the files create are there.
+//! - A live database (`schema apply`) can only be rebuilt from what pgmig models: the plan from a
+//!   new database to its model (all of it but the revisions schema, not only the managed part, so
+//!   a managed table's foreign key to an unmanaged one has its target). Objects pgmig does not model
+//!   (extensions, functions, views, ...) are not copied; a statement that needs one fails setup
+//!   ([`Error::VerifySetup`]).
+//!
+//! Then the plan under test runs as it would for real: a [`Plan`] batch by batch, each in its own
+//! transaction (as [`crate::apply`]); a migration file as `migrate apply` runs it, in one
+//! transaction committed at each `-- pgmig:commit`, or statement by statement with
+//! `-- pgmig:txmode none`. The result, as the options manage it, is inspected and diffed against
+//! the desired state. Changes the policy skips ([`Options::skip`]) are expected to remain, with
+//! those that depend on them; any other change left is an error. The shadow is wiped (dropped)
+//! before returning, whatever the outcome.
+//!
+//! Only the shadow database is changed, but statements that act outside any database
+//! (`CREATE ROLE`, `ALTER SYSTEM`, ...) in an edited plan or in a migration really run there, on
+//! the shadow's server: on a real Postgres shadow they take effect on that server.
 
 use std::path::PathBuf;
 
-use crate::{Change, Conn, Error, Model, Options, Plan, PlanOptions, Result, ShadowSpec, diff, inspect, plan_with};
+use crate::{Change, Conn, Error, MigrationDir, Model, Options, Plan, PlanOptions, Result, Shadow, ShadowSpec, diff, inspect, plan_with};
+
+/// The current state a plan under test starts from, copied into the shadow database.
+#[derive(Debug, Clone, Copy)]
+pub enum Current<'a> {
+    /// A live database's model, rebuilt from what pgmig models: all of it but the revisions
+    /// schema ([`crate::without_schema`]), not only what the options manage.
+    Model(&'a Model),
+    /// A migration directory, replayed file by file; `None` is a directory that does not exist
+    /// yet (an empty state).
+    Migrations(Option<&'a MigrationDir>),
+}
 
 /// Statements run together: in one transaction, or each committing on its own.
 struct Unit<'a> {
@@ -21,20 +47,20 @@ struct Unit<'a> {
     transaction: bool,
 }
 
-/// Check that `plan`, applied to `from` (the current state's model, as `opts` manages it),
-/// reaches `to` (the desired state's, likewise) but for the changes `opts` skips.
-pub fn verify_plan(from: &Model, plan: &Plan, to: &Model, shadow: &ShadowSpec, opts: &Options) -> Result<()> {
+/// Check that `plan`, applied to a copy of `current`, reaches `to` (the desired state's model, as
+/// `opts` manages it) but for the changes `opts` skips.
+pub fn verify_plan(current: Current, plan: &Plan, to: &Model, shadow: &ShadowSpec, opts: &Options) -> Result<()> {
     let units: Vec<Unit> = crate::batch_ranges(plan)
         .into_iter()
         .map(|r| Unit { statements: r.map(|i| (i, plan.statements[i].as_str())).collect(), transaction: true })
         .collect();
-    verify_units(from, &units, to, shadow, opts)
+    verify_units(current, &units, to, shadow, opts)
 }
 
 /// [`verify_plan`] for the text of a migration file (what `--edit` saved): split, and run as
 /// `migrate apply` runs a file, honouring its `-- pgmig:txmode` and `-- pgmig:commit` directives.
 /// Errors in the text name it `label`.
-pub fn verify_migration_sql(from: &Model, sql: &str, label: &str, to: &Model, shadow: &ShadowSpec, opts: &Options) -> Result<()> {
+pub fn verify_migration_sql(current: Current, sql: &str, label: &str, to: &Model, shadow: &ShadowSpec, opts: &Options) -> Result<()> {
     let path = PathBuf::from(label);
     let file = pgmig_sql::split(sql).map_err(|source| Error::Split { path: path.clone(), source })?;
     let (no_tx, commits) = crate::migrate_apply::check_directives(&path, &file)?;
@@ -52,14 +78,13 @@ pub fn verify_migration_sql(from: &Model, sql: &str, label: &str, to: &Model, sh
         }
         units
     };
-    verify_units(from, &units, to, shadow, opts)
+    verify_units(current, &units, to, shadow, opts)
 }
 
-fn verify_units(from: &Model, units: &[Unit], to: &Model, shadow: &ShadowSpec, opts: &Options) -> Result<()> {
+fn verify_units(current: Current, units: &[Unit], to: &Model, shadow: &ShadowSpec, opts: &Options) -> Result<()> {
     // Dropped on return: the shadow is wiped whatever happens.
-    let mut sh = shadow.open()?;
+    let mut sh = copy(current, shadow)?;
     let conn = sh.conn();
-    recreate(conn, from, opts)?;
     for unit in units {
         run_unit(conn, unit)?;
     }
@@ -69,15 +94,22 @@ fn verify_units(from: &Model, units: &[Unit], to: &Model, shadow: &ShadowSpec, o
     if remaining.is_empty() { Ok(()) } else { Err(Error::VerifyFailed { remaining }) }
 }
 
-/// Make the empty shadow hold `from`: in schema mode its schema first (a schema-mode model leaves
-/// the schema out), then the plan from a new database.
-fn recreate(conn: &mut Conn, from: &Model, opts: &Options) -> Result<()> {
-    let setup = |statement: &str, source| Error::VerifySetup { statement: statement.to_owned(), source };
-    if let Some(s) = &opts.schema {
-        let sql = format!("CREATE SCHEMA IF NOT EXISTS {}", pgmig_model::quote_ident(s));
-        conn.batch(&sql).map_err(|e| setup(&sql, e))?;
+/// A fresh shadow holding `current`.
+fn copy(current: Current, shadow: &ShadowSpec) -> Result<Shadow> {
+    match current {
+        Current::Migrations(dir) => crate::replay_or_empty(dir, shadow),
+        Current::Model(from) => {
+            let mut sh = shadow.open()?;
+            recreate(sh.conn(), from)?;
+            Ok(sh)
+        }
     }
-    let plan = plan_with(&diff(&opts.empty_database(), from), &PlanOptions::default())?;
+}
+
+/// Make the empty shadow hold `from`: the plan from a new database.
+fn recreate(conn: &mut Conn, from: &Model) -> Result<()> {
+    let setup = |statement: &str, source| Error::VerifySetup { statement: statement.to_owned(), source };
+    let plan = plan_with(&diff(&Model::empty_database(), from), &PlanOptions::default())?;
     for range in crate::batch_ranges(&plan) {
         let mut statements = std::iter::once("BEGIN").chain(range.map(|i| plan.statements[i].as_str())).chain(std::iter::once("COMMIT"));
         if let Some((statement, e)) = statements.find_map(|s| conn.batch(s).err().map(|e| (s, e))) {
@@ -114,7 +146,7 @@ pub(crate) fn remaining_message(remaining: &[Change]) -> String {
     let n = remaining.len();
     let list: String = remaining.iter().map(|c| format!("\n  {} {}", c.kind(), c.object())).collect();
     format!(
-        "verification failed: applied to a copy of the current state in the shadow database, the plan leaves {n} change{} to make:{list}\nnothing was applied or written",
+        "verification failed: applied to a copy of the current state in the shadow database, the plan leaves {n} change{} to make:{list}\nthe target was not changed and no migration was written",
         if n == 1 { "" } else { "s" }
     )
 }
@@ -125,5 +157,5 @@ pub(crate) fn statement_message(index: &Option<usize>, statement: &str, source: 
         Some(i) => format!("statement {} failed in the shadow database: {statement}", i + 1),
         None => format!("{statement} failed in the shadow database"),
     };
-    format!("verification failed: {what}\n{source}\nnothing was applied or written")
+    format!("verification failed: {what}\n{source}\nthe target was not changed and no migration was written")
 }

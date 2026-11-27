@@ -587,7 +587,13 @@ impl SkipArg {
 struct VerifyArg {
     /// Check the plan first (with --edit, as edited): apply it in the shadow database to a copy of
     /// the current state and compare the result with the desired state (changes --skip leaves out
-    /// may remain). A failure stops before anything is applied or written (config: `[diff] verify`).
+    /// may remain). A failure stops before the target is changed or a migration written (config:
+    /// `[diff] verify`). The copy is schema only, with no rows: failures that depend on data (SET NOT
+    /// NULL over NULLs, a unique index over duplicates, a USING cast) are not caught. `migrate diff`
+    /// replays the directory; `schema apply` rebuilds the copy from what pgmig models (tables, types,
+    /// sequences, constraints, indexes, comments), without extensions, functions or views.
+    /// Statements outside any schema (CREATE ROLE, ALTER SYSTEM, ...) in an edited plan or a
+    /// migration really run, on the shadow's server.
     #[arg(long, overrides_with = "no_verify")]
     verify: bool,
     /// Do not check the plan, whatever `[diff] verify` says.
@@ -959,25 +965,7 @@ fn migrate(command: MigrateCommand, s: &Settings, format: Format) -> anyhow::Res
                 editor: edit.then(editor),
                 verify: verify.on(s),
             };
-            let res = api::migrate_diff(&req)?;
-            if format == Format::Text {
-                print_skipped(&res.skipped);
-                if req.verify && res.file.is_some() {
-                    eprintln!("verified: in the shadow database the migration makes the desired state");
-                }
-            }
-            match format {
-                Format::Text => match &res.file {
-                    Some(file) if res.edited => eprintln!("wrote {} (as edited)", file.display()),
-                    Some(file) => {
-                        let n = res.plan.statements.len();
-                        eprintln!("wrote {} ({n} statement{})", file.display(), if n == 1 { "" } else { "s" });
-                    }
-                    None if res.edited => eprintln!("the edited migration has no statements: nothing written"),
-                    None => eprintln!("no changes"),
-                },
-                Format::Json => print_json(&res)?,
-            }
+            migrate_diff(&req, format)?;
         }
         MigrateCommand::Baseline { name, url, dir: d, scope, format: _ } => {
             let req = api::MigrateBaselineRequest {
@@ -1098,6 +1086,28 @@ fn migrate(command: MigrateCommand, s: &Settings, format: Format) -> anyhow::Res
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `migrate diff`: what was skipped, verified and written on stderr, or the response as JSON.
+fn migrate_diff(req: &api::MigrateDiffRequest, format: Format) -> anyhow::Result<()> {
+    let res = api::migrate_diff(req)?;
+    if format == Format::Json {
+        return print_json(&res);
+    }
+    print_skipped(&res.skipped);
+    if req.verify && res.file.is_some() {
+        eprintln!("verified: in the shadow database the migration makes the desired state");
+    }
+    match &res.file {
+        Some(file) if res.edited => eprintln!("wrote {} (as edited)", file.display()),
+        Some(file) => {
+            let n = res.plan.statements.len();
+            eprintln!("wrote {} ({n} statement{})", file.display(), if n == 1 { "" } else { "s" });
+        }
+        None if res.edited => eprintln!("the edited migration has no statements: nothing written"),
+        None => eprintln!("no changes"),
+    }
+    Ok(())
 }
 
 /// What `migrate apply --format json` prints: the target and the report.

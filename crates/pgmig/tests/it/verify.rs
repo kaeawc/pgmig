@@ -6,7 +6,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use pgmig::api::{self, ErrorCode, PlanApplyRequest};
 use pgmig::{
-    Change, ChangeKind, Error, Model, Options, Plan, PlanOptions, ShadowSpec, Source, diff, inspect, load_model, plan_with, verify_plan,
+    Change, ChangeKind, Current, Error, Filter, Model, Options, Plan, PlanOptions, ShadowSpec, Source, diff, inspect, load_model,
+    plan_with, verify_plan, without_schema,
 };
 
 use crate::support::{TestDb, postgres_dsn};
@@ -72,8 +73,8 @@ CREATE TABLE users (id int PRIMARY KEY, name text NOT NULL, n bigint, mood mood 
 CREATE INDEX users_name ON users (name);
 CREATE TABLE posts (id int PRIMARY KEY, user_id int REFERENCES users (id), body text);";
 
-/// A target holding `from`, the models on both sides (as `opts` manages them), and the plan
-/// between them.
+/// A target holding `from`, its whole model (what verification copies), the desired model (as
+/// `opts` manages it), and the plan between them.
 struct Case {
     db: TestDb,
     tmp: Tmp,
@@ -86,9 +87,9 @@ fn case(from: &str, to: &str, spec: &ShadowSpec, opts: &Options) -> Case {
     let db = TestDb::new();
     db.connect().batch(from).expect("load target");
     let tmp = Tmp::new();
-    let from = opts.managed(&inspect(&mut db.connect()).expect("inspect"));
+    let from = without_schema(&inspect(&mut db.connect()).expect("inspect"), &opts.revisions_schema);
     let to = opts.managed(&load_model(&tmp.sql("to.sql", to), spec).expect("load"));
-    let (changes, _) = opts.apply_policy(&diff(&from, &to), &PlanOptions::default());
+    let (changes, _) = opts.apply_policy(&diff(&opts.managed(&from), &to), &PlanOptions::default());
     let plan = plan_with(&changes, &PlanOptions::default()).expect("plan");
     Case { db, tmp, from, to, plan }
 }
@@ -104,7 +105,7 @@ fn a_correct_plan_verifies() {
     let c = case(FROM, TO, &spec, &opts);
     assert!(c.plan.statements.len() > 5, "{:?}", c.plan);
     assert!(c.plan.commit_after.is_some(), "the new enum value needs a commit point: {:?}", c.plan);
-    verify_plan(&c.from, &c.plan, &c.to, &spec, &opts).expect("verifies");
+    verify_plan(Current::Model(&c.from), &c.plan, &c.to, &spec, &opts).expect("verifies");
     // Through the API, before anything is applied.
     let req = PlanApplyRequest {
         target: c.db.conninfo.clone(),
@@ -133,7 +134,7 @@ fn an_injected_planner_bug_is_caught() {
     if dropped.commit_after.is_some_and(|a| a >= i) {
         dropped.commit_after = dropped.commit_after.map(|a| a - 1);
     }
-    let err = verify_plan(&c.from, &dropped, &c.to, &spec, &opts).expect_err("misses the index");
+    let err = verify_plan(Current::Model(&c.from), &dropped, &c.to, &spec, &opts).expect_err("misses the index");
     let Error::VerifyFailed { remaining } = &err else { panic!("{err}") };
     assert_eq!(kinds(remaining), [ChangeKind::CreateIndex], "{err}");
     assert!(err.to_string().starts_with("verification failed:"), "{err}");
@@ -143,7 +144,7 @@ fn an_injected_planner_bug_is_caught() {
     let mut wrong = c.plan.clone();
     let i = wrong.statements.iter().position(|s| s.contains("TYPE bigint")).expect("retype statement");
     wrong.statements[i] = wrong.statements[i].replace("TYPE bigint", "TYPE integer");
-    let err = verify_plan(&c.from, &wrong, &c.to, &spec, &opts).expect_err("wrong type");
+    let err = verify_plan(Current::Model(&c.from), &wrong, &c.to, &spec, &opts).expect_err("wrong type");
     let Error::VerifyFailed { remaining } = &err else { panic!("{err}") };
     assert_eq!(kinds(remaining), [ChangeKind::AlterColumnType], "{err}");
 
@@ -162,20 +163,20 @@ fn a_statement_failing_in_the_shadow_is_reported_with_the_server_error() {
     let mut bogus = c.plan.clone();
     bogus.statements.insert(0, "ALTER TABLE public.nosuch ADD COLUMN x integer".to_owned());
     bogus.commit_after = bogus.commit_after.map(|a| a + 1);
-    let err = verify_plan(&c.from, &bogus, &c.to, &spec, &opts).expect_err("fails");
+    let err = verify_plan(Current::Model(&c.from), &bogus, &c.to, &spec, &opts).expect_err("fails");
     let Error::VerifyStatement { statement_index, statement, source } = &err else { panic!("{err}") };
     assert_eq!(*statement_index, Some(0));
     assert_eq!(statement, "ALTER TABLE public.nosuch ADD COLUMN x integer");
     assert_eq!(source.code.as_deref(), Some("42P01"), "{err}");
     let msg = err.to_string();
     assert!(msg.starts_with("verification failed: statement 1 failed in the shadow database: ALTER TABLE public.nosuch"), "{msg}");
-    assert!(msg.contains("42P01") && msg.contains("nothing was applied or written"), "{msg}");
+    assert!(msg.contains("42P01") && msg.contains("the target was not changed"), "{msg}");
     let e = api::ApiError::from(&err);
     assert_eq!((e.code, e.sqlstate.as_deref()), (ErrorCode::VerifyFailed, Some("42P01")));
     assert_eq!(e.verify.expect("detail").statement_index, Some(0));
 
     // The shadow was wiped: it verifies the correct plan next.
-    verify_plan(&c.from, &c.plan, &c.to, &spec, &opts).expect("verifies after a failure");
+    verify_plan(Current::Model(&c.from), &c.plan, &c.to, &spec, &opts).expect("verifies after a failure");
 }
 
 #[test]
@@ -184,7 +185,7 @@ fn skipped_changes_are_expected_to_remain() {
     let opts = Options { skip: vec![ChangeKind::DropTable], ..Options::default() };
     let c = case(FROM, TO, &spec, &opts);
     assert!(!c.plan.statements.iter().any(|s| s.contains("DROP TABLE")), "{:?}", c.plan);
-    verify_plan(&c.from, &c.plan, &c.to, &spec, &opts).expect("old stays, as skipped");
+    verify_plan(Current::Model(&c.from), &c.plan, &c.to, &spec, &opts).expect("old stays, as skipped");
     let req = PlanApplyRequest {
         target: c.db.conninfo.clone(),
         desired: c.tmp.sql("to.sql", TO),
@@ -195,7 +196,7 @@ fn skipped_changes_are_expected_to_remain() {
     let res = api::schema_plan_apply(&req).expect("verifies");
     assert_eq!(res.skipped.len(), 1, "{:?}", res.skipped);
     // Without the policy, the same plan leaves the drop to do.
-    let err = verify_plan(&c.from, &c.plan, &c.to, &spec, &Options::default()).expect_err("old remains");
+    let err = verify_plan(Current::Model(&c.from), &c.plan, &c.to, &spec, &Options::default()).expect_err("old remains");
     let Error::VerifyFailed { remaining } = &err else { panic!("{err}") };
     assert_eq!(kinds(remaining), [ChangeKind::DropTable], "{err}");
 }
@@ -206,7 +207,37 @@ fn schema_mode_verifies() {
     let opts = Options { schema: Some("app".into()), ..Options::default() };
     let c =
         case("CREATE SCHEMA app; CREATE TABLE app.t (id int);", "CREATE SCHEMA app; CREATE TABLE app.t (id int, v text);", &spec, &opts);
-    verify_plan(&c.from, &c.plan, &c.to, &spec, &opts).expect("verifies");
+    verify_plan(Current::Model(&c.from), &c.plan, &c.to, &spec, &opts).expect("verifies");
+}
+
+/// The copy holds the whole target, not only the managed part: a managed table's foreign key to an
+/// unmanaged one has its target, and an unmanaged one's to a managed table stops the drop there as
+/// it would on the target.
+#[test]
+fn unmanaged_objects_are_copied_too() {
+    let (spec, _keep) = shadow();
+    let exclude = |table: &str| Options { filter: Filter::parse::<&str, _>(&[], &[table]).expect("filter"), ..Options::default() };
+    let tables = "CREATE TABLE parent (id int PRIMARY KEY); CREATE TABLE child (id int, p int REFERENCES parent (id));";
+
+    let opts = exclude("table:public.parent");
+    let to = format!("{tables} ALTER TABLE child ADD COLUMN v text;");
+    let c = case(tables, &to, &spec, &opts);
+    assert_eq!(c.plan.statements.len(), 1, "{:?}", c.plan);
+    verify_plan(Current::Model(&c.from), &c.plan, &c.to, &spec, &opts).expect("verifies");
+    let req = PlanApplyRequest {
+        target: c.db.conninfo.clone(),
+        desired: c.tmp.sql("to.sql", &to),
+        shadow: spec.clone(),
+        options: opts,
+        verify: true,
+    };
+    api::schema_plan_apply(&req).expect("plan and verify");
+
+    let opts = exclude("table:public.child");
+    let c = case(tables, "CREATE TABLE child (id int, p int);", &spec, &opts);
+    assert!(c.plan.statements.iter().any(|s| s.starts_with("DROP TABLE public.parent")), "{:?}", c.plan);
+    let err = verify_plan(Current::Model(&c.from), &c.plan, &c.to, &spec, &opts).expect_err("child's foreign key needs parent");
+    assert!(matches!(&err, Error::VerifyStatement { source, .. } if source.code.as_deref() == Some("2BP01")), "{err}");
 }
 
 #[test]
@@ -271,4 +302,29 @@ fn migrate_diff_verify_checks_the_edited_file_and_writes_nothing_on_failure() {
     let res = pgmig::migrate_diff_with(&t.dir(), "next", &to, &spec, &opts, Some(&no_tx), true).expect("verifies");
     assert!(res.edited && res.written.is_some());
     assert_eq!(t.files().len(), 2);
+}
+
+/// `migrate diff` replays the directory for the copy: a hand-written migration's objects that pgmig
+/// does not model (a function a default calls) are there. Rebuilt from the model, as `schema apply`
+/// does, they are not, and setup says why.
+#[test]
+fn migrate_diff_verify_copies_unmodelled_objects() {
+    let (spec, _keep) = shadow();
+    let t = Tmp::new();
+    let opts = Options::default();
+    let first = "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1';\nCREATE TABLE t (id int DEFAULT f());\n";
+    let new = pgmig::migrate_new(&t.dir(), "init").expect("new");
+    std::fs::write(&new.path, first).expect("write migration");
+    pgmig::migrate_hash(&t.dir()).expect("hash");
+    let to = t.sql("to.sql", &format!("{first}ALTER TABLE t ADD COLUMN v text;\n"));
+    let res = pgmig::migrate_diff_with(&t.dir(), "next", &to, &spec, &opts, None, true).expect("verifies");
+    assert_eq!(res.plan.statements.len(), 1, "{:?}", res.plan);
+    assert_eq!(t.files().len(), 2);
+
+    let db = TestDb::new();
+    db.connect().batch(first).expect("load target");
+    let req = PlanApplyRequest { target: db.conninfo.clone(), desired: to, shadow: spec.clone(), options: opts, verify: true };
+    let err = api::schema_plan_apply(&req).expect_err("f is not copied");
+    assert_eq!(err.code, ErrorCode::VerifyFailed, "{err}");
+    assert!(err.message.contains("objects outside that (extensions, functions, views, ...) are not copied"), "{err}");
 }
