@@ -198,7 +198,7 @@ fn schema_apply_and_diff_leave_the_revisions_schema_alone() {
     let opts = Options::default();
     let plan = target.plan(&opts);
     assert_eq!(plan, ["CREATE TABLE public.users (\n    id integer NOT NULL,\n    CONSTRAINT users_pkey PRIMARY KEY (id)\n)"], "{plan:#?}");
-    pgmig::apply(&target.db.conninfo, &pgmig::Plan { statements: plan, commit_after: None }).expect("apply");
+    pgmig::apply(&target.db.conninfo, &pgmig::Plan { statements: plan, ..Default::default() }).expect("apply");
     assert!(target.plan(&opts).is_empty());
     let mut conn = target.db.connect();
     let t = Table::open(&mut conn, DEFAULT_SCHEMA).expect("open").expect("still there");

@@ -12,7 +12,7 @@
 //! `ALTER TYPE ... ADD VALUE` may run in a transaction, but the new value cannot be used (as a
 //! column default, say) until that transaction commits. So the plan puts every `ADD VALUE` first
 //! and, when other statements follow, marks a commit point after them ([`Plan::commit_after`]):
-//! [`Plan::batches`] are the scripts to run in separate transactions, and [`Plan::to_sql`] writes
+//! [`Plan::units`] are the stretches to run in separate transactions, and [`Plan::to_sql`] writes
 //! the point as a comment and the `-- pgmig:commit` directive ([`COMMIT_MARKER`]), which
 //! `migrate apply` commits at when it runs a file `migrate diff` wrote. pgmig does not check which
 //! later statements use a new value; any statement after an `ADD VALUE` waits for the commit.
@@ -40,8 +40,27 @@
 //! `CREATE INDEX` is the statement the server printed for the index (schema-qualified, whatever
 //! [`PlanOptions`] says), run after the table and the columns it uses exist and have settled.
 //! `DROP INDEX` runs before the columns it uses change or go, and before a constraint or index of
-//! the same name is created. A table's indexes are dropped with it. Indexes are created without
-//! `CONCURRENTLY`: the plan runs in a transaction.
+//! the same name is created. A table's indexes are dropped with it.
+//!
+//! With [`PlanOptions::concurrent_indexes`] the plan creates and drops indexes `CONCURRENTLY`, so
+//! writes to the table are not blocked while an index is built or removed. Postgres refuses these
+//! statements inside a transaction block, so each one is a unit of its own that runs outside a
+//! transaction (see [Units](#units)). Four kinds of index keep the plain statement, in the
+//! transaction with the rest: one on a table the plan creates (the table is new and empty, so
+//! there is nothing to wait for), one on a table the plan drops, one a constraint owns (the
+//! constraint creates and drops it, as without the policy), and one on a partitioned table
+//! (Postgres does not allow `CONCURRENTLY` there; see [`pgmig_model::Index::on_partitioned_table`]).
+//! A `CONCURRENTLY` build that fails leaves an `INVALID` index behind; `DROP INDEX CONCURRENTLY`
+//! removes it.
+//!
+//! # Units
+//!
+//! A plan runs as an ordered list of units ([`Plan::units`]): a transactional unit is statements
+//! that run in one transaction, a non-transactional unit is one statement that runs outside any
+//! transaction and commits by itself. The statements keep their order; the units are where a
+//! transaction has to end. An enum commit point ([`Plan::commit_after`]) ends one, and each
+//! statement in [`Plan::non_transactional`] is one of its own. Earlier units stay committed when a
+//! later one fails.
 //!
 //! # Objects outside the changes
 //!
@@ -69,6 +88,8 @@ pub mod policy;
 
 pub use policy::{Cause, Skipped, skip};
 
+use std::collections::BTreeSet;
+
 use graph::{Deps, Node, Object};
 use pgmig_diff::{Change, CommentTarget, EnumPosition};
 use pgmig_model::{
@@ -77,14 +98,59 @@ use pgmig_model::{
 };
 use serde::{Deserialize, Serialize};
 
-/// Serialized as `{"statements": [...], "commit_after": <index or null>}`.
+/// Serialized as `{"statements": [...], "commit_after": <index or null>}`, and
+/// `"non_transactional": [...]` after them when some statement runs outside a transaction. Without
+/// the field, as written before it existed, every statement is transactional. Reading refuses a
+/// `non_transactional` that is not strictly ascending or names a statement the plan does not have.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "PlanWire")]
 pub struct Plan {
     pub statements: Vec<String>,
     /// The index of the last statement that must be committed before the statements after it run
     /// (see the module doc); `None` when the whole plan can run in one transaction.
     pub commit_after: Option<usize>,
+    /// The indexes (ascending) of the statements that cannot run in a transaction and run outside
+    /// one, each as a unit of its own (`CREATE INDEX CONCURRENTLY`; see the module doc).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub non_transactional: Vec<usize>,
+}
+
+/// What [`Plan`] is read from, before its `non_transactional` is checked.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlanWire {
+    statements: Vec<String>,
+    commit_after: Option<usize>,
+    #[serde(default)]
+    non_transactional: Vec<usize>,
+}
+
+impl TryFrom<PlanWire> for Plan {
+    type Error = String;
+
+    fn try_from(w: PlanWire) -> Result<Plan, String> {
+        let PlanWire { statements, commit_after, non_transactional } = w;
+        if let Some(i) = non_transactional.iter().find(|&&i| i >= statements.len()) {
+            return Err(format!("non_transactional: statement {i} does not exist (the plan has {})", statements.len()));
+        }
+        if let Some(pair) = non_transactional.windows(2).find(|p| p[0] >= p[1]) {
+            return Err(format!(
+                "non_transactional: expected strictly ascending statement indexes, but {} is followed by {}",
+                pair[0], pair[1]
+            ));
+        }
+        Ok(Plan { statements, commit_after, non_transactional })
+    }
+}
+
+/// A run of a plan's statements ([`Plan::units`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unit {
+    /// The statements, by index in [`Plan::statements`].
+    pub statements: std::ops::Range<usize>,
+    /// Whether they run in one transaction; if not, the unit is one statement and it commits by
+    /// itself.
+    pub transactional: bool,
 }
 
 impl Plan {
@@ -93,26 +159,67 @@ impl Plan {
     }
 
     /// The plan as a SQL script: one statement per entry, each ending in `;`, with
-    /// [`COMMIT_MARKER`] at the commit point.
+    /// [`COMMIT_MARKER`] at the commit point, and each non-transactional statement preceded by
+    /// [`NO_TRANSACTION_MARKER`].
     pub fn to_sql(&self) -> String {
-        self.batches().join(COMMIT_MARKER)
+        let mut out = String::new();
+        for (i, statement) in self.statements.iter().enumerate() {
+            if i > 0 && self.commit_after == Some(i - 1) {
+                out.push_str(COMMIT_MARKER);
+            }
+            if self.is_non_transactional(i) {
+                out.push_str(NO_TRANSACTION_MARKER);
+            }
+            out.push_str(statement);
+            out.push_str(";\n");
+        }
+        out
     }
 
-    /// The plan as scripts that must each be committed before the next one runs.
-    pub fn batches(&self) -> Vec<String> {
-        let script = |statements: &[String]| statements.iter().map(|s| format!("{s};\n")).collect::<String>();
-        match self.commit_after {
-            Some(i) if i + 1 < self.statements.len() => {
-                vec![script(&self.statements[..=i]), script(&self.statements[i + 1..])]
+    fn is_non_transactional(&self, i: usize) -> bool {
+        self.non_transactional.contains(&i)
+    }
+
+    /// The plan as the units that run in order, each committed before the next one starts: the
+    /// stretches between commit points and non-transactional statements, and each of those
+    /// statements. Empty for an empty plan.
+    pub fn units(&self) -> Vec<Unit> {
+        let n = self.statements.len();
+        let mut out = Vec::new();
+        let mut start = 0;
+        let end_transaction = |out: &mut Vec<Unit>, start: &mut usize, end: usize| {
+            if end > *start {
+                out.push(Unit { statements: *start..end, transactional: true });
             }
-            _ => vec![script(&self.statements)],
+            *start = end;
+        };
+        for i in 0..n {
+            if self.is_non_transactional(i) {
+                end_transaction(&mut out, &mut start, i);
+                out.push(Unit { statements: i..i + 1, transactional: false });
+                start = i + 1;
+            } else if self.commit_after == Some(i) {
+                end_transaction(&mut out, &mut start, i + 1);
+            }
         }
+        end_transaction(&mut out, &mut start, n);
+        out
+    }
+
+    /// The SQL script of `unit`: its statements, each ending in `;`.
+    pub fn unit_sql(&self, unit: &Unit) -> String {
+        self.statements[unit.statements.clone()].iter().map(|s| format!("{s};\n")).collect()
     }
 }
 
 /// Marks [`Plan::commit_after`] in [`Plan::to_sql`]: a comment for the reader, then the
 /// `-- pgmig:commit` directive. `migrate apply` keys on the directive, never on the comment.
 pub const COMMIT_MARKER: &str = "-- New enum values cannot be used in the transaction that adds them.\n-- pgmig:commit\n";
+
+/// Precedes a statement of [`Plan::non_transactional`] in [`Plan::to_sql`]: a comment for the
+/// reader, then the `-- pgmig:notx` directive on the statement. An edited plan keeps the
+/// statement outside a transaction as long as the directive stays above it.
+pub const NO_TRANSACTION_MARKER: &str = "-- Runs outside a transaction: Postgres refuses it inside one.\n-- pgmig:notx\n";
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
@@ -132,6 +239,10 @@ pub struct PlanOptions {
     /// SQL the server printed (types, defaults, constraint definitions), are left as they are:
     /// inspection prints those schema-qualified (`'a'::public.mood`, `REFERENCES public.b(id)`).
     pub unqualified_schema: Option<String>,
+    /// Create and drop indexes `CONCURRENTLY`, each such statement in a unit outside a transaction
+    /// (see the module doc). Absent from older JSON: false.
+    #[serde(default)]
+    pub concurrent_indexes: bool,
 }
 
 impl PlanOptions {
@@ -154,17 +265,69 @@ pub fn plan_with(changes: &[Change], opts: &PlanOptions) -> Result<Plan, Error> 
     if !unsupported.is_empty() {
         return Err(Error::Unsupported(unsupported));
     }
+    let whole: BTreeSet<&QualName> = changes
+        .iter()
+        .filter_map(|c| match c {
+            Change::CreateTable(t) | Change::DropTable { table: t, .. } => Some(&t.name),
+            _ => None,
+        })
+        .collect();
     let (adds, rest): (Vec<&Change>, Vec<&Change>) = changes.iter().partition(|c| matches!(c, Change::AddEnumValue { .. }));
-    let mut statements = sorted(&adds, opts)?;
-    let commit_after = (!statements.is_empty() && !rest.is_empty()).then(|| statements.len() - 1);
-    statements.extend(sorted(&rest, opts)?);
-    Ok(Plan { statements, commit_after })
+    let mut plan = Plan::default();
+    for step in sorted(&adds, opts, &whole)? {
+        plan.statements.push(step.sql);
+    }
+    plan.commit_after = (!plan.statements.is_empty() && !rest.is_empty()).then(|| plan.statements.len() - 1);
+    for step in sorted(&rest, opts, &whole)? {
+        if step.non_transactional {
+            plan.non_transactional.push(plan.statements.len());
+        }
+        plan.statements.push(step.sql);
+    }
+    Ok(plan)
 }
 
-fn sorted(changes: &[&Change], opts: &PlanOptions) -> Result<Vec<String>, Error> {
+/// A planned statement.
+struct Step {
+    sql: String,
+    /// It runs outside a transaction.
+    non_transactional: bool,
+}
+
+/// `change` as a step. `whole` holds the tables the plan creates or drops, whose indexes are not
+/// built or dropped concurrently.
+fn step(change: &Change, opts: &PlanOptions, whole: &BTreeSet<&QualName>) -> Step {
+    let sql = statement(change, opts);
+    if opts.concurrent_indexes
+        && let Some(sql) = concurrently(change, &sql, whole)
+    {
+        return Step { sql, non_transactional: true };
+    }
+    Step { sql, non_transactional: false }
+}
+
+/// The `CONCURRENTLY` form of `sql`, the statement for `change`, when the policy applies to it
+/// (see the module doc).
+fn concurrently(change: &Change, sql: &str, whole: &BTreeSet<&QualName>) -> Option<String> {
+    match change {
+        Change::CreateIndex { table, index } if !index.on_partitioned_table && !whole.contains(table) => {
+            // The server prints `CREATE [UNIQUE] INDEX <name> ON ...`; a definition that is not in
+            // that form is left as it is.
+            let rest = sql.strip_prefix("CREATE UNIQUE INDEX ").map(|r| ("CREATE UNIQUE INDEX", r));
+            let (head, rest) = rest.or_else(|| sql.strip_prefix("CREATE INDEX ").map(|r| ("CREATE INDEX", r)))?;
+            Some(format!("{head} CONCURRENTLY {rest}"))
+        }
+        Change::DropIndex { table, index } if !index.on_partitioned_table && !whole.contains(table) => {
+            sql.strip_prefix("DROP INDEX ").map(|rest| format!("DROP INDEX CONCURRENTLY {rest}"))
+        }
+        _ => None,
+    }
+}
+
+fn sorted(changes: &[&Change], opts: &PlanOptions, whole: &BTreeSet<&QualName>) -> Result<Vec<Step>, Error> {
     let nodes: Vec<Node> = changes.iter().map(|c| Node { phase: phase(c), deps: deps(c) }).collect();
     match graph::sort(&nodes) {
-        Ok(order) => Ok(order.into_iter().map(|i| statement(changes[i], opts)).collect()),
+        Ok(order) => Ok(order.into_iter().map(|i| step(changes[i], opts, whole)).collect()),
         Err(graph::Cycle(steps)) => Err(Error::Cycle(steps.into_iter().map(|i| statement(changes[i], opts)).collect())),
     }
 }
@@ -906,7 +1069,11 @@ mod tests {
     /// The JSON of a plan is part of pgmig's interface: a change here must be deliberate.
     #[test]
     fn plan_json_is_pinned_and_round_trips() {
-        let plan = Plan { statements: vec!["ALTER TYPE e ADD VALUE 'b'".into(), "CREATE TABLE t (c e)".into()], commit_after: Some(0) };
+        let plan = Plan {
+            statements: vec!["ALTER TYPE e ADD VALUE 'b'".into(), "CREATE TABLE t (c e)".into()],
+            commit_after: Some(0),
+            ..Plan::default()
+        };
         let json = serde_json::to_string(&plan).expect("serialize");
         assert_eq!(json, r#"{"statements":["ALTER TYPE e ADD VALUE 'b'","CREATE TABLE t (c e)"],"commit_after":0}"#);
         assert_eq!(serde_json::from_str::<Plan>(&json).expect("deserialize"), plan);
@@ -1154,9 +1321,10 @@ mod tests {
             ]
         );
         assert_eq!(p.commit_after, Some(2));
-        assert_eq!(p.batches().len(), 2);
-        assert!(p.batches()[1].starts_with("CREATE SCHEMA other;\n"), "{:?}", p.batches());
-        assert_eq!(p.to_sql(), p.batches().join(COMMIT_MARKER));
+        let units = p.units();
+        assert_eq!(units.len(), 2);
+        assert!(p.unit_sql(&units[1]).starts_with("CREATE SCHEMA other;\n"), "{units:?}");
+        assert_eq!(p.to_sql(), units.iter().map(|u| p.unit_sql(u)).collect::<Vec<_>>().join(COMMIT_MARKER));
 
         let only_adds = plan(&changes[1..2]).expect("plan");
         assert_eq!(only_adds.commit_after, None);
@@ -1565,7 +1733,7 @@ mod tests {
 
     #[test]
     fn names_in_the_unqualified_schema_print_without_it() {
-        let scoped = PlanOptions { unqualified_schema: Some("public".into()) };
+        let scoped = PlanOptions { unqualified_schema: Some("public".into()), ..PlanOptions::default() };
         let mut t = keyed("t", "pid", vec![pkey("t")]);
         t.columns.push(col("m", row_type("app", "mood")));
         let owned = Some(OwnedBy { table: t.name.clone(), column: "id".into() });
@@ -1628,6 +1796,7 @@ mod tests {
             unique: false,
             columns: columns.iter().map(|c| c.to_string()).collect(),
             comment: None,
+            on_partitioned_table: false,
         }
     }
 
@@ -1652,7 +1821,7 @@ mod tests {
                 "COMMENT ON INDEX public.t_x_idx IS 'it''s'",
             ]
         );
-        let opts = PlanOptions { unqualified_schema: Some("public".into()) };
+        let opts = PlanOptions { unqualified_schema: Some("public".into()), ..PlanOptions::default() };
         let drop = Change::DropIndex { table: t.clone(), index: index("t", "Odd", "(x)", &["x"]) };
         assert_eq!(plan_with(std::slice::from_ref(&drop), &opts).expect("plan").statements, ["DROP INDEX \"Odd\""]);
         assert_eq!(sql(&[drop]), ["DROP INDEX public.\"Odd\""]);
@@ -1840,7 +2009,7 @@ mod tests {
                 "ALTER DOMAIN public.posint VALIDATE CONSTRAINT posint_small",
             ]
         );
-        let opts = PlanOptions { unqualified_schema: Some("public".into()) };
+        let opts = PlanOptions { unqualified_schema: Some("public".into()), ..PlanOptions::default() };
         let comment =
             Change::SetComment { target: CommentTarget::DomainConstraint { domain: name, name: "posint_check".into() }, comment: None };
         assert_eq!(plan_with(&[comment], &opts).expect("plan").statements, ["COMMENT ON CONSTRAINT posint_check ON DOMAIN posint IS NULL"]);
@@ -2018,5 +2187,215 @@ mod tests {
             shown,
             ["create_domain public.posint (policy)", "create_table public.t (because create_domain public.posint is skipped)"]
         );
+    }
+
+    fn concurrent() -> PlanOptions {
+        PlanOptions { concurrent_indexes: true, ..PlanOptions::default() }
+    }
+
+    fn create_index(table: &str, name: &str) -> Change {
+        Change::CreateIndex { table: QualName::new("public", table), index: index(table, name, "(x)", &["x"]) }
+    }
+
+    fn drop_index(table: &str, name: &str) -> Change {
+        Change::DropIndex { table: QualName::new("public", table), index: index(table, name, "(x)", &["x"]) }
+    }
+
+    #[test]
+    fn indexes_are_concurrent_only_with_the_policy() {
+        let changes = [create_index("t", "t_new"), drop_index("t", "t_old")];
+        let plain = plan(&changes).expect("plan");
+        assert_eq!(plain.statements, ["DROP INDEX public.t_old", "CREATE INDEX t_new ON public.t USING btree (x)"]);
+        assert!(plain.non_transactional.is_empty());
+        assert_eq!(plain.units(), [Unit { statements: 0..2, transactional: true }]);
+
+        let planned = plan_with(&changes, &concurrent()).expect("plan");
+        assert_eq!(
+            planned.statements,
+            ["DROP INDEX CONCURRENTLY public.t_old", "CREATE INDEX CONCURRENTLY t_new ON public.t USING btree (x)"]
+        );
+        assert_eq!(planned.non_transactional, [0, 1]);
+        // Each concurrent statement is a unit of its own.
+        assert_eq!(planned.units(), [Unit { statements: 0..1, transactional: false }, Unit { statements: 1..2, transactional: false }]);
+    }
+
+    #[test]
+    fn a_unique_index_is_built_concurrently_and_a_definition_not_in_the_usual_form_is_left_alone() {
+        let unique = pgmig_model::Index {
+            unique: true,
+            definition: "CREATE UNIQUE INDEX t_x_key ON public.t USING btree (x)".into(),
+            ..index("t", "t_x_key", "(x)", &["x"])
+        };
+        let odd = pgmig_model::Index { definition: "create index odd on public.t (x)".into(), ..index("t", "odd", "(x)", &["x"]) };
+        let t = QualName::new("public", "t");
+        let planned = plan_with(
+            &[Change::CreateIndex { table: t.clone(), index: unique }, Change::CreateIndex { table: t, index: odd }],
+            &concurrent(),
+        )
+        .expect("plan");
+        assert_eq!(
+            planned.statements,
+            ["CREATE UNIQUE INDEX CONCURRENTLY t_x_key ON public.t USING btree (x)", "create index odd on public.t (x)"]
+        );
+        assert_eq!(planned.non_transactional, [0]);
+    }
+
+    #[test]
+    fn indexes_of_tables_created_or_dropped_in_the_plan_stay_plain() {
+        let mut new = table("public", "n", vec![col("x", None)]);
+        new.indexes.push(index("n", "n_idx", "(x)", &["x"]));
+        let mut gone = table("public", "g", vec![col("x", None)]);
+        gone.indexes.push(index("g", "g_idx", "(x)", &["x"]));
+        // A `CreateIndex` for a table created in the same plan (the diff folds these into the table,
+        // but a caller may pass them apart), and the index of a dropped table.
+        let changes = [
+            Change::CreateTable(new),
+            create_index("n", "n_extra"),
+            drop_table(gone),
+            drop_index("g", "g_extra"),
+            create_index("t", "t_idx"),
+        ];
+        let planned = plan_with(&changes, &concurrent()).expect("plan");
+        assert_eq!(planned.non_transactional.len(), 1, "{:#?}", planned.statements);
+        let concurrent_ones: Vec<&String> = planned.non_transactional.iter().map(|&i| &planned.statements[i]).collect();
+        assert_eq!(concurrent_ones, ["CREATE INDEX CONCURRENTLY t_idx ON public.t USING btree (x)"]);
+        assert!(planned.statements.iter().any(|s| s == "CREATE INDEX n_extra ON public.n USING btree (x)"));
+        assert!(planned.statements.iter().any(|s| s == "DROP INDEX public.g_extra"));
+    }
+
+    #[test]
+    fn indexes_on_partitioned_tables_stay_plain() {
+        let partitioned = |name: &str| pgmig_model::Index { on_partitioned_table: true, ..index("p", name, "(x)", &["x"]) };
+        let p = QualName::new("public", "p");
+        let planned = plan_with(
+            &[
+                Change::CreateIndex { table: p.clone(), index: partitioned("p_new") },
+                Change::DropIndex { table: p, index: partitioned("p_old") },
+            ],
+            &concurrent(),
+        )
+        .expect("plan");
+        assert_eq!(planned.statements, ["DROP INDEX public.p_old", "CREATE INDEX p_new ON public.p USING btree (x)"]);
+        assert!(planned.non_transactional.is_empty());
+    }
+
+    #[test]
+    fn constraint_indexes_are_left_to_their_constraints() {
+        let t = QualName::new("public", "t");
+        let unique = constraint("t_x_key", pgmig_model::ConstraintKind::Unique, "UNIQUE (x)", &["x"]);
+        let changes =
+            [Change::DropConstraint { table: t.clone(), constraint: pkey("t") }, Change::AddConstraint { table: t, constraint: unique }];
+        let planned = plan_with(&changes, &concurrent()).expect("plan");
+        assert!(planned.non_transactional.is_empty());
+        assert!(planned.statements.iter().all(|s| !s.contains("CONCURRENTLY")), "{:?}", planned.statements);
+    }
+
+    #[test]
+    fn units_split_a_plan_at_commit_points_and_statements_outside_a_transaction() {
+        let plan = |n: usize, commit_after: Option<usize>, non_transactional: &[usize]| Plan {
+            statements: (0..n).map(|i| format!("SELECT {i}")).collect(),
+            commit_after,
+            non_transactional: non_transactional.to_vec(),
+        };
+        let tx = |r: std::ops::Range<usize>| Unit { statements: r, transactional: true };
+        let outside = |i: usize| Unit { statements: i..i + 1, transactional: false };
+        assert_eq!(plan(0, None, &[]).units(), []);
+        assert_eq!(plan(3, None, &[]).units(), [tx(0..3)]);
+        assert_eq!(plan(3, Some(0), &[]).units(), [tx(0..1), tx(1..3)]);
+        // A commit point after the last statement ends nothing.
+        assert_eq!(plan(3, Some(2), &[]).units(), [tx(0..3)]);
+        assert_eq!(plan(1, Some(0), &[]).units(), [tx(0..1)]);
+        assert_eq!(plan(3, None, &[1]).units(), [tx(0..1), outside(1), tx(2..3)]);
+        assert_eq!(plan(3, None, &[0, 2]).units(), [outside(0), tx(1..2), outside(2)]);
+        assert_eq!(plan(2, None, &[0, 1]).units(), [outside(0), outside(1)]);
+        // An enum commit point next to a statement outside a transaction is one boundary.
+        assert_eq!(plan(3, Some(0), &[1]).units(), [tx(0..1), outside(1), tx(2..3)]);
+        assert_eq!(plan(4, Some(1), &[2]).units(), [tx(0..2), outside(2), tx(3..4)]);
+        // Units cover every statement once, in order.
+        for p in [plan(5, Some(1), &[2, 4]), plan(5, None, &[0]), plan(5, Some(3), &[])] {
+            let covered: Vec<usize> = p.units().into_iter().flat_map(|u| u.statements).collect();
+            assert_eq!(covered, (0..5).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn a_plan_with_a_concurrent_index_after_enum_values_has_three_kinds_of_boundary() {
+        let add = add("ok", EnumPosition::End);
+        let planned = plan_with(&[add, create_index("t", "t_idx"), Change::CreateSchema("s".into())], &concurrent()).expect("plan");
+        assert_eq!(planned.commit_after, Some(0));
+        assert_eq!(planned.units().len(), 3, "{:?}", planned.units());
+        let sql = planned.to_sql();
+        assert!(sql.contains(COMMIT_MARKER) && sql.contains(NO_TRANSACTION_MARKER), "{sql}");
+    }
+
+    #[test]
+    fn to_sql_marks_statements_outside_a_transaction() {
+        let plan = Plan {
+            statements: vec![
+                "ALTER TABLE t ADD x int".into(),
+                "CREATE INDEX CONCURRENTLY i ON t (x)".into(),
+                "COMMENT ON INDEX i IS 'c'".into(),
+            ],
+            commit_after: None,
+            non_transactional: vec![1],
+        };
+        assert_eq!(
+            plan.to_sql(),
+            "ALTER TABLE t ADD x int;\n\
+             -- Runs outside a transaction: Postgres refuses it inside one.\n\
+             -- pgmig:notx\n\
+             CREATE INDEX CONCURRENTLY i ON t (x);\n\
+             COMMENT ON INDEX i IS 'c';\n"
+        );
+        let units = plan.units();
+        assert_eq!(plan.unit_sql(&units[1]), "CREATE INDEX CONCURRENTLY i ON t (x);\n");
+        // Without a statement outside a transaction the script is as it always was.
+        let plain = Plan { non_transactional: vec![], ..plan };
+        assert_eq!(plain.to_sql(), "ALTER TABLE t ADD x int;\nCREATE INDEX CONCURRENTLY i ON t (x);\nCOMMENT ON INDEX i IS 'c';\n");
+    }
+
+    #[test]
+    fn plan_json_without_the_new_field_reads_as_before_and_is_left_out_when_empty() {
+        let old = r#"{"statements":["CREATE INDEX i ON t (x)"],"commit_after":null}"#;
+        let plan: Plan = serde_json::from_str(old).expect("old shape");
+        assert_eq!(plan, Plan { statements: vec!["CREATE INDEX i ON t (x)".into()], commit_after: None, non_transactional: vec![] });
+        assert_eq!(serde_json::to_string(&plan).expect("serialize"), old);
+
+        let with = Plan { non_transactional: vec![0], ..plan };
+        let json = serde_json::to_string(&with).expect("serialize");
+        assert_eq!(json, r#"{"statements":["CREATE INDEX i ON t (x)"],"commit_after":null,"non_transactional":[0]}"#);
+        assert_eq!(serde_json::from_str::<Plan>(&json).expect("deserialize"), with);
+    }
+
+    #[test]
+    fn plan_json_with_a_bad_non_transactional_list_is_refused() {
+        let read = |list: &str| {
+            serde_json::from_str::<Plan>(&format!(r#"{{"statements":["a","b","c"],"commit_after":null,"non_transactional":{list}}}"#))
+        };
+        assert_eq!(read("[0,2]").expect("ascending").non_transactional, [0, 2]);
+        assert!(read("[]").expect("empty").non_transactional.is_empty());
+        for (list, message) in [
+            ("[2,0]", "strictly ascending statement indexes, but 2 is followed by 0"),
+            ("[1,1]", "strictly ascending statement indexes, but 1 is followed by 1"),
+            ("[3]", "statement 3 does not exist (the plan has 3)"),
+            ("[0,7]", "statement 7 does not exist"),
+        ] {
+            let err = read(list).expect_err(list).to_string();
+            assert!(err.contains(message), "{list}: {err}");
+        }
+        // Other fields are still checked, and unknown ones refused.
+        assert!(serde_json::from_str::<Plan>(r#"{"statements":[],"commit_after":null,"x":1}"#).is_err());
+        // A plan built in code with the list out of order still lays out its units by statement.
+        let plan = Plan { statements: vec!["a".into(), "b".into(), "c".into()], non_transactional: vec![2, 0], ..Plan::default() };
+        let outside: Vec<bool> = plan.units().iter().map(|u| u.transactional).collect();
+        assert_eq!(outside, [false, true, false]);
+    }
+
+    #[test]
+    fn plan_options_json_without_the_new_field_reads_as_before() {
+        let opts: PlanOptions = serde_json::from_str(r#"{"unqualified_schema":"app"}"#).expect("old shape");
+        assert_eq!(opts, PlanOptions { unqualified_schema: Some("app".into()), concurrent_indexes: false });
+        let opts: PlanOptions = serde_json::from_str(r#"{"unqualified_schema":null,"concurrent_indexes":true}"#).expect("new shape");
+        assert!(opts.concurrent_indexes);
     }
 }

@@ -33,7 +33,7 @@ diff`), `include`, `exclude`, `schema`,
 `format`, and the `migrate apply` flags under `[migrations]`: `dir`, `tx_mode`, `exec_order`,
 `lock_name`, `lock_timeout`, `before_sql`, `after_sql`. `[migrations] revisions_schema` (default
 `pgmig`) names the schema of the revisions table; pgmig never manages that schema. `[diff] skip`
-is --skip, `[diff] verify = true` is --verify. `[env.NAME]` sections, selected with --env NAME,
+is --skip, `[diff] verify = true` is --verify, `[diff] concurrent_indexes = true` is --concurrent-indexes. `[env.NAME]` sections, selected with --env NAME,
 override the top level. A flag wins over both. `${KEY}` in a value is replaced by --var KEY=VALUE,
 or else by the environment variable KEY; `$${` is a literal `${`.";
 
@@ -103,7 +103,7 @@ enum MigrateCommand {
         #[command(flatten)]
         scope: ScopeArgs,
         #[command(flatten)]
-        skip: SkipArg,
+        skip: PolicyArg,
         /// Open the plan in $VISUAL, else $EDITOR, else vi (split on whitespace; no shell) before
         /// writing it: what you save is what is written (a file left without statements writes nothing), with no new diff. Needs a terminal; not with
         /// --format json.
@@ -403,7 +403,7 @@ enum SchemaCommand {
         #[command(flatten)]
         scope: ScopeArgs,
         #[command(flatten)]
-        skip: SkipArg,
+        skip: PolicyArg,
         #[command(flatten)]
         format: FormatArg,
         /// Exit with status 3 when there are changes (skipped ones do not count).
@@ -446,7 +446,7 @@ enum SchemaCommand {
         #[command(flatten)]
         scope: ScopeArgs,
         #[command(flatten)]
-        skip: SkipArg,
+        skip: PolicyArg,
         /// Print the plan and change nothing.
         #[arg(long)]
         dry_run: bool,
@@ -551,33 +551,52 @@ impl ScopeArgs {
             schema: self.schema.or_else(|| settings.schema.clone()),
             revisions_schema: revisions_schema(settings),
             skip: Vec::new(),
+            concurrent_indexes: false,
         })
     }
 }
 
+/// The diff policy: what plans leave out (`--skip`) and how they build indexes.
 #[derive(clap::Args)]
-struct SkipArg {
+struct PolicyArg {
     /// Never plan this kind of change (repeatable): one of the `kind` names of the JSON changes,
     /// such as drop_table, drop_column, drop_schema, drop_constraint, drop_default. A change that
     /// needs a skipped one is skipped too. Skipped changes are reported on stderr (in JSON:
     /// `skipped`) and found again by every later diff (config: `[diff] skip`).
     #[arg(long, value_name = "KIND", value_parser = parse_kind)]
     skip: Vec<ChangeKind>,
+    /// Create and drop indexes CONCURRENTLY, so writes to the table are not blocked. Postgres
+    /// refuses these statements in a transaction, so each runs on its own outside one: `schema
+    /// apply` commits the statements before it first, and `migrate diff` writes one file per such
+    /// statement (`-- pgmig:txmode none`) and cannot be combined with --edit. A failed build leaves
+    /// an INVALID index to drop (DROP INDEX CONCURRENTLY). Indexes on tables the plan creates or
+    /// drops, and on partitioned tables, keep the plain statement (config: `[diff]
+    /// concurrent_indexes`).
+    #[arg(long, overrides_with = "no_concurrent_indexes")]
+    concurrent_indexes: bool,
+    /// Plain CREATE INDEX and DROP INDEX, whatever `[diff] concurrent_indexes` says.
+    #[arg(long)]
+    no_concurrent_indexes: bool,
 }
 
 fn parse_kind(s: &str) -> Result<ChangeKind, String> {
     s.parse().map_err(|e: pgmig::UnknownKind| e.to_string())
 }
 
-impl SkipArg {
+impl PolicyArg {
     /// `options` with the policy: the flags, or where none are given, `[diff] skip` (checked when
-    /// the file was read).
+    /// the file was read) and `[diff] concurrent_indexes`.
     fn add_to(self, mut options: Options, settings: &Settings) -> anyhow::Result<Options> {
         options.skip = if self.skip.is_empty() {
             let names = settings.diff_skip.iter().flatten();
             names.map(|n| n.parse().map_err(|e: pgmig::UnknownKind| ApiError::usage(e.to_string()))).collect::<Result<_, _>>()?
         } else {
             self.skip
+        };
+        options.concurrent_indexes = match (self.concurrent_indexes, self.no_concurrent_indexes) {
+            (true, _) => true,
+            (_, true) => false,
+            _ => settings.diff_concurrent_indexes.unwrap_or(false),
         };
         Ok(options)
     }
@@ -1100,6 +1119,15 @@ fn migrate_diff(req: &api::MigrateDiffRequest, format: Format) -> anyhow::Result
     }
     match &res.file {
         Some(file) if res.edited => eprintln!("wrote {} (as edited)", file.display()),
+        Some(_) if res.files.len() > 1 => {
+            eprintln!(
+                "wrote {} files, one per unit of the plan (a statement outside a transaction has a file of its own):",
+                res.files.len()
+            );
+            for f in &res.files {
+                eprintln!("  {}", f.path.display());
+            }
+        }
         Some(file) => {
             let n = res.plan.statements.len();
             eprintln!("wrote {} ({n} statement{})", file.display(), if n == 1 { "" } else { "s" });
@@ -1353,7 +1381,15 @@ fn schema_apply(req: api::PlanApplyRequest, target: &Target, flags: ApplyFlags, 
     if json {
         print_json(&ApplyOutput { target, plan: res, applied: true, report: Some(report) })?;
     } else {
-        eprintln!("applied {} statements in {} transaction(s)", report.statements, report.batches);
+        match report.non_transactional {
+            0 => eprintln!("applied {} statements in {} transaction(s)", report.statements, report.batches),
+            k => eprintln!(
+                "applied {} statements: {} in {} transaction(s), {k} outside a transaction",
+                report.statements,
+                report.statements - k,
+                report.batches
+            ),
+        }
     }
     Ok(ExitCode::SUCCESS)
 }

@@ -45,7 +45,7 @@ pub use pgmig_migrate::history;
 pub use pgmig_migrate::revisions;
 pub use pgmig_migrate::{Dir as MigrationDir, SUM_FILE, SumFile, SumLine, ValidateError as ChecksumError};
 pub use pgmig_model::{Model, fingerprint};
-pub use pgmig_plan::{Cause as SkipCause, Plan, PlanOptions, Skipped, plan, plan_with};
+pub use pgmig_plan::{Cause as SkipCause, Plan, PlanOptions, Skipped, Unit as PlanUnit, plan, plan_with};
 pub use pgmig_shadow::{PUBLIC_COMMENT as PUBLIC_SCHEMA_COMMENT_SQL, Shadow};
 pub use verify::{Current, verify_migration_sql, verify_plan};
 
@@ -97,8 +97,9 @@ pub enum Error {
     Inspect(#[from] pgmig_inspect::Error),
     #[error(transparent)]
     Plan(#[from] pgmig_plan::Error),
-    /// A statement of an applied plan failed; its transaction was rolled back.
-    #[error("{}", apply_message(.statement_index, .statement, .source, .committed_batches))]
+    /// A statement of an applied plan failed; its transaction was rolled back (a statement outside
+    /// a transaction committed nothing).
+    #[error("{}", apply_message(.statement_index, .statement, .source, .committed_batches, .committed_outside_transaction, .outside_transaction))]
     Apply {
         /// 0-based index into [`Plan::statements`]; `None` when the `COMMIT` itself failed.
         statement_index: Option<usize>,
@@ -106,8 +107,13 @@ pub enum Error {
         statement: String,
         /// The server's error, verbatim with its SQLSTATE.
         source: pgmig_conn::Error,
-        /// Batches committed before the failing one: their changes stay applied.
+        /// Transactions committed before the failing statement: their changes stay applied.
         committed_batches: usize,
+        /// Statements that ran outside a transaction ([`Plan::non_transactional`]) before it, and
+        /// committed by themselves: their changes stay applied too.
+        committed_outside_transaction: usize,
+        /// The statement ran outside a transaction ([`Plan::non_transactional`]).
+        outside_transaction: bool,
     },
     /// A `-- pgmig:<name>` directive that is misplaced or has bad arguments.
     #[error("{path}:{pos}: {message}")]
@@ -130,7 +136,7 @@ pub enum Error {
     #[error("{path}: cannot resume after the statements an earlier run applied: {reason}")]
     Resume { path: PathBuf, reason: String },
     /// A migration statement failed; `pos` is where the server located the error.
-    #[error("{path}:{pos}: {source}\n{}", migrate_apply::outcome_message(*.outcome, *.applied_files))]
+    #[error("{path}:{pos}: {source}\n{}{}", migrate_apply::outcome_message(*.outcome, *.applied_files), leftover_index_hint(.statement, .source))]
     MigrationFailed {
         path: PathBuf,
         pos: pgmig_sql::Pos,
@@ -220,12 +226,20 @@ pub enum Error {
     VerifySetup { statement: String, source: pgmig_conn::Error },
 }
 
-fn apply_message(index: &Option<usize>, statement: &str, source: &pgmig_conn::Error, committed: &usize) -> String {
+fn apply_message(
+    index: &Option<usize>,
+    statement: &str,
+    source: &pgmig_conn::Error,
+    committed: &usize,
+    committed_outside: &usize,
+    outside: &bool,
+) -> String {
     let what = match index {
         Some(i) => format!("statement {} failed", i + 1),
         None => format!("{statement} failed"),
     };
     let batch = match (index, statement) {
+        _ if *outside => "it ran outside a transaction and committed nothing",
         // A COMMIT that lost the connection may or may not have committed.
         (None, "COMMIT") if source.code.is_none() => {
             "the connection failed during COMMIT, so this batch may or may not be applied; plan again to see what is left"
@@ -233,12 +247,89 @@ fn apply_message(index: &Option<usize>, statement: &str, source: &pgmig_conn::Er
         (None, "BEGIN") => "this batch did not start",
         _ => "its transaction was rolled back",
     };
-    let committed = match committed {
-        0 => "nothing was committed".to_owned(),
-        1 => "1 earlier batch was committed and stays applied".to_owned(),
-        n => format!("{n} earlier batches were committed and stay applied"),
+    let committed = match (committed, committed_outside) {
+        (0, 0) => "nothing was committed".to_owned(),
+        (1, 0) => "1 earlier batch was committed and stays applied".to_owned(),
+        (n, 0) => format!("{n} earlier batches were committed and stay applied"),
+        (n, m) => {
+            let plural = |n: &usize, one: &str, many: &str| match n {
+                0 => None,
+                1 => Some(format!("1 earlier {one}")),
+                n => Some(format!("{n} earlier {many}")),
+            };
+            let parts: Vec<String> =
+                [plural(n, "batch", "batches"), plural(m, "statement outside a transaction", "statements outside a transaction")]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+            format!("{} committed and stay{} applied", parts.join(" and "), if *n == 0 && *m == 1 { "s" } else { "" })
+        }
     };
-    format!("{what}: {statement}\n{source}\n{batch}; {committed}")
+    let leftover = if *outside { leftover_index_hint(statement, source) } else { String::new() };
+    format!("{what}: {statement}\n{source}\n{batch}; {committed}{leftover}")
+}
+
+/// For a `CREATE INDEX CONCURRENTLY` that failed while it ran (not one the server refused in a
+/// transaction block, SQLSTATE 25001, which builds nothing): a line that says an `INVALID` index may
+/// be left behind and how to remove it. Empty for any other statement.
+fn leftover_index_hint(statement: &str, source: &pgmig_conn::Error) -> String {
+    match concurrent_index_name(statement) {
+        Some(name) if source.code.as_deref() != Some("25001") => format!(
+            "\na failed CREATE INDEX CONCURRENTLY can leave an INVALID index behind (`pg_index.indisvalid` is false): remove it with DROP INDEX CONCURRENTLY {name}, then try again"
+        ),
+        _ => String::new(),
+    }
+}
+
+/// The name (schema-qualified when the statement says the table's schema) of the index a
+/// `CREATE [UNIQUE] INDEX CONCURRENTLY [IF NOT EXISTS] <name> ON [ONLY] <table> ...` statement
+/// builds. Only for the message that tells how to remove a leftover `INVALID` index.
+fn concurrent_index_name(statement: &str) -> Option<String> {
+    fn word(s: &str) -> Option<(&str, &str)> {
+        let s = s.trim_start();
+        let end = s.find(char::is_whitespace).unwrap_or(s.len());
+        (end > 0).then(|| s.split_at(end))
+    }
+    // A possibly quoted identifier; `rest` starts at what follows it.
+    fn ident(s: &str) -> Option<(&str, &str)> {
+        let s = s.trim_start();
+        if s.starts_with('"') {
+            let mut i = 1;
+            while let Some(at) = s[i..].find('"') {
+                i += at + 1;
+                if s[i..].starts_with('"') {
+                    i += 1;
+                } else {
+                    return Some(s.split_at(i));
+                }
+            }
+            return None;
+        }
+        let end = s.find(|c: char| c.is_whitespace() || c == '.' || c == '(').unwrap_or(s.len());
+        (end > 0).then(|| s.split_at(end))
+    }
+    let mut rest = statement;
+    for expected in ["CREATE", "UNIQUE", "INDEX", "CONCURRENTLY", "IF", "NOT", "EXISTS"] {
+        let (w, r) = word(rest)?;
+        if w.eq_ignore_ascii_case(expected) {
+            rest = r;
+        } else if !matches!(expected, "UNIQUE" | "IF" | "NOT" | "EXISTS") {
+            return None;
+        }
+    }
+    let (name, rest) = ident(rest)?;
+    let (on, rest) = word(rest)?;
+    if !on.eq_ignore_ascii_case("ON") {
+        return None;
+    }
+    let (mut table, mut rest) = ident(rest)?;
+    if table.eq_ignore_ascii_case("ONLY") {
+        (table, rest) = ident(rest)?;
+    }
+    Some(match rest.strip_prefix('.') {
+        Some(_) => format!("{table}.{name}"),
+        None => name.to_owned(),
+    })
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -295,8 +386,9 @@ impl ShadowSpec {
 }
 
 /// What pgmig manages, how it prints names, and which changes it never plans. Serialized as
-/// `{"filter": {...}, "schema": ..., "revisions_schema": ..., "skip": [...]}`; each may be left
-/// out, `revisions_schema` is left out when it is the default and `skip` when it is empty.
+/// `{"filter": {...}, "schema": ..., "revisions_schema": ..., "skip": [...], "concurrent_indexes":
+/// ...}`; each may be left out, `revisions_schema` is left out when it is the default, `skip` when
+/// it is empty and `concurrent_indexes` when it is false.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Options {
@@ -320,11 +412,22 @@ pub struct Options {
     /// commands plan from an empty database, where the policy does not apply.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub skip: Vec<ChangeKind>,
+    /// The index policy: plans create and drop indexes `CONCURRENTLY`, each such statement outside
+    /// a transaction (see [`pgmig_plan`]'s `Indexes` and `Units`). Applies where `skip` does, and
+    /// is left out of the JSON when false.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub concurrent_indexes: bool,
 }
 
 impl Default for Options {
     fn default() -> Options {
-        Options { filter: Filter::default(), schema: None, revisions_schema: revisions::DEFAULT_SCHEMA.to_owned(), skip: Vec::new() }
+        Options {
+            filter: Filter::default(),
+            schema: None,
+            revisions_schema: revisions::DEFAULT_SCHEMA.to_owned(),
+            skip: Vec::new(),
+            concurrent_indexes: false,
+        }
     }
 }
 
@@ -369,7 +472,12 @@ impl Options {
 
     /// How printed plans name objects under these options.
     pub fn plan_options(&self) -> PlanOptions {
-        PlanOptions { unqualified_schema: self.schema.clone() }
+        PlanOptions { unqualified_schema: self.schema.clone(), concurrent_indexes: self.concurrent_indexes }
+    }
+
+    /// How plans that are executed name objects: always qualified (see [`schema_plan_apply`]).
+    pub fn qualified_plan_options(&self) -> PlanOptions {
+        PlanOptions { concurrent_indexes: self.concurrent_indexes, ..PlanOptions::default() }
     }
 
     /// The changes of `changes` to plan under [`Options::skip`], and those left out, statements
@@ -479,16 +587,18 @@ pub struct NewMigration {
 /// What [`migrate_diff`] found and wrote.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MigrateDiff {
-    /// The file written; `None` when there were no changes (or the edit left no statement) and
-    /// nothing was written.
-    pub written: Option<NewMigration>,
+    /// The files written, in version order: one, or one per unit of a plan with non-transactional
+    /// statements ([`Plan::units`]); none when there were no changes (or the edit left no
+    /// statement).
+    pub written: Vec<NewMigration>,
     /// The changes from the replayed directory to the desired state that the plan makes.
     pub changes: Vec<Change>,
     /// The changes the policy ([`Options::skip`]) left out of the plan.
     pub skipped: Vec<Skipped>,
     /// The plan from the replayed directory to the desired state.
     pub plan: Plan,
-    /// The file's contents: [`Plan::to_sql`], or what the editor saved.
+    /// The file's contents: [`Plan::to_sql`], or what the editor saved. For several files, the plan
+    /// as one script ([`Plan::to_sql`]); the files hold its units.
     pub sql: String,
     /// Whether the plan was edited ([`migrate_diff_edited`]).
     pub edited: bool,
@@ -501,7 +611,14 @@ pub const EDITED_MIGRATION: &str = "edited migration";
 /// its sum file (it may be missing or empty: nothing to check) and replayed in a fresh shadow
 /// database, `to` is loaded in another, and the plan between them, for the objects `opts` manages,
 /// is written as `<version>_<name>.sql` ([`Plan::to_sql`], commit points included) and the sum
-/// file rehashed. With no changes nothing is written. Changes the policy skips
+/// file rehashed. With no changes nothing is written.
+///
+/// A plan with statements that cannot run in a transaction ([`Plan::non_transactional`], from
+/// [`Options::concurrent_indexes`]) is written as one file per unit ([`Plan::units`]) with
+/// consecutive versions, named `<name>.sql`, `<name>_2.sql`, ...: a transactional unit as it is,
+/// a non-transactional statement after `-- pgmig:txmode none`. All are written under one lock and
+/// hashed together. Such a plan cannot be edited ([`migrate_diff_edited`] refuses it): the
+/// editor's text would have to be split again. Changes the policy skips
 /// ([`Options::skip`]) are not in the file; with only those, nothing is written.
 ///
 /// The file will be executed, so its names are schema-qualified in schema mode too (see
@@ -569,10 +686,18 @@ fn migrate_diff_at(
     };
     let (b, mut loaded) = open_model(to, shadow)?;
     let b = opts.managed(&b);
-    let names = PlanOptions::default();
+    let names = opts.qualified_plan_options();
     let (changes, skipped) = opts.apply_policy(&diff_with_casts(&a, &b, loaded.conn()), &names);
     let plan = plan_with(&changes, &names)?;
     drop(loaded);
+    if editor.is_some() && !plan.non_transactional.is_empty() {
+        return Err(Error::Options(
+            "--edit cannot be combined with concurrent_indexes when the plan has statements outside a transaction: \
+             they are written as files of their own, and an edited script cannot be split again; \
+             edit the migration files afterwards, or run without --edit"
+                .into(),
+        ));
+    }
     let mut sql = plan.to_sql();
     let mut statements = plan.statements.len();
     let edited = editor.is_some() && !plan.is_empty();
@@ -590,9 +715,34 @@ fn migrate_diff_at(
             verify_plan(current, &plan, &b, shadow, opts)?;
         }
     }
-    let written = if statements == 0 { None } else { Some(write_migration(dir, lock, existing, &description, sql.clone(), now)?) };
+    let written =
+        if statements == 0 { Vec::new() } else { write_migrations(dir, lock, existing, migration_files(&plan, &description, &sql), now)? };
     Ok(MigrateDiff { written, changes, skipped, plan, sql, edited })
 }
+
+/// The files [`migrate_diff`] writes for `plan`, each a description and its contents: `sql` as one
+/// file, or when the plan has statements outside a transaction one file per unit.
+fn migration_files(plan: &Plan, description: &str, sql: &str) -> Vec<(String, String)> {
+    if plan.non_transactional.is_empty() {
+        return vec![(description.to_owned(), sql.to_owned())];
+    }
+    plan.units()
+        .iter()
+        .enumerate()
+        .map(|(i, unit)| {
+            let name = if i == 0 { description.to_owned() } else { format!("{description}_{}", i + 1) };
+            let mut text = plan.unit_sql(unit);
+            if !unit.transactional {
+                text = format!("{NO_TRANSACTION_FILE_HEADER}{text}");
+            }
+            (name, text)
+        })
+        .collect()
+}
+
+/// Starts a migration file that holds one statement Postgres refuses inside a transaction.
+const NO_TRANSACTION_FILE_HEADER: &str =
+    "-- pgmig:txmode none\n-- Runs outside a transaction: Postgres refuses this statement inside one.\n";
 
 /// `migrate new`: write an empty migration `<version>_<name>.sql` to the directory at `dir` (created
 /// when missing) and rehash the sum file. The directory is checked against its sum file first.
@@ -652,6 +802,20 @@ fn write_migration(
     sql: String,
     now: SystemTime,
 ) -> Result<NewMigration> {
+    let mut written = write_migrations(path, lock, existing, vec![(description.to_owned(), sql)], now)?;
+    Ok(written.remove(0))
+}
+
+/// [`write_migration`] for several files, each a description and its contents: written in order
+/// with consecutive versions, all under the one lock and hashed into the sum file together. When a
+/// write fails the files this call already wrote are removed again, so the directory is as it was.
+fn write_migrations(
+    path: &Path,
+    lock: Option<pgmig_migrate::DirLock>,
+    existing: Option<MigrationDir>,
+    items: Vec<(String, String)>,
+    now: SystemTime,
+) -> Result<Vec<NewMigration>> {
     let (_lock, existing) = match lock {
         Some(l) => (l, existing),
         None => {
@@ -665,19 +829,42 @@ fn write_migration(
             (lock, existing)
         }
     };
-    let files = existing.map(|d| d.files().to_vec()).unwrap_or_default();
-    let version = pgmig_migrate::next_version(files.last().map(|f| f.version.as_str()), now);
-    let name = format!("{version}_{description}.sql");
-    let file = path.join(&name);
-    if files.iter().any(|f| pgmig_migrate::compare_versions(&f.version, &version).is_eq()) {
-        return Err(pgmig_migrate::Error::Exists { path: file }.into());
+    let mut all = existing.map(|d| d.files().to_vec()).unwrap_or_default();
+    let mut written: Vec<NewMigration> = Vec::new();
+    for (description, sql) in items {
+        let version = pgmig_migrate::next_version(all.last().map(|f| f.version.as_str()), now);
+        let name = format!("{version}_{description}.sql");
+        let file = path.join(&name);
+        let result = if all.iter().any(|f| pgmig_migrate::compare_versions(&f.version, &version).is_eq()) {
+            Err(pgmig_migrate::Error::Exists { path: file.clone() })
+        } else {
+            pgmig_migrate::write_new(&file, sql.as_bytes())
+        };
+        if let Err(e) = result {
+            remove_files(&written);
+            return Err(e.into());
+        }
+        written.push(NewMigration { path: file.clone(), version });
+        match pgmig_migrate::File::new(&name, sql) {
+            Ok(new) => all.push(new),
+            Err(reason) => {
+                remove_files(&written);
+                return Err(pgmig_migrate::Error::Name { path: file, reason }.into());
+            }
+        }
     }
-    pgmig_migrate::write_new(&file, sql.as_bytes())?;
-    let new = pgmig_migrate::File::new(&name, sql).map_err(|reason| pgmig_migrate::Error::Name { path: file.clone(), reason })?;
-    let mut all = files;
-    all.push(new);
-    MigrationDir::from_files(path, all)?.write_sum()?;
-    Ok(NewMigration { path: file, version })
+    if let Err(e) = MigrationDir::from_files(path, all).and_then(|d| d.write_sum()) {
+        remove_files(&written);
+        return Err(e.into());
+    }
+    Ok(written)
+}
+
+/// Remove files this process just created, ignoring errors: the caller is reporting a worse one.
+fn remove_files(files: &[NewMigration]) {
+    for f in files {
+        let _ = std::fs::remove_file(&f.path);
+    }
 }
 
 /// The file of `dir` whose name (a path is reduced to its last component) or version is exactly
@@ -861,7 +1048,7 @@ pub fn schema_plan_apply(target: &str, desired: &Source, shadow: &ShadowSpec, op
 /// [`schema_plan_apply`], with the changes the plan makes and those it skips.
 fn plan_apply_changes(target: &str, desired: &Source, shadow: &ShadowSpec, opts: &Options) -> Result<Diffed> {
     opts.validate()?;
-    diff_sources(&Source::Database(target.to_owned()), desired, shadow, opts, &PlanOptions::default())
+    diff_sources(&Source::Database(target.to_owned()), desired, shadow, opts, &opts.qualified_plan_options())
 }
 
 /// `schema apply --verify`: check that `plan` (as planned or edited), applied in a fresh shadow
@@ -881,61 +1068,66 @@ pub fn schema_verify(target: &str, desired: &Source, plan: &Plan, shadow: &Shado
 /// What [`apply`] did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApplyReport {
-    /// Transactions committed (one per [`Plan::batches`] entry).
+    /// Transactions committed (one per transactional [`Plan::units`] entry).
     pub batches: usize,
+    /// Statements run, in transactions and outside them.
     pub statements: usize,
+    /// How many of `statements` ran outside a transaction ([`Plan::non_transactional`]). Left out of
+    /// the JSON when none did.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub non_transactional: usize,
+}
+
+pub(crate) fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// `schema apply`, second half: run `plan` against the database at `target`.
 ///
-/// Each batch of the plan (see [`Plan::batches`]) runs in its own transaction, so a plan with one
-/// batch is applied entirely or not at all. On failure the failing batch is rolled back and
-/// [`Error::Apply`] names the statement; earlier batches stay committed.
-///
-/// Statements Postgres refuses inside a transaction block (`CREATE INDEX CONCURRENTLY`, say) are
-/// not planned yet. When they are, they need batches of their own that run without `BEGIN`; this
-/// is where to add that, driven by a marker on the plan rather than by matching SQL text.
+/// Each unit of the plan ([`Plan::units`]) runs on its own. A transactional unit runs in one
+/// transaction, so a plan with one unit is applied entirely or not at all; on failure the failing
+/// transaction is rolled back and [`Error::Apply`] names the statement. A non-transactional unit is
+/// one statement that runs without `BEGIN` (`CREATE INDEX CONCURRENTLY`, say) and commits by itself;
+/// when it fails, nothing of it was committed, but a failed `CONCURRENTLY` build may leave an
+/// `INVALID` index behind, which the error says how to remove. Earlier units stay committed.
 pub fn apply(target: &str, plan: &Plan) -> Result<ApplyReport> {
     let mut conn = Conn::connect(target)?;
     let mut report = ApplyReport::default();
-    for range in batch_ranges(plan) {
-        let fail = |conn: &mut Conn, statement_index, statement: &str, source| {
-            // The server has aborted the transaction (or ended it, when COMMIT failed); a ROLLBACK
-            // error would only hide the one that matters.
-            let _ = conn.batch("ROLLBACK");
-            Error::Apply { statement_index, statement: statement.to_owned(), source, committed_batches: report.batches }
+    for unit in plan.units() {
+        let (committed_batches, committed_outside_transaction) = (report.batches, report.non_transactional);
+        let error = |statement_index, statement: &str, source, outside_transaction| Error::Apply {
+            statement_index,
+            statement: statement.to_owned(),
+            source,
+            committed_batches,
+            committed_outside_transaction,
+            outside_transaction,
         };
-        if let Err(e) = conn.batch("BEGIN") {
-            return Err(Error::Apply {
-                statement_index: None,
-                statement: "BEGIN".to_owned(),
-                source: e,
-                committed_batches: report.batches,
-            });
-        }
-        for i in range.clone() {
-            let statement = &plan.statements[i];
-            if let Err(e) = conn.batch(statement) {
-                return Err(fail(&mut conn, Some(i), statement, e));
+        if !unit.transactional {
+            let i = unit.statements.start;
+            conn.batch(&plan.statements[i]).map_err(|e| error(Some(i), &plan.statements[i], e, true))?;
+            report.non_transactional += 1;
+        } else {
+            conn.batch("BEGIN").map_err(|e| error(None, "BEGIN", e, false))?;
+            for i in unit.statements.clone() {
+                let statement = &plan.statements[i];
+                if let Err(e) = conn.batch(statement) {
+                    // The server has aborted the transaction; a ROLLBACK error would only hide the
+                    // one that matters.
+                    let _ = conn.batch("ROLLBACK");
+                    return Err(error(Some(i), statement, e, false));
+                }
             }
+            if let Err(e) = conn.batch("COMMIT") {
+                // Ends the transaction a failed COMMIT may have left open.
+                let _ = conn.batch("ROLLBACK");
+                return Err(error(None, "COMMIT", e, false));
+            }
+            report.batches += 1;
         }
-        if let Err(e) = conn.batch("COMMIT") {
-            return Err(fail(&mut conn, None, "COMMIT", e));
-        }
-        report.batches += 1;
-        report.statements += range.len();
+        report.statements += unit.statements.len();
     }
     Ok(report)
-}
-
-/// The statement indices of each [`Plan::batches`] entry, in order. Empty for an empty plan.
-fn batch_ranges(plan: &Plan) -> Vec<std::ops::Range<usize>> {
-    let n = plan.statements.len();
-    match plan.commit_after {
-        _ if n == 0 => vec![],
-        Some(i) if i + 1 < n => vec![0..i + 1, i + 1..n],
-        _ => std::iter::once(0..n).collect(),
-    }
 }
 
 #[cfg(test)]
@@ -946,10 +1138,20 @@ mod tests {
     fn apply_messages_say_what_is_applied() {
         let lost = pgmig_conn::Error { code: None, message: "connection closed".into(), position: None };
         let server = pgmig_conn::Error { code: Some("23503".into()), message: "deferred fk".into(), position: None };
-        assert!(apply_message(&None, "COMMIT", &lost, &0).contains("may or may not be applied"));
-        assert!(apply_message(&None, "COMMIT", &server, &0).contains("rolled back; nothing was committed"));
-        assert!(apply_message(&None, "BEGIN", &lost, &1).contains("did not start; 1 earlier batch was committed"));
-        assert!(apply_message(&Some(2), "SELECT 1", &server, &0).starts_with("statement 3 failed: SELECT 1"));
+        assert!(apply_message(&None, "COMMIT", &lost, &0, &0, &false).contains("may or may not be applied"));
+        assert!(apply_message(&None, "COMMIT", &server, &0, &0, &false).contains("rolled back; nothing was committed"));
+        assert!(apply_message(&None, "BEGIN", &lost, &1, &0, &false).contains("did not start; 1 earlier batch was committed"));
+        assert!(apply_message(&Some(2), "SELECT 1", &server, &0, &0, &false).starts_with("statement 3 failed: SELECT 1"));
+        let build = "CREATE INDEX CONCURRENTLY t_x_idx ON public.t USING btree (x)";
+        let msg = apply_message(&Some(1), build, &server, &1, &0, &true);
+        assert!(msg.contains("ran outside a transaction and committed nothing; 1 earlier batch was committed and stays applied"), "{msg}");
+        let both = |batches, outside| apply_message(&Some(1), build, &server, &batches, &outside, &true);
+        assert!(both(1, 1).contains("1 earlier batch and 1 earlier statement outside a transaction committed and stay applied"));
+        assert!(both(2, 3).contains("2 earlier batches and 3 earlier statements outside a transaction committed and stay applied"));
+        assert!(both(0, 1).contains("1 earlier statement outside a transaction committed and stays applied"), "{}", both(0, 1));
+        assert!(both(0, 2).contains("2 earlier statements outside a transaction committed and stay applied"), "{}", both(0, 2));
+        assert!(msg.contains("INVALID index") && msg.contains("DROP INDEX CONCURRENTLY public.t_x_idx"), "{msg}");
+        assert!(!apply_message(&Some(1), build, &server, &1, &0, &false).contains("INVALID"));
     }
 
     #[test]
@@ -1080,18 +1282,17 @@ mod tests {
     }
 
     #[test]
-    fn batch_ranges_match_batches() {
-        let statements = |n: usize| (0..n).map(|i| format!("SELECT {i}")).collect::<Vec<_>>();
-        for (n, commit_after) in [(0, None), (3, None), (3, Some(0)), (3, Some(2)), (1, Some(0))] {
-            let plan = Plan { statements: statements(n), commit_after };
-            let ranges = batch_ranges(&plan);
-            let scripts: Vec<String> =
-                ranges.iter().map(|r| plan.statements[r.clone()].iter().map(|s| format!("{s};\n")).collect()).collect();
-            if n == 0 {
-                assert!(ranges.is_empty());
-            } else {
-                assert_eq!(scripts, plan.batches(), "n={n} commit_after={commit_after:?}");
-            }
-        }
+    fn a_failed_concurrent_build_names_the_index_to_drop() {
+        let name = concurrent_index_name;
+        assert_eq!(name("CREATE INDEX CONCURRENTLY t_x_idx ON public.t USING btree (x)").as_deref(), Some("public.t_x_idx"));
+        assert_eq!(
+            name("CREATE UNIQUE INDEX CONCURRENTLY \"Odd \"\"x\" ON app.\"T t\" USING btree (x)").as_deref(),
+            Some("app.\"Odd \"\"x\"")
+        );
+        assert_eq!(name("create index concurrently if not exists i on t (x)").as_deref(), Some("i"));
+        assert_eq!(name("CREATE INDEX CONCURRENTLY i ON ONLY app.t (x)").as_deref(), Some("app.i"));
+        assert_eq!(name("CREATE INDEX i ON public.t USING btree (x)"), None);
+        assert_eq!(name("DROP INDEX CONCURRENTLY i"), None);
+        assert_eq!(name("SELECT 1"), None);
     }
 }

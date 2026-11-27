@@ -82,27 +82,45 @@ pub fn edit_sql(sql: &str, editor: &[String]) -> Result<String> {
         .map_err(|e| Error::Io { path: tmp.path.clone(), source: std::io::Error::new(std::io::ErrorKind::InvalidData, e) })
 }
 
-/// A plan from SQL text such as [`Plan::to_sql`] prints: its statements, and the commit point a
-/// `-- pgmig:commit` line between two statements marks. A plan has at most one commit point, and
-/// no other directive. Errors name the text [`EDITED_PLAN`], with the line and column.
+/// A plan from SQL text such as [`Plan::to_sql`] prints: its statements, the commit point a
+/// `-- pgmig:commit` line between two statements marks, and the statements that run outside a
+/// transaction, each with `-- pgmig:notx` directly above it. A plan has at most one commit point,
+/// and no other directive. Errors name the text [`EDITED_PLAN`], with the line and column.
 pub fn plan_from_sql(text: &str) -> Result<Plan> {
     let path = PathBuf::from(EDITED_PLAN);
     let sql = pgmig_sql::split(text).map_err(|source| Error::Split { path: path.clone(), source })?;
     let all = sql.directives.iter().chain(sql.statements.iter().flat_map(|s| &s.directives));
-    if let Some(d) = all.filter(|d| d.name != "commit").min_by_key(|d| d.pos) {
-        let message = format!("pgmig:{} is not understood in a plan; only pgmig:commit is", d.name);
+    if let Some(d) = all.filter(|d| d.name != "commit" && d.name != "notx").min_by_key(|d| d.pos) {
+        let message = format!("pgmig:{} is not understood in a plan; only pgmig:commit and pgmig:notx are", d.name);
         return Err(Error::Directive { path, pos: d.pos, message });
     }
-    let commits = crate::migrate_apply::commit_points(&sql).map_err(|(pos, message)| Error::Directive {
-        path: path.clone(),
-        pos,
-        message: message.to_owned(),
-    })?;
-    if let Some((_, pos)) = commits.get(1) {
-        let message = "a plan has at most one commit point (pgmig:commit)".to_owned();
-        return Err(Error::Directive { path, pos: *pos, message });
+    let directive_error = |pos, message: &str| Error::Directive { path: path.clone(), pos, message: message.to_owned() };
+    let mut non_transactional = Vec::new();
+    if let Some(d) = sql.directives.iter().find(|d| d.name == "notx") {
+        return Err(directive_error(d.pos, "pgmig:notx must be on the line directly above a statement"));
     }
-    Ok(Plan { statements: sql.statements.into_iter().map(|s| s.sql).collect(), commit_after: commits.first().map(|(i, _)| i - 1) })
+    for (i, s) in sql.statements.iter().enumerate() {
+        for d in s.directives.iter().filter(|d| d.name == "notx") {
+            if d.pos > s.pos {
+                return Err(directive_error(d.pos, "pgmig:notx must be on the line directly above a statement, not inside one"));
+            }
+            if !d.args.is_empty() {
+                return Err(directive_error(d.pos, "pgmig:notx takes no arguments"));
+            }
+            if non_transactional.last() != Some(&i) {
+                non_transactional.push(i);
+            }
+        }
+    }
+    let commits = crate::migrate_apply::commit_points(&sql).map_err(|(pos, message)| directive_error(pos, message))?;
+    if let Some((_, pos)) = commits.get(1) {
+        return Err(directive_error(*pos, "a plan has at most one commit point (pgmig:commit)"));
+    }
+    Ok(Plan {
+        statements: sql.statements.into_iter().map(|s| s.sql).collect(),
+        commit_after: commits.first().map(|(i, _)| i - 1),
+        non_transactional,
+    })
 }
 
 /// Check the text of an edited migration as `migrate apply` would read it: it splits, and its
@@ -127,11 +145,22 @@ mod tests {
         let plan = Plan {
             statements: vec!["ALTER TYPE e ADD VALUE 'b'".into(), "CREATE TABLE t (c e DEFAULT 'b')".into(), "SELECT ';'".into()],
             commit_after: Some(0),
+            ..Plan::default()
         };
         assert_eq!(plan_from_sql(&plan.to_sql()).expect("parse"), plan);
-        let one = Plan { statements: vec!["SELECT 1".into()], commit_after: None };
+        let one = Plan { statements: vec!["SELECT 1".into()], ..Plan::default() };
         assert_eq!(plan_from_sql(&one.to_sql()).expect("parse"), one);
         assert_eq!(plan_from_sql("-- nothing\n").expect("parse"), Plan::default());
+    }
+
+    #[test]
+    fn statements_outside_a_transaction_round_trip() {
+        let statements =
+            ["ALTER TYPE e ADD VALUE 'b'", "CREATE INDEX CONCURRENTLY i ON t (c)", "ALTER TABLE t ADD d int", "DROP INDEX CONCURRENTLY j"];
+        let plan = Plan { statements: statements.map(Into::into).to_vec(), commit_after: Some(0), non_transactional: vec![1, 3] };
+        let sql = plan.to_sql();
+        assert!(sql.contains("-- pgmig:notx\nCREATE INDEX CONCURRENTLY"), "{sql}");
+        assert_eq!(plan_from_sql(&sql).expect("parse"), plan);
     }
 
     #[test]
@@ -142,6 +171,10 @@ mod tests {
         assert!(err.to_string().starts_with("edited plan:4:1: a plan has at most one"), "{err}");
         let err = plan_from_sql("-- pgmig:txmode none\nSELECT 1;\n").expect_err("txmode");
         assert!(err.to_string().starts_with("edited plan:1:1: pgmig:txmode is not understood"), "{err}");
+        let err = plan_from_sql("-- pgmig:notx\n\nSELECT 1;\n").expect_err("detached");
+        assert!(err.to_string().starts_with("edited plan:1:1: pgmig:notx must be on the line directly above"), "{err}");
+        let err = plan_from_sql("-- pgmig:notx now\nSELECT 1;\n").expect_err("arguments");
+        assert!(err.to_string().starts_with("edited plan:1:1: pgmig:notx takes no arguments"), "{err}");
     }
 
     #[cfg(unix)]

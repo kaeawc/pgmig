@@ -23,6 +23,7 @@
 //! | `migrations.after_sql` | `--after-sql` | string |
 //! | `diff.skip` | `--skip` | array of kinds of change (`"drop_table"`, ...; [`pgmig_diff::ChangeKind`]) |
 //! | `diff.verify` | `--verify` (`schema apply`, `migrate diff`) | boolean |
+//! | `diff.concurrent_indexes` | `--concurrent-indexes` | boolean |
 //!
 //! Top-level keys apply everywhere; an `[env.<name>]` section overrides them key by key (an array
 //! replaces the one below it, it does not extend it). [`Config::resolve`] applies the precedence
@@ -75,6 +76,8 @@ pub struct Settings {
     pub diff_skip: Option<Vec<String>>,
     /// `[diff] verify`: check plans in a shadow database before applying or writing them.
     pub diff_verify: Option<bool>,
+    /// `[diff] concurrent_indexes`: create and drop indexes `CONCURRENTLY`.
+    pub diff_concurrent_indexes: Option<bool>,
 }
 
 impl fmt::Debug for Settings {
@@ -99,6 +102,7 @@ impl fmt::Debug for Settings {
             .field("migrations_after_sql", &self.migrations_after_sql)
             .field("diff_skip", &self.diff_skip)
             .field("diff_verify", &self.diff_verify)
+            .field("diff_concurrent_indexes", &self.diff_concurrent_indexes)
             .finish()
     }
 }
@@ -369,15 +373,16 @@ fn settings(table: &toml::Table, prefix: &str, problems: &mut Vec<Problem>) -> S
                 toml::Value::Table(d) => {
                     for (k, v) in d {
                         let path = join(&path, k);
-                        if k == "verify" {
+                        if k == "verify" || k == "concurrent_indexes" {
                             match v {
-                                toml::Value::Boolean(b) => s.diff_verify = Some(*b),
+                                toml::Value::Boolean(b) if k == "verify" => s.diff_verify = Some(*b),
+                                toml::Value::Boolean(b) => s.diff_concurrent_indexes = Some(*b),
                                 _ => problems.push(Problem::key(&path, "expected a boolean")),
                             }
                             continue;
                         }
                         if k != "skip" {
-                            problems.push(Problem::key(&path, "unknown key (expected `skip` or `verify`)"));
+                            problems.push(Problem::key(&path, "unknown key (expected `skip`, `verify` or `concurrent_indexes`)"));
                             continue;
                         }
                         let toml::Value::Array(items) = v else {
@@ -660,6 +665,7 @@ impl Config {
             migrations_after_sql,
             diff_skip,
             diff_verify: section.diff_verify.or(self.top.diff_verify),
+            diff_concurrent_indexes: section.diff_concurrent_indexes.or(self.top.diff_concurrent_indexes),
         })
     }
 }
@@ -832,7 +838,7 @@ exclude = ["e"]
 schema = "app"
 format = "text"
 migrations = { dir = "m", revisions_schema = "ops", tx_mode = "none", exec_order = "linear-skip", lock_name = "l", lock_timeout = "5s", before_sql = "SET LOCAL lock_timeout = '1s'", after_sql = "SELECT 1" }
-diff = { skip = ["drop_table", "drop_column"], verify = true }
+diff = { skip = ["drop_table", "drop_column"], verify = true, concurrent_indexes = true }
 "#,
         );
         let s = c.resolve(None, &Vars::only(BTreeMap::new())).expect("resolve");
@@ -855,6 +861,7 @@ diff = { skip = ["drop_table", "drop_column"], verify = true }
             migrations_after_sql: Some("SELECT 1".into()),
             diff_skip: Some(vec!["drop_table".into(), "drop_column".into()]),
             diff_verify: Some(true),
+            diff_concurrent_indexes: Some(true),
         };
         assert_eq!(s, want);
         assert!(c.envs.is_empty());
@@ -920,7 +927,7 @@ skip = true
         assert_eq!(got.len(), 4, "{got:?}");
         assert!(got[0].starts_with("diff.skip[1]: unknown kind of change \"drop_tables\" (expected one of create_schema,"), "{got:?}");
         assert_eq!(got[1], "diff.skip[2]: expected a string");
-        assert_eq!(got[2], "diff.skipp: unknown key (expected `skip` or `verify`)");
+        assert_eq!(got[2], "diff.skipp: unknown key (expected `skip`, `verify` or `concurrent_indexes`)");
         assert_eq!(got[3], "env.prod.diff.skip: expected an array of kinds of change");
         // An environment replaces the list; a placeholder is checked once interpolated.
         let c = parse("[diff]\nskip = [\"drop_table\"]\n[env.prod.diff]\nskip = [\"${KIND}\"]\n");
@@ -941,6 +948,17 @@ skip = true
         assert_eq!(c.resolve(None, &vars(&[])).expect("top").diff_verify, Some(true));
         assert_eq!(c.resolve(Some("dev"), &vars(&[])).expect("dev").diff_verify, Some(false));
         assert_eq!(parse("").resolve(None, &vars(&[])).expect("empty").diff_verify, None);
+    }
+
+    #[test]
+    fn diff_concurrent_indexes_is_a_boolean_an_environment_overrides() {
+        let got = problems("[diff]\nconcurrent_indexes = \"yes\"\n[env.dev.diff]\nconcurrent_indexes = 1\n");
+        assert_eq!(got, ["diff.concurrent_indexes: expected a boolean", "env.dev.diff.concurrent_indexes: expected a boolean"]);
+        let c = parse("[diff]\nconcurrent_indexes = true\n[env.dev.diff]\nconcurrent_indexes = false\n[env.qa]\n");
+        assert_eq!(c.resolve(None, &vars(&[])).expect("top").diff_concurrent_indexes, Some(true));
+        assert_eq!(c.resolve(Some("dev"), &vars(&[])).expect("dev").diff_concurrent_indexes, Some(false));
+        assert_eq!(c.resolve(Some("qa"), &vars(&[])).expect("qa").diff_concurrent_indexes, Some(true));
+        assert_eq!(parse("").resolve(None, &vars(&[])).expect("empty").diff_concurrent_indexes, None);
     }
 
     #[test]

@@ -2,6 +2,7 @@
 mod apply;
 mod apply_report;
 mod clean;
+mod concurrent_indexes;
 mod config;
 #[cfg(unix)]
 mod edit;

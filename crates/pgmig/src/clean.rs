@@ -459,6 +459,7 @@ mod tests {
             unique: false,
             columns: columns.iter().map(|c| c.to_string()).collect(),
             comment: None,
+            on_partitioned_table: false,
         };
         let mut full = model();
         let gone = QualName::new("public", "gone");

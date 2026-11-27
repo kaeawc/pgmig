@@ -245,3 +245,43 @@ fn migrate_diff_verify_writes_nothing_when_the_edit_misses_a_change() {
     assert!(out.contains("verification failed") && out.contains("add_column public.t.age"), "{out}");
     assert!(sql_files(&dir).is_empty() && !dir.join("pgmig.sum").exists());
 }
+
+#[test]
+fn an_edited_plan_keeps_its_statements_outside_a_transaction() {
+    // The editor only adds a comment: the marker above the concurrent build must survive the round
+    // trip through the text, or the build would run in a transaction and fail.
+    let editor = Editor::new("printf -- '-- reviewed\\n' >> \"$1\"");
+    let db = TestDb::new();
+    db.connect().batch("CREATE TABLE t (id int, a int);").expect("load target");
+    let desired = SqlFile::new("CREATE TABLE t (id int, a int);\nCREATE INDEX t_a_idx ON t (a);");
+    let (shadow, _keep) = shadow_arg();
+    let (code, out) = pgmig_tty(&[&apply_args(&db, &desired.path(), &shadow)[..], &["--concurrent-indexes"]].concat(), &editor);
+    assert_eq!(code, Some(0), "{out}");
+    // A pseudo-terminal ends lines with CR LF.
+    let out = out.replace("\r\n", "\n");
+    assert!(out.contains("-- pgmig:notx\nCREATE INDEX CONCURRENTLY t_a_idx"), "{out}");
+    assert!(out.contains("applied 1 statements: 0 in 0 transaction(s), 1 outside a transaction"), "{out}");
+    let rows = db.connect().query("SELECT indisvalid FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid WHERE i.relname = 't_a_idx'");
+    assert_eq!(rows.expect("query"), vec![vec![Some("t".to_owned())]]);
+}
+
+#[test]
+fn migrate_diff_edit_is_refused_when_the_plan_needs_several_files() {
+    let editor = Editor::new("");
+    let (shadow, _keep) = shadow_arg();
+    let root = Editor::new("");
+    let dir = root.0.join("migrations");
+    let dir_arg = dir.to_string_lossy().into_owned();
+    let base = SqlFile::new("CREATE TABLE t (id int);");
+    let out = pgmig(&["migrate", "diff", "init", "--dir", &dir_arg, "--to", &base.path(), "--shadow", &shadow]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+
+    let desired = SqlFile::new("CREATE TABLE t (id int, name text);\nCREATE INDEX t_name ON t (name);");
+    let args =
+        ["migrate", "diff", "idx", "--dir", &dir_arg, "--to", &desired.path(), "--shadow", &shadow, "--edit", "--concurrent-indexes"];
+    let (code, out) = pgmig_tty(&args, &editor);
+    assert_eq!(code, Some(2), "{out}");
+    assert!(out.contains("--edit cannot be combined with concurrent_indexes"), "{out}");
+    assert!(!editor.0.join("seen").exists(), "the editor was not run");
+    assert_eq!(sql_files(&dir).len(), 1);
+}

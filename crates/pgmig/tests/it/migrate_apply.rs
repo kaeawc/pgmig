@@ -365,6 +365,7 @@ fn add_value_and_use(then: &str) -> String {
             then.into(),
         ],
         commit_after: Some(0),
+        ..pgmig::Plan::default()
     };
     let sql = plan.to_sql();
     assert!(sql.contains("\n-- pgmig:commit\nALTER TABLE"), "{sql}");

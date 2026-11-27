@@ -302,10 +302,16 @@ pub struct MigrateDiffRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MigrateDiffResponse {
-    /// The migration written; null when there were no changes and nothing was written.
+    /// The migration written (the first, when there are several: see `files`); null when there
+    /// were no changes and nothing was written.
     pub file: Option<PathBuf>,
     /// Its version; null when nothing was written.
     pub version: Option<String>,
+    /// Every migration written, in version order. More than one when the plan has statements that
+    /// cannot run in a transaction (`concurrent_indexes`): one file per unit of the plan. Empty
+    /// when nothing was written.
+    #[serde(default)]
+    pub files: Vec<crate::NewMigration>,
     /// The plan from the replayed directory to the desired state (schema-qualified).
     pub plan: Plan,
     pub changes: Vec<Change>,
@@ -313,7 +319,8 @@ pub struct MigrateDiffResponse {
     #[serde(default)]
     pub skipped: Vec<Skipped>,
     /// The new file's contents: `plan` rendered as a SQL script ([`Plan::to_sql`]), or with
-    /// `editor`, what the editor saved.
+    /// `editor`, what the editor saved. With several files, the plan as one script; the files hold
+    /// its units.
     pub sql: String,
     /// Whether the editor was run (only with `editor`, and changes to edit).
     #[serde(default)]
@@ -725,8 +732,12 @@ pub struct ApplyFailure {
     pub statement_index: Option<usize>,
     /// The failing statement (`BEGIN` or `COMMIT` included).
     pub statement: String,
-    /// Batches committed before the failing one; their changes stay applied.
+    /// Transactions committed before the failing statement; their changes stay applied.
     pub committed_batches: usize,
+    /// Statements that ran outside a transaction before it and committed by themselves; their
+    /// changes stay applied too. Left out of the JSON when none did.
+    #[serde(default, skip_serializing_if = "crate::is_zero")]
+    pub committed_outside_transaction: usize,
     pub outcome: ApplyOutcome,
 }
 
@@ -738,6 +749,9 @@ pub enum ApplyOutcome {
     RolledBack,
     /// `BEGIN` failed: the batch never started.
     NotStarted,
+    /// A statement that runs outside a transaction failed: it committed nothing, but a failed
+    /// `CREATE INDEX CONCURRENTLY` may have left an `INVALID` index behind.
+    StatementFailed,
     /// The connection failed during `COMMIT`: the batch may or may not be applied.
     Unknown,
 }
@@ -868,8 +882,9 @@ impl From<&Error> for ApiError {
             Error::Inspect(pgmig_inspect::Error::Query { source, .. }) => err(ErrorCode::Inspect).sqlstate(source),
             Error::Inspect(_) => err(ErrorCode::Inspect),
             Error::Plan(_) => err(ErrorCode::Plan),
-            Error::Apply { statement_index, statement, source, committed_batches } => {
+            Error::Apply { statement_index, statement, source, committed_batches, committed_outside_transaction, outside_transaction } => {
                 let outcome = match (statement_index, statement.as_str()) {
+                    _ if *outside_transaction => ApplyOutcome::StatementFailed,
                     (None, "BEGIN") => ApplyOutcome::NotStarted,
                     (None, "COMMIT") if source.code.is_none() => ApplyOutcome::Unknown,
                     _ => ApplyOutcome::RolledBack,
@@ -879,6 +894,7 @@ impl From<&Error> for ApiError {
                     statement_index: *statement_index,
                     statement: statement.clone(),
                     committed_batches: *committed_batches,
+                    committed_outside_transaction: *committed_outside_transaction,
                     outcome,
                 }));
                 e
@@ -1084,8 +1100,17 @@ pub fn migrate_validate(req: &MigrateValidateRequest) -> Result<MigrateValidateR
 /// [`crate::migrate_diff`].
 pub fn migrate_diff(req: &MigrateDiffRequest) -> Result<MigrateDiffResponse, ApiError> {
     let res = crate::migrate_diff_with(&req.dir, &req.name, &req.to, &req.shadow, &req.options, req.editor.as_deref(), req.verify)?;
-    let (file, version) = res.written.map(|w| (w.path, w.version)).unzip();
-    Ok(MigrateDiffResponse { file, version, sql: res.sql, plan: res.plan, changes: res.changes, skipped: res.skipped, edited: res.edited })
+    let (file, version) = res.written.first().map(|w| (w.path.clone(), w.version.clone())).unzip();
+    Ok(MigrateDiffResponse {
+        file,
+        version,
+        files: res.written,
+        sql: res.sql,
+        plan: res.plan,
+        changes: res.changes,
+        skipped: res.skipped,
+        edited: res.edited,
+    })
 }
 
 /// [`crate::migrate_new`].
@@ -1205,7 +1230,7 @@ mod tests {
     }
 
     fn plan() -> Plan {
-        Plan { statements: vec!["CREATE SCHEMA app".into()], commit_after: None }
+        Plan { statements: vec!["CREATE SCHEMA app".into()], ..Plan::default() }
     }
 
     #[test]
@@ -1317,10 +1342,11 @@ mod tests {
         let fp = FingerprintResponse { fingerprint: crate::fingerprint(&Model::empty_database()) };
         assert_eq!(round_trip(&fp), format!(r#"{{"fingerprint":"{}"}}"#, fp.fingerprint));
         round_trip(&PlanApplyResponse { plan: plan(), sql: plan().to_sql(), changes, skipped });
-        round_trip(&ApplyReport { batches: 2, statements: 5 });
+        round_trip(&ApplyReport { batches: 2, statements: 5, non_transactional: 1 });
         round_trip(&MigrateDiffResponse {
             file: Some("m/1_a.sql".into()),
             version: Some("1".into()),
+            files: vec![crate::NewMigration { path: "m/1_a.sql".into(), version: "1".into() }],
             plan: plan(),
             sql: plan().to_sql(),
             changes: vec![],
@@ -1441,7 +1467,14 @@ mod tests {
         assert_eq!((e.file.as_deref(), e.line, e.col), (Some(std::path::Path::new("b.sql")), Some(4), Some(8)));
         assert_eq!(e.message, load.to_string());
         assert!(is_diagnostic(&load));
-        let apply = Error::Apply { statement_index: Some(0), statement: "SELECT 1".into(), source: server(), committed_batches: 0 };
+        let apply = Error::Apply {
+            statement_index: Some(0),
+            statement: "SELECT 1".into(),
+            source: server(),
+            committed_batches: 0,
+            committed_outside_transaction: 0,
+            outside_transaction: false,
+        };
         let e = ApiError::from(&apply);
         assert_eq!((e.code, e.sqlstate.as_deref(), e.file), (ErrorCode::Apply, Some("42704"), None));
         assert!(!is_diagnostic(&apply));
@@ -1453,7 +1486,14 @@ mod tests {
     fn apply_errors_are_structured() {
         let apply = |statement_index, statement: &str, code: Option<&str>| {
             let source = pgmig_conn::Error { code: code.map(Into::into), message: "boom".into(), position: None };
-            let e = Error::Apply { statement_index, statement: statement.into(), source, committed_batches: 2 };
+            let e = Error::Apply {
+                statement_index,
+                statement: statement.into(),
+                source,
+                committed_batches: 2,
+                committed_outside_transaction: 0,
+                outside_transaction: false,
+            };
             serde_json::to_string(&ApiError::from(&e)).expect("serialize")
         };
         let tail = |index: &str, statement: &str, outcome: &str| {

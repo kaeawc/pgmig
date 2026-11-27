@@ -3,6 +3,7 @@ mod api;
 mod apply;
 mod casts;
 mod clean;
+mod concurrent_indexes;
 mod corpus;
 mod filters;
 mod fingerprint;
