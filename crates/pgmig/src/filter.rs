@@ -415,9 +415,19 @@ mod tests {
             comment: None,
             constraints: vec![check],
             indexes: vec![index("t_id_idx", "id"), index("t_legacy_idx", "legacy")],
+            partition_key: None,
+            partition_of: None,
         };
         m.tables.insert(t.name.clone(), t);
-        let tmp = Table { name: q("public", "tmp_x"), columns: vec![], comment: None, constraints: vec![], indexes: vec![] };
+        let tmp = Table {
+            name: q("public", "tmp_x"),
+            columns: vec![],
+            comment: None,
+            constraints: vec![],
+            indexes: vec![],
+            partition_key: None,
+            partition_of: None,
+        };
         m.tables.insert(tmp.name.clone(), tmp);
         m.enums.insert(q("app", "mood"), Enum { name: q("app", "mood"), labels: vec![], comment: None });
         let domain = pgmig_model::Domain {

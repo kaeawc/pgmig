@@ -8,6 +8,25 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
 
 ### Added
 
+- Declarative partitioning: range, list and hash partitioned tables, sub-partitions and default
+  partitions are inspected, diffed and planned. The model gains `Table.partition_key`
+  (`pg_get_partkeydef`) and `Table.partition_of` (`parent`, and `bound` as `pg_get_expr(relpartbound)`
+  prints it), left out of the JSON and the fingerprint when unset. A partition's model holds only
+  what is its own: the columns that differ from its parent's, and the constraints and indexes the
+  catalog does not mark as its parent's (an index or key of its own stays even when defined like
+  the parent's), so a partition reads the same whether it was created with `PARTITION OF` or
+  attached. Plans write `CREATE TABLE ... PARTITION BY ...` and `CREATE TABLE ... PARTITION OF ...
+  <bound>`, create partitions after their parent and drop them before it (`schema clean` too),
+  `DETACH PARTITION` a partition kept as a standalone table before its parent changes, make a
+  standalone table's columns and checks match its parent's and then `ATTACH PARTITION` it, and
+  detach and attach again a partition whose bound changes, after the changes to its parent reach
+  it. A comment on a partition's column is set with `COMMENT ON COLUMN`. A changed partition key, a table becoming partitioned or not, a partition
+  moving to another parent, changes to a partition's own columns, and a detach from a table with
+  indexes or primary key, unique or exclusion constraints are refused as unsupported, naming the
+  table. An index on a partitioned table is created on its partitions too (Postgres prints it
+  `ON ONLY`). New kinds of change: `attach_partition`, `detach_partition`,
+  `unsupported_partition_change`.
+
 - Saved plans: `pgmig schema plan --url <db> --to <desired> --out plan.json` writes the plan
   `schema apply` would run (same flags, `--verify` included) as a versioned JSON file with its SQL
   and the `h1:` fingerprints of the database it was planned for (`from`) and of the desired state

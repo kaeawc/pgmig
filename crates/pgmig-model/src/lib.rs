@@ -92,6 +92,111 @@ pub struct Table {
     /// constraint's index is the constraint's), by name. Absent from older JSON: none.
     #[serde(default)]
     pub indexes: Vec<Index>,
+    /// `PARTITION BY`: `pg_get_partkeydef` of a partitioned table (`relkind = 'p'`), such as
+    /// `RANGE (id)`. Absent from older JSON, and left out of it when `None`: not partitioned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition_key: Option<String>,
+    /// The table is a partition (`relispartition`) of another one. A partition holds only what is
+    /// its own: the columns, constraints and indexes it has from its parent are the parent's, so
+    /// [`Table::columns`] lists only the columns that differ from the parent's (see
+    /// [`partition_column_differs`]), and its constraints and indexes only those the catalog does
+    /// not mark as the parent's (on pgmem, which leaves the marks unset, those
+    /// [`inherited_constraint`] and [`inherited_index`] do not match). Absent from older JSON, and
+    /// left out of it when `None`: not a partition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition_of: Option<PartitionOf>,
+}
+
+/// What a partition is a partition of.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartitionOf {
+    /// The partitioned table (`pg_inherits.inhparent`).
+    pub parent: QualName,
+    /// `pg_get_expr(relpartbound, oid)`: `FOR VALUES FROM (1) TO (10)`, `FOR VALUES IN ('a')`,
+    /// `FOR VALUES WITH (modulus 4, remainder 0)` or `DEFAULT`.
+    pub bound: String,
+}
+
+/// Whether a partition's column `child` differs from its parent's column `parent` of the same name,
+/// so the partition's model lists it: a different type, `NOT NULL` or default, or a comment of its
+/// own (Postgres does not copy comments to partitions). Identity is the parent's.
+pub fn partition_column_differs(child: &Column, parent: &Column) -> bool {
+    partition_column_own(child, parent) || child.comment.is_some()
+}
+
+/// Whether a partition's column `child` differs from its parent's column `parent` in what Postgres
+/// keeps in step with the parent (type, `NOT NULL`, default). A column that differs only by its
+/// comment is the parent's, with a comment of the partition's.
+pub fn partition_column_own(child: &Column, parent: &Column) -> bool {
+    child.type_name != parent.type_name || child.not_null != parent.not_null || child.default != parent.default
+}
+
+/// Whether constraint `child` of a partition is the one it has from its parent's constraint
+/// `parent`: of the same kind and definition, and for a check or foreign key of the same name (a
+/// partition's primary key, unique or exclusion constraint is named after the partition).
+pub fn inherited_constraint(parent: &Constraint, child: &Constraint) -> bool {
+    parent.kind == child.kind
+        && parent.definition == child.definition
+        && (parent.name == child.name
+            || matches!(child.kind, ConstraintKind::PrimaryKey | ConstraintKind::Unique | ConstraintKind::Exclusion))
+}
+
+/// Whether index `child` of partition `child_table` is the one it has from index `parent` of its
+/// parent `parent_table` (or the one `ATTACH PARTITION` makes it): the same definition but for the
+/// names and the parent's `ONLY`. Postgres names a partition's index after the partition.
+pub fn inherited_index(parent_table: &QualName, parent: &Index, child_table: &QualName, child: &Index) -> bool {
+    parent.unique == child.unique
+        && index_body(parent_table, parent).is_some_and(|p| index_body(child_table, child).is_some_and(|c| p == c))
+}
+
+/// [`Index::definition`] after `CREATE [UNIQUE] INDEX <name> ON [ONLY] <table> `: the method,
+/// columns and options. `None` when it is not in the form the server prints.
+fn index_body<'a>(table: &QualName, i: &'a Index) -> Option<&'a str> {
+    let d = &i.definition;
+    let rest = d.strip_prefix("CREATE UNIQUE INDEX ").or_else(|| d.strip_prefix("CREATE INDEX "))?;
+    let rest = rest.strip_prefix(quote_ident(&i.name).as_str())?.strip_prefix(" ON ")?;
+    let rest = rest.strip_prefix("ONLY ").unwrap_or(rest);
+    rest.strip_prefix(table.to_string().as_str())?.strip_prefix(' ')
+}
+
+impl Model {
+    /// The columns `table` has in the database: its own, or for a partition its parent's (as it
+    /// has them, recursively) with the partition's own in their place, without the parent's
+    /// comments. `None` when the table, or a parent of a partition, is not in the model.
+    pub fn table_columns(&self, table: &QualName) -> Option<Vec<Column>> {
+        self.table_columns_within(table, self.tables.len())
+    }
+
+    fn table_columns_within(&self, table: &QualName, depth: usize) -> Option<Vec<Column>> {
+        let t = self.tables.get(table)?;
+        let Some(p) = &t.partition_of else { return Some(t.columns.clone()) };
+        let parent = self.table_columns_within(&p.parent, depth.checked_sub(1)?)?;
+        Some(
+            parent
+                .into_iter()
+                .map(|c| match t.column(&c.name) {
+                    Some(own) => own.clone(),
+                    None => Column { comment: None, ..c },
+                })
+                .collect(),
+        )
+    }
+
+    /// The tables `table` is a partition of, nearest first (none for a table that is not a
+    /// partition). Stops at a parent the model does not have.
+    pub fn partition_ancestors(&self, table: &QualName) -> Vec<&Table> {
+        let mut out: Vec<&Table> = Vec::new();
+        let mut at = self.tables.get(table);
+        while let Some(p) = at.and_then(|t| t.partition_of.as_ref()) {
+            let Some(parent) = self.tables.get(&p.parent) else { break };
+            if out.iter().any(|t| t.name == parent.name) {
+                break;
+            }
+            out.push(parent);
+            at = Some(parent);
+        }
+        out
+    }
 }
 
 impl Table {
@@ -844,7 +949,15 @@ mod tests {
         };
         m.tables.insert(
             t.clone(),
-            Table { name: t.clone(), columns, comment: Some("people".into()), constraints: vec![pk, fk], indexes: vec![index] },
+            Table {
+                name: t.clone(),
+                columns,
+                comment: Some("people".into()),
+                constraints: vec![pk, fk],
+                indexes: vec![index],
+                partition_key: None,
+                partition_of: None,
+            },
         );
         let mood = QualName::new("app", "mood");
         m.enums.insert(mood.clone(), Enum { name: mood, labels: vec!["sad".into(), "ok".into()], comment: None });
@@ -975,7 +1088,18 @@ mod tests {
             comment: None,
             on_partitioned_table: false,
         };
-        m.tables.insert(t.clone(), Table { name: t, columns: vec![id], comment: None, constraints: vec![check], indexes: vec![index] });
+        m.tables.insert(
+            t.clone(),
+            Table {
+                name: t,
+                columns: vec![id],
+                comment: None,
+                constraints: vec![check],
+                indexes: vec![index],
+                partition_key: None,
+                partition_of: None,
+            },
+        );
         let want = r#"{
   "schemas": [
     {

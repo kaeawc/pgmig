@@ -8,7 +8,7 @@
 //! holding it, the enum, domain, composite type or table row type a column uses (and those a kept
 //! domain is over or a kept composite type's attributes use), the sequence a default takes values from
 //! or that owns a sequence, the table, columns and key a foreign key references, the columns a
-//! constraint or index uses. Each is reported as [`Kept`]. A table that stays keeps its unmanaged
+//! constraint or index uses, the partitioned table a partition is of. Each is reported as [`Kept`]. A table that stays keeps its unmanaged
 //! indexes; managed indexes go (with their table, or alone when the table stays).
 //!
 //! The revisions schema is never managed, so it stays with the migration history it records.
@@ -175,6 +175,9 @@ fn needs(full: &Model, d: &Model) -> Vec<(Need, String)> {
     for t in d.tables.values() {
         let table = format!("table {}", t.name);
         out.push((Need::Schema(t.name.schema.clone()), format!("{table} is in it")));
+        if let Some(p) = &t.partition_of {
+            out.push((Need::Table(p.parent.clone()), format!("{table} is a partition of it")));
+        }
         for c in &t.columns {
             let col = format!("column {}.{}", t.name, pgmig_model::quote_ident(&c.name));
             if let Some(r) = &c.type_ref
@@ -370,7 +373,18 @@ mod tests {
         m.enums.insert(mood.clone(), Enum { name: mood.clone(), labels: vec!["a".into()], comment: None });
         for (name, cols) in [("keep", vec![col("m", Some(mood.clone()))]), ("gone", vec![col("id", None)])] {
             let n = QualName::new("public", name);
-            m.tables.insert(n.clone(), Table { name: n, columns: cols, comment: None, constraints: vec![], indexes: vec![] });
+            m.tables.insert(
+                n.clone(),
+                Table {
+                    name: n,
+                    columns: cols,
+                    comment: None,
+                    constraints: vec![],
+                    indexes: vec![],
+                    partition_key: None,
+                    partition_of: None,
+                },
+            );
         }
         m
     }

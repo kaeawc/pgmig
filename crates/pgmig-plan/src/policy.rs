@@ -52,7 +52,7 @@ use pgmig_model::{ConstraintKind, QualName, quote_ident, quote_literal};
 use serde::{Deserialize, Serialize};
 
 use crate::graph::{Deps, Object};
-use crate::{PlanOptions, deps, is_unsupported, statement};
+use crate::{Partitions, PlanOptions, deps, is_unsupported, statement};
 
 /// A change the policy left out. Serialized as `{"kind", "object", "statement", "because"}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,7 +93,8 @@ pub fn skip(changes: &[Change], kinds: &BTreeSet<ChangeKind>, opts: &PlanOptions
     if kinds.is_empty() {
         return (changes.to_vec(), Vec::new());
     }
-    let deps: Vec<Deps> = changes.iter().map(deps).collect();
+    let partitions = Partitions::of(changes);
+    let deps: Vec<Deps> = changes.iter().map(|c| deps(c, &partitions)).collect();
     let statements: Vec<Option<String>> = changes.iter().map(|c| (!is_unsupported(c)).then(|| statement(c, opts))).collect();
     let cause = |j: usize| Cause { kind: changes[j].kind(), object: changes[j].object() };
     // For each change: None (kept), or Some(None) (skipped by kind), or Some(Some(cause)).
@@ -246,7 +247,15 @@ mod tests {
     }
 
     fn table(schema: &str, name: &str) -> Table {
-        Table { name: QualName::new(schema, name), columns: vec![col("id")], comment: None, constraints: vec![], indexes: vec![] }
+        Table {
+            name: QualName::new(schema, name),
+            columns: vec![col("id")],
+            comment: None,
+            constraints: vec![],
+            indexes: vec![],
+            partition_key: None,
+            partition_of: None,
+        }
     }
 
     fn kinds(k: &[ChangeKind]) -> BTreeSet<ChangeKind> {

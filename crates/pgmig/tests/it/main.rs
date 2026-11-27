@@ -17,6 +17,7 @@ mod migrate_diff;
 mod migrate_maintain;
 mod migrate_resume;
 mod migrate_status;
+mod partitions;
 mod policy;
 mod quoting;
 mod revisions;

@@ -21,7 +21,8 @@
 //! - tables: name, comment; columns by name (column order is not compared: Postgres cannot reorder
 //!   columns, so a diff never tries to), each with its type, `NOT NULL`, default, comment and
 //!   identity (how it is generated and its sequence options); constraints by name, each with its
-//!   kind, definition and comment; indexes by name, each with its definition and comment.
+//!   kind, definition and comment; indexes by name, each with its definition and comment; a
+//!   partitioned table's partition key, and a partition's parent and bound.
 //!
 //! Left out, because they are derived from what enters or are named by the server rather than by
 //! the schema: [`Column::type_ref`] and [`Column::default_sequences`] (read from the type and the
@@ -30,7 +31,7 @@
 //! is the catalog's), and an index's uniqueness and columns (its definition says them) and whether its
 //! table is partitioned (the table says that).
 //!
-//! Indexes, domains and composite types entered the fingerprint without a new [`FORMAT`]: a model
+//! Indexes, domains, composite types and partitioning entered the fingerprint without a new [`FORMAT`]: a model
 //! without them writes no record of them, so its fingerprint is what it was. A schema with them
 //! fingerprints differently from before, as it should: earlier versions did not read them at all.
 //!
@@ -50,7 +51,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     Attribute, Column, Composite, Constraint, ConstraintKind, Domain, DomainConstraint, Enum, Generated, Identity, Index, Model, OwnedBy,
-    QualName, Schema, Sequence, SequenceOptions, Table,
+    PartitionOf, QualName, Schema, Sequence, SequenceOptions, Table,
 };
 
 /// The first line of the canonical text. Changing what enters the fingerprint, or how it is
@@ -126,8 +127,15 @@ pub fn canonical(model: &Model) -> String {
         w.opt(comment).end();
     }
     for t in tables.values() {
-        let Table { name, columns, comment, constraints, indexes } = t;
+        let Table { name, columns, comment, constraints, indexes, partition_key, partition_of } = t;
         w.tag("table").name(name).opt(comment).end();
+        // Written only for partitioned tables and partitions, so other tables keep their records.
+        if let Some(key) = partition_key {
+            w.tag("partition_key").str(key).end();
+        }
+        if let Some(PartitionOf { parent, bound }) = partition_of {
+            w.tag("partition_of").name(parent).str(bound).end();
+        }
         let mut columns: Vec<_> = columns.iter().collect();
         columns.sort_by(|a, b| a.name.cmp(&b.name));
         for c in columns {
@@ -366,7 +374,18 @@ mod tests {
                 on_partitioned_table: false,
             },
         ];
-        m.tables.insert(t(), Table { name: t(), columns, comment: Some("people".into()), constraints: vec![pk, fk], indexes });
+        m.tables.insert(
+            t(),
+            Table {
+                name: t(),
+                columns,
+                comment: Some("people".into()),
+                constraints: vec![pk, fk],
+                indexes,
+                partition_key: None,
+                partition_of: None,
+            },
+        );
         let mood = QualName::new("app", "mood");
         m.enums.insert(mood.clone(), Enum { name: mood, labels: vec!["sad".into(), "ok".into()], comment: None });
         let seq = QualName::new("app", "users_n_seq");
@@ -511,6 +530,15 @@ index 14:users_team_idx 76:CREATE INDEX users_team_idx ON app.users USING btree 
             ("index definition", |m| table(m).indexes[0].definition = "CREATE INDEX users_team_idx ON app.users USING hash (team)".into()),
             ("index comment", |m| table(m).indexes[1].comment = Some("x".into())),
             ("index dropped", |m| table(m).indexes.truncate(1)),
+            ("partition key", |m| table(m).partition_key = Some("RANGE (id)".into())),
+            ("partition key text", |m| table(m).partition_key = Some("LIST (id)".into())),
+            ("partition of", |m| table(m).partition_of = Some(PartitionOf { parent: QualName::new("app", "p"), bound: "DEFAULT".into() })),
+            ("partition bound", |m| {
+                table(m).partition_of = Some(PartitionOf { parent: QualName::new("app", "p"), bound: "FOR VALUES IN (1)".into() })
+            }),
+            ("partition parent", |m| {
+                table(m).partition_of = Some(PartitionOf { parent: QualName::new("app", "q"), bound: "DEFAULT".into() })
+            }),
             ("table renamed", |m| {
                 let mut tb = m.tables.remove(&t()).expect("table");
                 tb.name = QualName::new("app", "people");

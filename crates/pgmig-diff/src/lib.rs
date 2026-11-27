@@ -91,6 +91,27 @@
 //! runs first. A foreign key that stays the same but references a unique index that is dropped
 //! (or dropped and created again) is dropped first and added again after, as for a constraint.
 //!
+//! # Partitioning
+//!
+//! A partitioned table carries its partition key ([`Table::partition_key`]) and a partition its
+//! parent and bound ([`Table::partition_of`]); a partition's model holds only what is its own,
+//! not the columns, constraints and indexes it has from its parent. A new partitioned table or
+//! partition is [`Change::CreateTable`] with them. A partition whose bound changes is detached
+//! and attached again with the new bound ([`Change::DetachPartition`], [`Change::AttachPartition`]).
+//! A partition that becomes a standalone table is detached, and then compared as the table it is
+//! once detached (its parent's columns, checks and foreign keys are its own then). A standalone
+//! table that becomes a partition is first given its parent's columns and checks (and keeps the
+//! constraints and indexes equal to its parent's, which Postgres adopts), then attached. A dropped
+//! partition is [`Change::DropTable`]. A comment on a partition's column is the partition's own:
+//! it is set with [`Change::SetComment`].
+//!
+//! Postgres cannot change a table's partition key, or make a table partitioned or not, in place;
+//! and a plan cannot predict the names a detached table's copies of its parent's indexes and
+//! primary key, unique and exclusion constraints get. Those changes, a partition moving to
+//! another parent, and changes to a partition's own columns (those that differ from its parent's,
+//! such as a default of its own) are [`Change::UnsupportedPartitionChange`], which the planner
+//! refuses.
+//!
 //! # Type changes
 //!
 //! [`diff`] knows types only by their printed names, so it cannot tell whether Postgres converts
@@ -111,9 +132,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use pgmig_model::{
-    Attribute, Column, Composite, Constraint, ConstraintKind, Domain, DomainConstraint, Enum, Identity, Index, Model, OwnedBy, QualName,
-    Sequence, Table, quote_ident,
+    Attribute, Column, Composite, Constraint, ConstraintKind, Domain, DomainConstraint, Enum, Identity, Index, Model, OwnedBy, PartitionOf,
+    QualName, Sequence, Table, quote_ident,
 };
+
+mod partitions;
 
 /// An object that can carry a comment. New kinds (constraints, indexes) add a variant here, a
 /// matching `Object` in the planner, and a comparison in [`diff`].
@@ -390,6 +413,26 @@ pub enum Change {
         table: QualName,
         index: Index,
     },
+    /// `ALTER TABLE <parent> DETACH PARTITION <table>`. `columns` are the partition's (its
+    /// parent's): the changes made to the table once it stands alone follow the detach.
+    DetachPartition {
+        table: QualName,
+        parent: QualName,
+        columns: Vec<String>,
+    },
+    /// `ALTER TABLE <parent> ATTACH PARTITION <table> <bound>`. `columns` are the partition's (its
+    /// parent's): the changes that make the table's columns match go first.
+    AttachPartition {
+        table: QualName,
+        partition_of: PartitionOf,
+        columns: Vec<String>,
+    },
+    /// A change to the table's partitioning that cannot be planned (see the module doc), said in
+    /// `detail`; the planner reports it as an error.
+    UnsupportedPartitionChange {
+        name: QualName,
+        detail: String,
+    },
     /// `COMMENT ON ... IS <comment>`; `None` removes the comment. Never emitted for an object
     /// that is being dropped.
     SetComment {
@@ -476,6 +519,9 @@ change_kinds! {
     AlterConstraint => "alter_constraint",
     CreateIndex => "create_index",
     DropIndex => "drop_index",
+    DetachPartition => "detach_partition",
+    AttachPartition => "attach_partition",
+    UnsupportedPartitionChange => "unsupported_partition_change",
     SetComment => "set_comment",
 }
 
@@ -554,6 +600,8 @@ impl Change {
             Change::CreateIndex { table, index } | Change::DropIndex { table, index } => {
                 QualName::new(table.schema.clone(), index.name.clone()).to_string()
             }
+            Change::DetachPartition { table, .. } | Change::AttachPartition { table, .. } => table.to_string(),
+            Change::UnsupportedPartitionChange { name, .. } => name.to_string(),
             Change::SetComment { target, .. } => match target {
                 CommentTarget::Schema(s) => format!("schema {}", quote_ident(s)),
                 CommentTarget::Table(t) => format!("table {t}"),
@@ -578,6 +626,9 @@ impl Change {
 /// it and set after (adding the [`Change::DropDefault`] and [`Change::SetDefault`] the diff left
 /// out because the default did not change).
 pub fn add_casts(mut changes: Vec<Change>, a: &Model, b: &Model, assignable: &mut dyn FnMut(&str, &str) -> bool) -> Vec<Change> {
+    // The models the diff compared (a table detached or attached as it stands alone).
+    let prepared = partitions::prepare(a, b);
+    let (a, b) = (&prepared.a, &prepared.b);
     let column = |m: &Model, table: &QualName, name: &str| m.tables.get(table).and_then(|t| t.column(name)).cloned();
     let mut extra = Vec::new();
     for change in &mut changes {
@@ -613,6 +664,14 @@ pub fn add_casts(mut changes: Vec<Change>, a: &Model, b: &Model, assignable: &mu
 }
 
 pub fn diff(a: &Model, b: &Model) -> Vec<Change> {
+    let prepared = partitions::prepare(a, b);
+    let mut changes = diff_models(&prepared.a, &prepared.b);
+    changes.extend(prepared.changes);
+    changes
+}
+
+/// The changes between two models whose partitions have been prepared ([`partitions::prepare`]).
+fn diff_models(a: &Model, b: &Model) -> Vec<Change> {
     let mut changes = Vec::new();
 
     for name in b.schemas.keys().filter(|n| !a.schemas.contains_key(*n)) {
@@ -1320,7 +1379,10 @@ mod tests {
     fn model(columns: Vec<Column>) -> Model {
         let mut m = Model::empty_database();
         let name = QualName::new("public", "t");
-        m.tables.insert(name.clone(), Table { name, columns, comment: None, constraints: vec![], indexes: vec![] });
+        m.tables.insert(
+            name.clone(),
+            Table { name, columns, comment: None, constraints: vec![], indexes: vec![], partition_key: None, partition_of: None },
+        );
         m
     }
 
@@ -1411,8 +1473,18 @@ mod tests {
         let mut c = col("id", "integer");
         c.comment = comment.map(Into::into);
         let name = QualName::new("public", "t");
-        m.tables
-            .insert(name.clone(), Table { name, columns: vec![c], comment: comment.map(Into::into), constraints: vec![], indexes: vec![] });
+        m.tables.insert(
+            name.clone(),
+            Table {
+                name,
+                columns: vec![c],
+                comment: comment.map(Into::into),
+                constraints: vec![],
+                indexes: vec![],
+                partition_key: None,
+                partition_of: None,
+            },
+        );
         m
     }
 
@@ -1752,7 +1824,15 @@ mod tests {
             let name = QualName::new("public", *name);
             m.tables.insert(
                 name.clone(),
-                Table { name, columns: vec![col("id", "integer")], comment: None, constraints: constraints.clone(), indexes: vec![] },
+                Table {
+                    name,
+                    columns: vec![col("id", "integer")],
+                    comment: None,
+                    constraints: constraints.clone(),
+                    indexes: vec![],
+                    partition_key: None,
+                    partition_of: None,
+                },
             );
         }
         m
@@ -2056,6 +2136,8 @@ mod tests {
             comment: Some("t".into()),
             constraints: vec![constraint.clone()],
             indexes: vec![idx("t_n_idx", "(n)")],
+            partition_key: None,
+            partition_of: None,
         };
         let owned = OwnedBy { table: t.clone(), column: "id".into() };
         let sequence =
@@ -2172,6 +2254,17 @@ mod tests {
             },
             Change::SetComment { target: CommentTarget::DomainConstraint { domain: d, name: "d_check".into() }, comment: None },
             Change::SetComment { target: CommentTarget::Attribute { composite: p, attribute: "a".into() }, comment: Some("a".into()) },
+            Change::DetachPartition {
+                table: QualName::new("public", "c"),
+                parent: QualName::new("public", "p"),
+                columns: vec!["id".into()],
+            },
+            Change::AttachPartition {
+                table: QualName::new("public", "c"),
+                partition_of: PartitionOf { parent: QualName::new("public", "p"), bound: "FOR VALUES FROM (1) TO (10)".into() },
+                columns: vec!["id".into()],
+            },
+            Change::UnsupportedPartitionChange { name: QualName::new("public", "p"), detail: "the partitioning cannot change".into() },
         ]
     }
 
@@ -2224,6 +2317,9 @@ mod tests {
             Change::DropAttribute { .. } => 43,
             Change::AlterAttributeType { .. } => 44,
             Change::UnsupportedCompositeChange { .. } => 45,
+            Change::DetachPartition { .. } => 46,
+            Change::AttachPartition { .. } => 47,
+            Change::UnsupportedPartitionChange { .. } => 48,
         }
     }
 
@@ -2231,7 +2327,7 @@ mod tests {
     fn every_change_round_trips_through_json() {
         let changes = every_change();
         let covered: BTreeSet<usize> = changes.iter().map(variant).collect();
-        assert_eq!(covered, (0..46).collect(), "a sample for every variant");
+        assert_eq!(covered, (0..49).collect(), "a sample for every variant");
         for c in &changes {
             let json = serde_json::to_string(c).expect("serialize");
             let back: Change = serde_json::from_str(&json).expect(&json);
@@ -2530,5 +2626,202 @@ mod tests {
         let changes = diff(&ma, &mb);
         assert!(changes.iter().any(|c| matches!(c, Change::AlterAttributeType { .. })), "{changes:?}");
         assert!(!changes.iter().any(|c| matches!(c, Change::UnsupportedCompositeChange { .. })), "{changes:?}");
+    }
+
+    /// `public.p (id integer NOT NULL, v text)` partitioned by `RANGE (id)` with `constraints`, and
+    /// its partitions `(name, bound)`.
+    fn partitioned(constraints: Vec<Constraint>, partitions: &[(&str, &str)]) -> Model {
+        let mut m = Model::empty_database();
+        let p = QualName::new("public", "p");
+        let columns = vec![Column { not_null: true, ..col("id", "integer") }, col("v", "text")];
+        m.tables.insert(
+            p.clone(),
+            Table {
+                partition_key: Some("RANGE (id)".into()),
+                constraints,
+                ..Table {
+                    name: p.clone(),
+                    columns,
+                    comment: None,
+                    constraints: vec![],
+                    indexes: vec![],
+                    partition_key: None,
+                    partition_of: None,
+                }
+            },
+        );
+        for (name, bound) in partitions {
+            let n = QualName::new("public", *name);
+            let of = PartitionOf { parent: p.clone(), bound: (*bound).into() };
+            m.tables.insert(
+                n.clone(),
+                Table {
+                    name: n,
+                    columns: vec![],
+                    comment: None,
+                    constraints: vec![],
+                    indexes: vec![],
+                    partition_key: None,
+                    partition_of: Some(of),
+                },
+            );
+        }
+        m
+    }
+
+    fn standalone(m: &mut Model, name: &str, columns: Vec<Column>) {
+        let n = QualName::new("public", name);
+        m.tables.insert(
+            n.clone(),
+            Table { name: n, columns, comment: None, constraints: vec![], indexes: vec![], partition_key: None, partition_of: None },
+        );
+    }
+
+    const LOW: &str = "FOR VALUES FROM (1) TO (10)";
+
+    #[test]
+    fn a_partition_is_created_with_its_bound_and_none_of_its_parents_columns() {
+        let changes = diff(&partitioned(vec![], &[]), &partitioned(vec![], &[("c", LOW)]));
+        let [Change::CreateTable(t)] = &changes[..] else { panic!("{changes:?}") };
+        assert!(t.columns.is_empty());
+        assert_eq!(t.partition_of.as_ref().map(|p| p.bound.as_str()), Some(LOW));
+        assert!(diff(&partitioned(vec![], &[("c", LOW)]), &partitioned(vec![], &[("c", LOW)])).is_empty());
+    }
+
+    #[test]
+    fn a_new_bound_detaches_and_attaches_the_partition_again() {
+        let high = "FOR VALUES FROM (1) TO (20)";
+        let changes = diff(&partitioned(vec![], &[("c", LOW)]), &partitioned(vec![], &[("c", high)]));
+        let c = QualName::new("public", "c");
+        let p = QualName::new("public", "p");
+        let columns = vec!["id".to_owned(), "v".to_owned()];
+        assert_eq!(
+            changes,
+            [
+                Change::DetachPartition { table: c.clone(), parent: p.clone(), columns: columns.clone() },
+                Change::AttachPartition { table: c, partition_of: PartitionOf { parent: p, bound: high.into() }, columns },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_detached_partition_is_compared_as_the_table_it_becomes() {
+        let from = partitioned(vec![check("p_id_check", "CHECK ((id > 0))")], &[("c", LOW)]);
+        let mut to = partitioned(vec![check("p_id_check", "CHECK ((id > 0))")], &[]);
+        // The detached table has the parent's columns and check; it drops the check.
+        standalone(&mut to, "c", vec![Column { not_null: true, ..col("id", "integer") }, col("v", "text")]);
+        let changes = diff(&from, &to);
+        assert!(
+            matches!(&changes[..], [Change::DropConstraint { constraint, .. }, Change::DetachPartition { .. }] if constraint.name == "p_id_check"),
+            "{changes:?}"
+        );
+    }
+
+    #[test]
+    fn a_partition_cannot_be_detached_from_a_table_with_a_key() {
+        let key = Constraint { kind: ConstraintKind::PrimaryKey, ..check("p_pkey", "PRIMARY KEY (id)") };
+        let mut to = partitioned(vec![key.clone()], &[]);
+        standalone(&mut to, "c", vec![col("id", "integer")]);
+        let changes = diff(&partitioned(vec![key], &[("c", LOW)]), &to);
+        assert!(changes.iter().any(|c| matches!(c, Change::UnsupportedPartitionChange { name, .. } if name.name == "c")), "{changes:?}");
+    }
+
+    #[test]
+    fn a_table_is_given_its_parents_columns_before_it_is_attached() {
+        let mut from = partitioned(vec![], &[]);
+        standalone(
+            &mut from,
+            "c",
+            vec![col("id", "integer"), Column { default: Some("'x'::text".into()), ..col("v", "text") }, col("extra", "date")],
+        );
+        let changes = diff(&from, &partitioned(vec![], &[("c", LOW)]));
+        let kinds: Vec<ChangeKind> = changes.iter().map(Change::kind).collect();
+        assert_eq!(
+            kinds,
+            [ChangeKind::SetNotNull, ChangeKind::DropDefault, ChangeKind::DropColumn, ChangeKind::AttachPartition],
+            "{changes:?}"
+        );
+    }
+
+    #[test]
+    fn partition_key_changes_and_moves_between_parents_are_unsupported() {
+        let mut to = partitioned(vec![], &[]);
+        to.tables.values_mut().for_each(|t| t.partition_key = Some("LIST (id)".into()));
+        let changes = diff(&partitioned(vec![], &[]), &to);
+        assert!(
+            matches!(&changes[..], [Change::UnsupportedPartitionChange { detail, .. }] if detail.contains("PARTITION BY RANGE (id) to PARTITION BY LIST (id)")),
+            "{changes:?}"
+        );
+
+        let mut plain = partitioned(vec![], &[]);
+        plain.tables.values_mut().for_each(|t| t.partition_key = None);
+        let changes = diff(&plain, &partitioned(vec![], &[]));
+        assert!(
+            matches!(&changes[..], [Change::UnsupportedPartitionChange { detail, .. }] if detail.contains("not partitioned")),
+            "{changes:?}"
+        );
+
+        let mut from = partitioned(vec![], &[("c", LOW)]);
+        let mut to = from.clone();
+        for m in [&mut from, &mut to] {
+            let mut q = m.tables[&QualName::new("public", "p")].clone();
+            q.name = QualName::new("public", "q");
+            m.tables.insert(q.name.clone(), q);
+        }
+        to.tables.get_mut(&QualName::new("public", "c")).and_then(|t| t.partition_of.as_mut()).expect("partition").parent =
+            QualName::new("public", "q");
+        let changes = diff(&from, &to);
+        assert!(
+            matches!(&changes[..], [Change::UnsupportedPartitionChange { detail, .. }] if detail.contains("cannot become a partition of")),
+            "{changes:?}"
+        );
+    }
+
+    #[test]
+    fn a_partitions_own_columns_are_unsupported_when_new_or_changed() {
+        let own = Column { default: Some("7".into()), ..col("v", "text") };
+        let mut to = partitioned(vec![], &[("c", LOW)]);
+        to.tables.get_mut(&QualName::new("public", "c")).expect("c").columns = vec![own];
+        for from in [partitioned(vec![], &[]), partitioned(vec![], &[("c", LOW)])] {
+            let changes = diff(&from, &to);
+            assert!(changes.iter().any(|c| matches!(c, Change::UnsupportedPartitionChange { .. })), "{changes:?}");
+        }
+        assert!(diff(&to, &to).is_empty());
+    }
+
+    #[test]
+    fn a_comment_on_a_partitions_column_is_set_not_refused() {
+        let commented = |comment: &str| {
+            let mut m = partitioned(vec![], &[("c", LOW)]);
+            m.tables.get_mut(&QualName::new("public", "c")).expect("c").columns =
+                vec![Column { comment: Some(comment.into()), ..col("v", "text") }];
+            m
+        };
+        let target = CommentTarget::Column { table: QualName::new("public", "c"), column: "v".into() };
+        // A new partition: created without the column, then the comment.
+        let changes = diff(&partitioned(vec![], &[]), &commented("mine"));
+        let [Change::CreateTable(t), Change::SetComment { target: at, comment }] = &changes[..] else { panic!("{changes:?}") };
+        assert!(t.columns.is_empty(), "{t:?}");
+        assert_eq!((at, comment.as_deref()), (&target, Some("mine")));
+        // A changed comment, and a removed one.
+        assert_eq!(
+            diff(&commented("old"), &commented("new")),
+            [Change::SetComment { target: target.clone(), comment: Some("new".into()) }]
+        );
+        assert_eq!(diff(&commented("old"), &partitioned(vec![], &[("c", LOW)])), [Change::SetComment { target, comment: None }]);
+        assert!(diff(&commented("old"), &commented("old")).is_empty());
+    }
+
+    #[test]
+    fn a_table_is_given_its_parents_checks_before_it_is_attached() {
+        let parent_check = check("p_id_check", "CHECK ((id > 0))");
+        let mut from = partitioned(vec![parent_check.clone()], &[]);
+        standalone(&mut from, "c", vec![Column { not_null: true, ..col("id", "integer") }, col("v", "text")]);
+        let changes = diff(&from, &partitioned(vec![parent_check], &[("c", LOW)]));
+        assert!(
+            matches!(&changes[..], [Change::AddConstraint { table, constraint }, Change::AttachPartition { .. }]
+                if table.name == "c" && constraint.name == "p_id_check" && constraint.definition == "CHECK ((id > 0))"),
+            "{changes:?}"
+        );
     }
 }

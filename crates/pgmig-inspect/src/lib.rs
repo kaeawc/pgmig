@@ -4,11 +4,12 @@
 //! `information_schema` hides objects the current user doesn't own.
 
 use pgmig_conn::{Conn, Row};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use pgmig_model::{
     Attribute, Column, Composite, Constraint, ConstraintKind, Domain, DomainConstraint, Enum, Generated, Identity, Index, Model, OwnedBy,
-    QualName, References, Schema, Sequence, SequenceOptions, Table, quote_literal,
+    PartitionOf, QualName, References, Schema, Sequence, SequenceOptions, Table, inherited_constraint, inherited_index,
+    partition_column_differs, quote_literal,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -85,15 +86,35 @@ fn inspect_catalog(conn: &mut Conn) -> Result<Model> {
         model.schemas.insert(name.clone(), Schema { name, comment: row.get(1).cloned().flatten() });
     }
 
+    // A partition's parent is its one `pg_inherits` row; `pg_get_partkeydef` is NULL for a table
+    // that is not partitioned.
     let tables = format!(
-        "SELECT n.nspname, c.relname, obj_description(c.oid, 'pg_class') FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+        "SELECT n.nspname, c.relname, obj_description(c.oid, 'pg_class'), pg_get_partkeydef(c.oid), pn.nspname, pc.relname, \
+                pg_get_expr(c.relpartbound, c.oid) \
+         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+         LEFT JOIN pg_inherits h ON c.relispartition AND h.inhrelid = c.oid \
+         LEFT JOIN pg_class pc ON pc.oid = h.inhparent \
+         LEFT JOIN pg_namespace pn ON pn.oid = pc.relnamespace \
          WHERE c.relkind IN ('r', 'p') AND {USER_SCHEMA} ORDER BY 1, 2"
     );
     for row in run(conn, "tables", &tables)? {
-        let name = QualName::new(text(&row, 0, "tables")?, text(&row, 1, "tables")?);
+        let what = "tables";
+        let name = QualName::new(text(&row, 0, what)?, text(&row, 1, what)?);
+        let partition_of = match (qual_name(&row, 4, 5), row.get(6).cloned().flatten()) {
+            (Some(parent), Some(bound)) => Some(PartitionOf { parent, bound }),
+            _ => None,
+        };
         model.tables.insert(
             name.clone(),
-            Table { name, columns: Vec::new(), comment: row.get(2).cloned().flatten(), constraints: Vec::new(), indexes: Vec::new() },
+            Table {
+                name,
+                columns: Vec::new(),
+                comment: row.get(2).cloned().flatten(),
+                constraints: Vec::new(),
+                indexes: Vec::new(),
+                partition_key: row.get(3).cloned().flatten(),
+                partition_of,
+            },
         );
     }
 
@@ -166,7 +187,7 @@ fn inspect_catalog(conn: &mut Conn) -> Result<Model> {
     let columns = format!(
         "SELECT n.nspname, c.relname, a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull, \
                 pg_get_expr(d.adbin, d.adrelid), tn.nspname, COALESCE(e.typname, t.typname), \
-                col_description(a.attrelid, a.attnum), a.attidentity, a.attnum \
+                col_description(a.attrelid, a.attnum), a.attidentity, a.attnum, a.attinhcount > 0 \
          FROM pg_attribute a \
          JOIN pg_class c ON c.oid = a.attrelid \
          JOIN pg_namespace n ON n.oid = c.relnamespace \
@@ -179,10 +200,15 @@ fn inspect_catalog(conn: &mut Conn) -> Result<Model> {
     );
     let mut resolved: BTreeMap<String, Option<QualName>> = BTreeMap::new();
     let mut attnames: BTreeMap<(QualName, String), String> = BTreeMap::new();
+    // Tables with a column the catalog marks as inherited (see [`keep_partitions_own`]).
+    let mut marked: BTreeSet<QualName> = BTreeSet::new();
     for row in run(conn, "columns", &columns)? {
         let table = QualName::new(text(&row, 0, "columns")?, text(&row, 1, "columns")?);
         let name = text(&row, 2, "columns")?;
         attnames.insert((table.clone(), text(&row, 10, "columns")?), name.clone());
+        if text(&row, 11, "columns")? == "t" {
+            marked.insert(table.clone());
+        }
         let default = match row.get(5).cloned().flatten() {
             Some(expr) => Some(qualify_regclass_literals(&expr, |literal| resolve_cached(conn, &mut resolved, literal))?),
             None => None,
@@ -233,6 +259,7 @@ fn inspect_catalog(conn: &mut Conn) -> Result<Model> {
          LEFT JOIN pg_namespace fn ON fn.oid = fc.relnamespace \
          LEFT JOIN pg_class ci ON ci.oid = co.conindid \
          WHERE co.contype IN ('p', 'u', 'c', 'f', 'x') AND co.conislocal AND cl.relkind IN ('r', 'p') AND {USER_SCHEMA} \
+           AND NOT (cl.relispartition AND (co.coninhcount > 0 OR co.conparentid <> 0)) \
          ORDER BY 1, 2, 3"
     );
     for row in run(conn, "constraints", &constraints)? {
@@ -279,8 +306,38 @@ fn inspect_catalog(conn: &mut Conn) -> Result<Model> {
     }
 
     inspect_indexes(conn, &mut model, &attnames)?;
+    keep_partitions_own(&mut model, &marked);
 
     Ok(model)
+}
+
+/// Leaves each partition with only what is its own (see [`Table::partition_of`]).
+///
+/// The catalog marks what a partition has from its parent: a column's `attinhcount`, a
+/// constraint's `coninhcount` or `conparentid` (`conislocal` is false for those), an index attached
+/// to its parent's in `pg_inherits`. The constraint and index queries leave those out, so what is
+/// left is the partition's own, even when it is defined like one of its parent's. Every column of a
+/// partition is its parent's (`attinhcount > 0`; an attached table's columns too), so a column
+/// stays only when it differs from the parent's ([`partition_column_differs`]).
+///
+/// pgmem leaves the marks unset: `attinhcount` 0 (kaeawc/pgmem#288), `coninhcount` and
+/// `conparentid` 0 (kaeawc/pgmem#205), no `pg_inherits` row for an attached index
+/// (kaeawc/pgmem#289). A partition none of whose columns is marked (on Postgres, a partition of a
+/// table without columns, which has nothing to leave out) is compared with its parent instead:
+/// constraints and indexes defined like the parent's ([`inherited_constraint`],
+/// [`inherited_index`]) are taken for the parent's.
+fn keep_partitions_own(model: &mut Model, marked: &BTreeSet<QualName>) {
+    let full = model.tables.clone();
+    for t in model.tables.values_mut() {
+        let Some(parent) = t.partition_of.as_ref().and_then(|p| full.get(&p.parent)) else { continue };
+        t.columns.retain(|c| parent.column(&c.name).is_none_or(|pc| partition_column_differs(c, pc)));
+        if marked.contains(&t.name) {
+            continue;
+        }
+        t.constraints.retain(|c| !parent.constraints.iter().any(|pc| inherited_constraint(pc, c)));
+        let name = t.name.clone();
+        t.indexes.retain(|i| !parent.indexes.iter().any(|pi| inherited_index(&parent.name, pi, &name, i)));
+    }
 }
 
 /// The indexes of the model's tables that no constraint owns: not a primary key, unique or
