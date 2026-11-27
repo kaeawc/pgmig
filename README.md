@@ -105,6 +105,42 @@ pretty-printed JSON document on stdout and nothing on stderr; a failure prints t
 still reported as text on stderr. `apply` never asks
 in JSON mode: pass `--auto-approve` or `--dry-run`.
 
+### Saved plans: `schema plan` and `schema apply --plan`
+
+`pgmig schema plan --url <db> --to <desired> --out plan.json` plans what `schema apply` would do
+(same `--shadow`, `--include`, `--exclude`, `--schema`, `--skip`, `--concurrent-indexes` and
+`--verify`, and the same config settings) and saves it as a plan file; without `--out` the file
+goes to stdout. The database is only read. A plan with no statements is saved too.
+
+The file is pretty-printed JSON: `format` (`1`; another number is refused), `pgmig_version`, `from`
+(the `h1:` fingerprint of the database's managed objects when planned, as `schema fingerprint`
+prints it), `to` (the fingerprint of the desired state's managed objects), `skipped` (changes
+`--skip` left out, when there are any), `options` (filters, schema mode, revisions schema, skip
+policy, `concurrent_indexes`: the scope both fingerprints are relative to), `plan` (the statements,
+commit point and statements outside a transaction: what runs) and `sql` (the plan as a script, for
+reviewing).
+
+`pgmig schema apply --url <db> --plan plan.json` runs it only if the database still matches. It
+reads the file, fingerprints the database's managed objects under the file's own options and, when
+that is not `from`, stops with a `plan_stale` error naming both fingerprints and applies nothing;
+a change outside the planned scope (another schema, an excluded table) does not make a plan stale.
+It also refuses a file whose `sql` is not the script of its `plan` (`saved_plan`), so the SQL that
+was reviewed is the SQL that runs. Otherwise it shows the SQL and asks as `schema apply` does
+(`--auto-approve`, `--dry-run`, `--exit-code`, `--format json`, no prompt without a terminal), runs
+the plan's units (a statement outside a transaction on its own, as planned), then fingerprints the
+database again: when it is not `to` the changes stay applied and the command fails with
+`plan_diverged` ("applied, but the result does not match the planned state") so that CI notices.
+That last check is skipped when `skipped` is not empty, since the result is then expected to differ.
+`--plan` cannot be combined with `--to`, `--shadow`, `--include`, `--exclude`, `--schema`, `--skip`,
+`--concurrent-indexes`, `--verify` or `--edit` (usage error, exit `2`): the file carries its scope
+and was verified when planned. With `--format json` the response has `target`, `from`, `to`, `plan`,
+`sql`, `applied`, `report` and `fingerprint` (the database's after applying).
+
+pgmig takes no lock: between the check (made again right before the first statement) and the end
+of the apply, another session can still change the schema. Use it to keep a reviewed plan from
+running against a database that has moved on, not as mutual exclusion. Library: `pgmig::SavedPlan`,
+`api::schema_plan`, `api::apply_saved`.
+
 ### `schema clean`
 
 `pgmig schema clean --url <db>` (or `url` in `pgmig.toml`) drops every managed object in a

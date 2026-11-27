@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ApplyOptions, ApplyReport, Change, ChecksumError, DriftCheck, Error, Expected, Guard, Kept, MigrateApplyReport, MigrateEdit, MigrateLs,
-    MigrateRebase, MigrateRm, MigrateSet, MigrateShow, MigrateStatus, MigrationOutcome, Model, Options, Plan, SetOptions, ShadowSpec,
-    Skipped, Source, SumFile, filter::PatternError,
+    MigrateRebase, MigrateRm, MigrateSet, MigrateShow, MigrateStatus, MigrationOutcome, Model, Options, Plan, SavedApplied, SavedPlan,
+    SetOptions, ShadowSpec, Skipped, Source, SumFile, filter::PatternError,
 };
 
 /// `schema diff`.
@@ -191,6 +191,34 @@ pub struct ApplyRequest {
 }
 
 pub type ApplyResponse = ApplyReport;
+
+/// `schema plan`: the plan `schema apply` would run, as a [`SavedPlan`] that remembers what it was
+/// made from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SchemaPlanRequest {
+    /// The database to plan for (only read).
+    pub target: String,
+    pub desired: Source,
+    #[serde(default)]
+    pub shadow: ShadowSpec,
+    #[serde(default)]
+    pub options: Options,
+    /// Check the plan before saving it, as [`PlanApplyRequest::verify`] does.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub verify: bool,
+}
+
+/// `schema apply --plan`: run a saved plan if `target` still matches it. The plan's own options say
+/// what is managed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApplySavedRequest {
+    pub target: String,
+    pub plan: SavedPlan,
+}
+
+pub type ApplySavedResponse = SavedApplied;
 
 /// `schema apply --verify` of a plan the caller has (an edited one, say): applied in a fresh shadow
 /// database to a copy of `target` (only read), it must make `desired` but for the changes the
@@ -643,6 +671,15 @@ pub enum ErrorCode {
     /// `verify`: the plan, applied in a shadow database to a copy of the current state, failed or
     /// did not make the desired state; the target was not changed and no migration was written. `verify` says which.
     VerifyFailed,
+    /// A saved plan file cannot be used: it is not a plan file, has a format this version does not
+    /// read, or its `sql` is not its plan's statements.
+    SavedPlan,
+    /// `schema apply --plan`: the target's managed schema changed since the plan was made; nothing
+    /// was applied.
+    PlanStale,
+    /// `schema apply --plan`: the plan was applied, but the target's managed schema is not the
+    /// planned one; the changes stay applied.
+    PlanDiverged,
 }
 
 impl ErrorCode {
@@ -693,6 +730,9 @@ impl ErrorCode {
             ErrorCode::DirtyDatabase => "dirty_database",
             ErrorCode::NeedsForce => "needs_force",
             ErrorCode::VerifyFailed => "verify_failed",
+            ErrorCode::SavedPlan => "saved_plan",
+            ErrorCode::PlanStale => "plan_stale",
+            ErrorCode::PlanDiverged => "plan_diverged",
         }
     }
 }
@@ -890,6 +930,9 @@ impl From<&Error> for ApiError {
                 }));
                 e
             }
+            Error::SavedPlan(_) => err(ErrorCode::SavedPlan),
+            Error::PlanStale { .. } => err(ErrorCode::PlanStale),
+            Error::PlanDiverged { .. } => err(ErrorCode::PlanDiverged),
             Error::Checksum(c) => {
                 let code = match c {
                     ChecksumError::MissingSum { .. } => ErrorCode::SumMissing,
@@ -1082,7 +1125,10 @@ fn is_diagnostic(e: &Error) -> bool {
         | Error::NeedsForce { .. }
         | Error::VerifyFailed { .. }
         | Error::VerifyStatement { .. }
-        | Error::VerifySetup { .. } => false,
+        | Error::VerifySetup { .. }
+        | Error::SavedPlan(_)
+        | Error::PlanStale { .. }
+        | Error::PlanDiverged { .. } => false,
     }
 }
 
@@ -1239,6 +1285,21 @@ pub fn edit_plan(req: &EditPlanRequest) -> Result<EditPlanResponse, ApiError> {
     Ok(EditPlanResponse { plan: crate::plan_from_sql(&sql)?, sql })
 }
 
+/// [`crate::schema_plan_saved`].
+pub fn schema_plan(req: &SchemaPlanRequest) -> Result<SavedPlan, ApiError> {
+    Ok(crate::schema_plan_saved(&req.target, &req.desired, &req.shadow, &req.options, req.verify)?)
+}
+
+/// [`crate::check_saved`]: refuses a plan that is malformed or stale, and changes nothing.
+pub fn schema_check_saved(req: &ApplySavedRequest) -> Result<(), ApiError> {
+    Ok(crate::check_saved(&req.target, &req.plan)?)
+}
+
+/// [`crate::apply_saved`].
+pub fn apply_saved(req: &ApplySavedRequest) -> Result<ApplySavedResponse, ApiError> {
+    Ok(crate::apply_saved(&req.target, &req.plan)?)
+}
+
 /// [`crate::schema_verify`].
 pub fn schema_verify(req: &VerifyRequest) -> Result<(), ApiError> {
     Ok(crate::schema_verify(&req.target, &req.desired, &req.plan, &req.shadow, &req.options)?)
@@ -1297,6 +1358,13 @@ mod tests {
             options: Options::default(),
         });
         round_trip(&ApplyRequest { target: "host=localhost".into(), plan: plan() });
+        round_trip(&SchemaPlanRequest {
+            target: "t".into(),
+            desired: Source::Sql("s.sql".into()),
+            shadow: ShadowSpec::Pgmem,
+            options: options(),
+            verify: true,
+        });
         round_trip(&CleanPlanRequest { target: "host=localhost".into(), options: options() });
         let req: CleanPlanRequest = serde_json::from_str(r#"{"target":"host=localhost"}"#).expect("request");
         assert_eq!(req.options, Options::default());
