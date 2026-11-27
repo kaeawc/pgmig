@@ -258,6 +258,12 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
   `AlterColumnType` carry the referenced types; `Column` has a new `type_ref` field; `DropTable` and `DropColumn` carry the sequences they drop; `Table` has new `constraints` and `indexes` fields; `AlterColumnType` has a new `using` field; `schema_diff`, `schema_inspect` and `schema_plan_apply` take `&Options`; `Plan` has a new `commit_after` field and `plan` can fail
   with `Error::Unsupported`.
 
+### Fixed
+
+- Attaching a table that has two indexes defined like the same parent index is refused, naming them:
+  Postgres adopts only one, and which one is not known from the model, so the other would have been
+  planned for dropping afterwards. Drop all but one first.
+
 ## [0.1.0] - 2026-11-26
 
 ### Added

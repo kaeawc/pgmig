@@ -216,8 +216,8 @@ fn detach(a: &Model, old: &Table, o: &PartitionOf, out: &mut Prepared) {
 
 /// A standalone table of `a` that is a partition in `b`: the table is first made what `ATTACH
 /// PARTITION` needs (its columns those of the parent, its parent's checks added; constraints and
-/// indexes the parent gives it are kept when it has them already, as Postgres adopts them), then
-/// attached.
+/// indexes the parent gives it are kept when it has them already, as Postgres adopts them; two
+/// indexes for one parent index are refused), then attached.
 fn attach(b: &Model, old: &Table, new: &Table, n: &PartitionOf, out: &mut Prepared) {
     let name = &new.name;
     if !new.columns.is_empty() {
@@ -246,6 +246,24 @@ fn attach(b: &Model, old: &Table, new: &Table, n: &PartitionOf, out: &mut Prepar
     for c in ancestors.iter().flat_map(|t| &t.constraints).filter(|c| c.kind == ConstraintKind::Check) {
         if attached.constraint(&c.name).is_none() {
             attached.constraints.push(Constraint { on_partitioned_table: new.partition_key.is_some(), ..c.clone() });
+        }
+    }
+    // `ATTACH PARTITION` adopts one index of the table for each parent index, the first of the
+    // table's index list (by OID, which the model does not know): with two to pick from, which one
+    // stays the table's own cannot be told, so the attach is refused.
+    for pi in ancestors.iter().flat_map(|t| t.indexes.iter().map(move |pi| (&t.name, pi))) {
+        let matching: Vec<&str> = old.indexes.iter().filter(|i| inherited_index(pi.0, pi.1, name, i)).map(|i| i.name.as_str()).collect();
+        if matching.len() > 1 {
+            out.changes.push(unsupported(
+                name,
+                format!(
+                    "it has more than one index defined like {} of {} ({}); drop all but one before attaching it",
+                    pi.1.name,
+                    pi.0,
+                    matching.join(", ")
+                ),
+            ));
+            return;
         }
     }
     for i in &old.indexes {
