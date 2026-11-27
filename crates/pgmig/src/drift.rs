@@ -4,7 +4,9 @@
 //! What it should be is either a migration directory at the version the database's revisions table
 //! records, or any [`Source`]: desired-state SQL, a migration directory replayed to its newest file,
 //! or another database. With a migration directory, the directory is replayed in a fresh shadow
-//! database exactly as far as the history says it was applied, in version order: every file with a
+//! database exactly as far as the history says it was applied, in the order the files ran (the rows'
+//! execution times, the version breaking ties; version order when a row has no time, as `migrate
+//! apply --exec-order non-linear` can run an older file last): every file with a
 //! complete row (baselines included: their file is the state they recorded), and of a file that
 //! stopped part way only the statements its row records as applied. Files without a row are pending:
 //! listed, not replayed, not drift. The history is checked as `migrate status` checks it; each
@@ -74,11 +76,14 @@ pub struct DriftHistory {
     /// The files of these that are replayed only in part: those their row records as applied.
     #[serde(default)]
     pub partial: Vec<String>,
-    /// The files `migrate apply` would run. Not drift.
+    /// The files `migrate apply` would run, not counting those replayed in part. Not drift.
     pub pending: Vec<String>,
     /// Problems with the history, each with how to recover (as `migrate status` reports them). Each
     /// counts as drift.
     pub issues: Vec<StatusIssue>,
+    /// What to know before running the plan: the history has problems, or has no revisions table.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// `drift check`: compare the database at `target` with `expected`, for the objects `opts` manages.
@@ -117,10 +122,22 @@ fn replay_applied(target: &str, dir: &Path, shadow: &ShadowSpec, revisions_schem
     check_no_imports(&d)?;
     let mut sh = shadow.open()?;
     let (mut replayed, mut partial) = (Vec::new(), Vec::new());
-    for f in d.files() {
-        let Some(row) = rows.iter().find(|s| pgmig_migrate::compare_versions(&s.revision.version, &f.version).is_eq()) else {
-            continue;
-        };
+    // The files with a row, in the order they ran.
+    let mut ran: Vec<_> = d
+        .files()
+        .iter()
+        .filter_map(|f| rows.iter().find(|s| pgmig_migrate::compare_versions(&s.revision.version, &f.version).is_eq()).map(|row| (f, row)))
+        .collect();
+    if !ran.is_empty() {
+        let mut conn = pgmig_conn::Conn::connect(target)?;
+        if let Some(table) = pgmig_migrate::revisions::Table::open(&mut conn, revisions_schema)? {
+            let order = table.versions_by_execution(&mut conn)?;
+            let position = |v: &str| order.iter().position(|o| pgmig_migrate::compare_versions(o, v).is_eq()).unwrap_or(usize::MAX);
+            // Stable: ties keep version (directory) order.
+            ran.sort_by_key(|(_, row)| position(&row.revision.version));
+        }
+    }
+    for (f, row) in ran {
         let r = &row.revision;
         let mut file = split_migration(&d, f)?;
         if !r.is_complete() {
@@ -133,14 +150,27 @@ fn replay_applied(target: &str, dir: &Path, shadow: &ShadowSpec, revisions_schem
         migrate_apply::run_file(sh.conn(), &d.path.join(&f.name), &file)?;
         replayed.push(f.name.clone());
     }
+    let mut warnings = Vec::new();
+    if status.revisions_table.is_none() {
+        warnings.push(format!("no revisions table in {revisions_schema}: the expected state is an empty database"));
+    }
+    if !status.issues.is_empty() {
+        warnings.push(
+            "the history has problems (listed above); the plan below brings the database to the directory as it is now and may drop \
+             objects: resolve the problems first"
+                .into(),
+        );
+    }
+    let pending = status.pending.into_iter().filter(|f| !partial.contains(f)).collect();
     let history = DriftHistory {
         dir: status.dir,
         revisions_table: status.revisions_table,
         current: status.current,
         replayed,
         partial,
-        pending: status.pending,
+        pending,
         issues: status.issues,
+        warnings,
     };
     Ok((history, sh))
 }

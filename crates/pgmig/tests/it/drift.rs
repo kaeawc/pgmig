@@ -6,7 +6,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use pgmig::api::{self, DriftCheckRequest};
 use pgmig::{
-    ApplyOptions, ChangeKind, DriftCheck, Expected, Filter, IssueKind, Options, ShadowSpec, Source, TxMode, drift_check, migrate_apply,
+    ApplyOptions, ChangeKind, DriftCheck, ExecOrder, Expected, Filter, IssueKind, Options, ShadowSpec, Source, TxMode, drift_check,
+    migrate_apply,
 };
 
 use crate::support::{TestDb, postgres_dsn};
@@ -121,7 +122,27 @@ fn pending_files_are_listed_and_are_not_drift() {
     let d = applied(&fresh, &m, &shadow, &Options::default());
     assert!(d.drifted && d.sql.contains("DROP TABLE public.stray"), "{d:?}");
     let h = d.history.expect("history");
-    assert_eq!((h.revisions_table, h.replayed.len(), h.pending.len()), (None, 0, 2));
+    assert_eq!((h.revisions_table.clone(), h.replayed.len(), h.pending.len()), (None, 0, 2));
+    assert_eq!(h.warnings.len(), 1, "{:?}", h.warnings);
+    assert!(h.warnings[0].contains("no revisions table in pgmig") && h.warnings[0].contains("empty database"), "{:?}", h.warnings);
+}
+
+/// A file applied after a newer one (`--exec-order non-linear`) is replayed after it.
+#[test]
+fn files_are_replayed_in_the_order_they_ran() {
+    let (shadow, _keep) = shadow_spec();
+    let db = TestDb::new();
+    let m = Dir::new(&[("1_t.sql", "CREATE TABLE t (id int);\n"), ("3_c.sql", "ALTER TABLE t ADD COLUMN c int;\n")], true);
+    migrate_apply(&db.conninfo, m.path(), &ApplyOptions::default()).expect("apply 1 and 3");
+    // Captures t's columns as of now: id and c.
+    m.write("2_u.sql", "CREATE TABLE u (LIKE t);\n", true);
+    let opts = ApplyOptions { exec_order: ExecOrder::NonLinear, ..ApplyOptions::default() };
+    migrate_apply(&db.conninfo, m.path(), &opts).expect("apply 2 last");
+    let d = applied(&db, &m, &shadow, &Options::default());
+    assert!(!d.drifted && d.changes.is_empty(), "{d:?}");
+    let h = d.history.expect("history");
+    assert_eq!(h.replayed, ["1_t.sql", "3_c.sql", "2_u.sql"]);
+    assert!(h.warnings.is_empty(), "{:?}", h.warnings);
 }
 
 #[test]
@@ -152,7 +173,9 @@ fn a_failed_file_is_replayed_as_far_as_it_was_applied() {
     assert!(d.drifted && d.changes.is_empty(), "x and y are expected: {d:?}");
     assert_eq!(issue_kinds(&d), [IssueKind::Failed]);
     let h = d.history.as_ref().expect("history");
-    assert_eq!((h.replayed.clone(), h.partial.clone(), h.pending.clone()), (vec![A.into(), B.into()], vec![B.into()], vec![B.into()]));
+    assert_eq!((h.replayed.clone(), h.partial.clone(), h.pending.clone()), (vec![A.into(), B.into()], vec![B.into()], vec![]));
+    assert_eq!(h.warnings.len(), 1, "{:?}", h.warnings);
+    assert!(h.warnings[0].contains("history has problems"), "{:?}", h.warnings);
     assert!(h.issues[0].hint.contains("pgmig migrate apply"), "{}", h.issues[0].hint);
 
     // Undone by hand: now the schema drifted too.

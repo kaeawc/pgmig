@@ -422,6 +422,13 @@ impl Table {
         Ok(out)
     }
 
+    /// Every row's version in the order the rows ran: by `executed_at` as the server compares it
+    /// (not its text, which changes offset across daylight saving time), then by version.
+    pub fn versions_by_execution(&self, conn: &mut Conn) -> Result<Vec<String>> {
+        let rows = conn.query(&format!("SELECT version FROM {} ORDER BY executed_at, version", self.name()))?;
+        Ok(rows.into_iter().filter_map(|r| r.into_iter().next().flatten()).collect())
+    }
+
     /// Add `rev`'s row; `executed_at` is the server's `now()` unless `rev` gives it. A version
     /// already in the table is the server's unique violation (23505).
     pub fn insert(&self, conn: &mut Conn, rev: &Revision) -> Result<()> {

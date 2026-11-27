@@ -1313,8 +1313,8 @@ fn migrate_status(req: &api::MigrateStatusRequest, target: &Target, format: Form
     Ok(code)
 }
 
-/// `drift check`: the plan on stdout; the history's problems, pending files, skipped and
-/// unsupported changes and a one-line verdict on stderr. Exits 3 on drift.
+/// `drift check`: the plan on stdout; the history's problems and warnings (before the plan),
+/// pending files, skipped and unsupported changes and a one-line verdict on stderr. Exits 3 on drift.
 fn drift_check(req: &api::DriftCheckRequest, target: &Target, format: Format) -> anyhow::Result<ExitCode> {
     let res = api::drift_check(req)?;
     let code = if res.drifted { ExitCode::from(CHANGES) } else { ExitCode::SUCCESS };
@@ -1322,8 +1322,6 @@ fn drift_check(req: &api::DriftCheckRequest, target: &Target, format: Format) ->
         print_json(&TargetOutput { target, result: &res })?;
         return Ok(code);
     }
-    print!("{}", res.sql);
-    std::io::stdout().flush()?;
     eprintln!("Target: {} (from {})", target.display, target.source);
     if let Some(h) = &res.history {
         match (&h.revisions_table, &h.current) {
@@ -1340,7 +1338,12 @@ fn drift_check(req: &api::DriftCheckRequest, target: &Target, format: Format) ->
         for i in &h.issues {
             eprintln!("problem: {}\n  {}", i.message, i.hint);
         }
+        for w in &h.warnings {
+            eprintln!("warning: {w}");
+        }
     }
+    print!("{}", res.sql);
+    std::io::stdout().flush()?;
     print_skipped(&res.skipped);
     for u in &res.unsupported {
         eprintln!("cannot plan: {u}");

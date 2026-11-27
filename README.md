@@ -142,12 +142,15 @@ A failure prints the usual error object (`code` `migration`, `message`, `sqlstat
 
 `pgmig drift check --url <db> --dir migrations/` compares a live database with the migration
 directory at the version its revisions table records: every file recorded as applied (baselines
-included) is replayed in the shadow database, in version order, and of a file that stopped part way
+included) is replayed in the shadow database, in the order it ran (execution time, not version, so a file run last by
+`--exec-order non-linear` is replayed last), and of a file that stopped part way
 only the statements recorded as applied. Files not applied yet are listed as pending and are not
 drift. The history is checked as `migrate status` checks it (an applied file edited or missing, a
 failed or interrupted file, a statement left in flight, a row edited by hand, a file out of order,
 a directory that does not match `pgmig.sum`); each problem is printed with how to recover, and counts
-as drift. `--to <state>` compares with any state instead: SQL files, a migration directory replayed
+as drift; the plan then targets the directory as it is now, so a warning says to resolve the
+problems first (the same for a missing revisions table, which means an empty expected database;
+JSON `history.warnings`). `--to <state>` compares with any state instead: SQL files, a migration directory replayed
 to its newest file, or another database (staging against production, say). With neither flag,
 `[migrations] dir` is used, else `to`. `--include`, `--exclude`, `--schema` and `--skip` work as for
 `schema diff`.
@@ -156,7 +159,7 @@ The SQL that turns the database back into the expected state goes to stdout (sch
 is meant to be run), a summary to stderr. A change the planner cannot plan is listed (`cannot plan:`;
 JSON `unsupported`) and the plan is then empty. `--format json` prints `target`, `drifted`,
 `changes`, `skipped`, `plan`, `sql`, `unsupported` and `history` (`dir`, `revisions_table`,
-`current`, `replayed`, `partial`, `pending`, `issues` with `kind`, `version`, `message` and `hint`;
+`current`, `replayed`, `partial`, `pending` (not the partial ones), `warnings`, `issues` with `kind`, `version`, `message` and `hint`;
 null with `--to`). It exits `3` on drift and `0` without; it only reads the database.
 
 Exit codes: `0` success; `1` error (including `validate` finding errors); `2` usage (bad flags, or `apply` with no way to approve);
