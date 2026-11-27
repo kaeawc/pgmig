@@ -127,7 +127,7 @@ pub fn plan_from_sql(text: &str) -> Result<Plan> {
 /// directives are well placed. Returns its number of statements. Errors name the text `label`.
 pub(crate) fn check_migration_sql(text: &str, label: &str) -> Result<usize> {
     let path = PathBuf::from(label);
-    let sql = pgmig_sql::split(text).map_err(|source| Error::Split { path: path.clone(), source })?;
+    let (sql, _) = crate::migrate_apply::split_migration_text(&path, text)?;
     let all = sql.directives.iter().chain(sql.statements.iter().flat_map(|s| &s.directives));
     if let Some(d) = all.filter(|d| d.name == "import").min_by_key(|d| d.pos) {
         return Err(Error::MigrationImport { path, pos: d.pos });

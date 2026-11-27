@@ -653,6 +653,9 @@ pub enum ErrorCode {
     TxModeConflict,
     /// A partly applied file cannot resume: its applied statements changed.
     Resume,
+    /// A pre-migration assertion (`-- pgmig:assert`) of a pending file was not true; nothing of the
+    /// file ran.
+    AssertionFailed,
     /// A migration failed: a statement, a hook, `BEGIN` or `COMMIT`.
     Migration,
     /// No migration has the version or file name given.
@@ -722,6 +725,7 @@ impl ErrorCode {
             ErrorCode::LockTimeout => "lock_timeout",
             ErrorCode::TxModeConflict => "tx_mode_conflict",
             ErrorCode::Resume => "resume",
+            ErrorCode::AssertionFailed => "assertion_failed",
             ErrorCode::Migration => "migration",
             ErrorCode::MigrationNotFound => "migration_not_found",
             ErrorCode::MigrationAmbiguous => "migration_ambiguous",
@@ -999,6 +1003,19 @@ impl From<&Error> for ApiError {
                 }));
                 e
             }
+            Error::AssertionFailed { path, failures, outcome, applied_files, report } => {
+                let first = &failures[0];
+                let pos = pgmig_sql::Pos { line: first.line, col: 1 };
+                let mut e = err(ErrorCode::AssertionFailed).at(path, Some(pos));
+                e.migration = Some(Box::new(MigrationFailure {
+                    statement_index: None,
+                    statement: first.statement.clone(),
+                    applied_files: *applied_files,
+                    outcome: *outcome,
+                    report: (**report).clone(),
+                }));
+                e
+            }
             Error::MigrationRecord { path, statement_index, source, outcome, applied_files, report } => {
                 let mut e = match source.as_ref() {
                     pgmig_migrate::revisions::Error::Conn(c) => err(ErrorCode::Revisions).sqlstate(c),
@@ -1117,6 +1134,7 @@ fn is_diagnostic(e: &Error) -> bool {
         | Error::TxModeConflict { .. }
         | Error::Resume { .. }
         | Error::MigrationFailed { .. }
+        | Error::AssertionFailed { .. }
         | Error::MigrationStep { .. }
         | Error::MigrationRecord { .. }
         | Error::MigrationApplied { .. }
@@ -1551,6 +1569,7 @@ mod tests {
             LockTimeout,
             TxModeConflict,
             Resume,
+            AssertionFailed,
             Migration,
             MigrationNotFound,
             MigrationAmbiguous,

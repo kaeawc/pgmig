@@ -72,7 +72,8 @@ fn plan_units(plan: &Plan) -> Vec<Unit<'_>> {
 /// Errors in the text name it `label`.
 pub fn verify_migration_sql(current: Current, sql: &str, label: &str, to: &Model, shadow: &ShadowSpec, opts: &Options) -> Result<()> {
     let path = PathBuf::from(label);
-    let file = pgmig_sql::split(sql).map_err(|source| Error::Split { path: path.clone(), source })?;
+    // Assertions are not run: the shadow has no data.
+    let (file, _) = crate::migrate_apply::split_migration_text(&path, sql)?;
     let (no_tx, commits) = crate::migrate_apply::check_directives(&path, &file)?;
     let all: Vec<(usize, &str)> = file.statements.iter().enumerate().map(|(i, s)| (i, s.sql.as_str())).collect();
     let units: Vec<Unit> = crate::migrate_apply::segments(no_tx, &commits, all.len())

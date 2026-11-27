@@ -52,6 +52,25 @@
 //! mode refuses a pending file with a commit point, as it refuses `-- pgmig:txmode none`; without a
 //! transaction every statement commits anyway, so a commit point changes nothing.
 //!
+//! # Assertions
+//!
+//! A line `-- pgmig:assert` directly above a statement makes it a pre-migration assertion;
+//! `-- pgmig:assert any` makes it part of the file's one-of group. Assertions come before the file's
+//! first other statement and are each a single `SELECT` (or `WITH`) returning one row of one boolean
+//! column. Before a pending file runs (before its revisions row, its hooks and its first
+//! statement), and again on every run that starts it, resumes included, they are evaluated on the
+//! target in a read-only transaction that is rolled back (with `--tx-mode all`, inside the run's
+//! transaction, so they see the earlier files of the run): every plain assertion must be true, and
+//! when the group exists at least one `any` assertion must be true; NULL is false. Otherwise the run
+//! stops with [`Error::AssertionFailed`]: nothing of the file runs and no row is written; earlier
+//! files of the run stay applied (with `--tx-mode all`, the run's transaction is rolled back). An
+//! assertion with another shape, or that does not run, is a [`Error::Directive`] error.
+//!
+//! Assertions are not statements: they are not counted in a revisions row's `total`, `applied` or
+//! hashes, nor in the report. The file's hash covers them (they are part of its text). Replay in the
+//! shadow database (`migrate diff`, drift checks, `--verify`, fingerprints) skips them, as do
+//! `--dry-run`, `status` and `--baseline`: the shadow has no data to check them against.
+//!
 //! # Hooks
 //!
 //! [`ApplyOptions::before_sql`] runs right after each `BEGIN`, [`ApplyOptions::after_sql`] right
@@ -351,6 +370,28 @@ struct Prepared<'a> {
     /// Commit points (`-- pgmig:commit`): the index of the statement each one comes before, and
     /// where the directive is. Sorted, without duplicates, never 0 or past the last statement.
     commits: Vec<(usize, pgmig_sql::Pos)>,
+    /// `-- pgmig:assert` statements, taken out of `sql`.
+    assertions: Vec<Assertion>,
+}
+
+/// A pre-migration assertion: a statement taken out of its file.
+pub(crate) struct Assertion {
+    pos: pgmig_sql::Pos,
+    sql: String,
+    /// `-- pgmig:assert any`.
+    any: bool,
+}
+
+/// An assertion that was not true, in [`Error::AssertionFailed`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailedAssertion {
+    /// 1-based line in its file where the statement starts.
+    pub line: u32,
+    pub statement: String,
+    /// What it returned: `Some(false)`, or `None` for NULL.
+    pub value: Option<bool>,
+    /// It belongs to the `-- pgmig:assert any` group, of which none was true.
+    pub any: bool,
 }
 
 impl Prepared<'_> {
@@ -395,6 +436,8 @@ enum Failure {
         source: pgmig_conn::Error,
     },
     Revisions(pgmig_migrate::revisions::Error),
+    /// An assertion failed or could not be evaluated (`--tx-mode all`, inside the run's transaction).
+    Assertion(Box<Error>),
     /// Without a transaction: statement `index` ran, and recording it failed.
     Record {
         index: usize,
@@ -434,14 +477,143 @@ pub fn migrate_apply(target: &str, dir: &Path, opts: &ApplyOptions) -> Result<Mi
     res
 }
 
-/// Split `f` and read its `-- pgmig:txmode` and `-- pgmig:commit` directives.
+/// Split `f` and read its `-- pgmig:txmode`, `-- pgmig:commit` and `-- pgmig:assert` directives.
 fn prepare<'a>(dir: &MigrationDir, f: &'a pgmig_migrate::File) -> Result<Prepared<'a>> {
     let path = dir.path.join(&f.name);
     let text = std::str::from_utf8(&f.bytes)
         .map_err(|e| Error::Io { path: path.clone(), source: std::io::Error::new(std::io::ErrorKind::InvalidData, e) })?;
-    let sql = pgmig_sql::split(text).map_err(|source| Error::Split { path: path.clone(), source })?;
+    let (sql, assertions) = split_migration_text(&path, text)?;
     let (no_tx, commits) = check_directives(&path, &sql)?;
-    Ok(Prepared { file: f, path, sql, no_tx, commits })
+    Ok(Prepared { file: f, path, sql, no_tx, commits, assertions })
+}
+
+/// Split the text of a migration file named `path` and take its assertions out of the statements
+/// ([`take_assertions`]), so that statement indexes, counts and hashes never see them.
+pub(crate) fn split_migration_text(path: &Path, text: &str) -> Result<(pgmig_sql::File, Vec<Assertion>)> {
+    let mut sql = pgmig_sql::split(text).map_err(|source| Error::Split { path: path.to_owned(), source })?;
+    let assertions = take_assertions(path, &mut sql)?;
+    Ok((sql, assertions))
+}
+
+/// Move the `-- pgmig:assert` statements of `sql` out of its statements. They must be directly
+/// above their statement, come before the first other statement, take no argument or `any`, and
+/// start with `SELECT` or `WITH`. Other directives on an assertion move to the file's.
+fn take_assertions(path: &Path, sql: &mut pgmig_sql::File) -> Result<Vec<Assertion>> {
+    let bad = |pos, message: &str| Error::Directive { path: path.to_owned(), pos, message: message.to_owned() };
+    if let Some(d) = sql.directives.iter().filter(|d| d.name == "assert").min_by_key(|d| d.pos) {
+        return Err(bad(d.pos, "pgmig:assert must be on the line directly above its statement (no blank line between)"));
+    }
+    let mut assertions = Vec::new();
+    let mut kept = Vec::new();
+    let mut moved = Vec::new();
+    for s in std::mem::take(&mut sql.statements) {
+        let Some(d) = s.directives.iter().find(|d| d.name == "assert") else {
+            kept.push(s);
+            continue;
+        };
+        if s.directives.iter().filter(|d| d.name == "assert").count() > 1 {
+            return Err(bad(d.pos, "a statement takes one pgmig:assert"));
+        }
+        if d.pos > s.pos {
+            return Err(bad(d.pos, "pgmig:assert must be on the line directly above its statement, not inside one"));
+        }
+        if !kept.is_empty() {
+            return Err(bad(d.pos, "pgmig:assert statements must come before the file's first other statement"));
+        }
+        let any = match d.args.as_str() {
+            "" => false,
+            "any" => true,
+            _ => return Err(bad(d.pos, "pgmig:assert takes no argument, or `any`")),
+        };
+        let word = s.sql.split(|c: char| !c.is_ascii_alphanumeric() && c != '_').next().unwrap_or("");
+        if !(word.eq_ignore_ascii_case("select") || word.eq_ignore_ascii_case("with")) {
+            return Err(bad(s.pos, "an assertion must be a single SELECT returning one row with one boolean column"));
+        }
+        assertions.push(Assertion { pos: s.pos, sql: s.sql, any });
+        moved.extend(s.directives.into_iter().filter(|d| d.name != "assert"));
+    }
+    sql.statements = kept;
+    sql.directives.extend(moved);
+    Ok(assertions)
+}
+
+/// Evaluate the assertions of `p` (see the module docs). `in_transaction`: the run's transaction is
+/// open and is used as it is; otherwise they run in a read-only transaction that is rolled back.
+fn check_assertions(conn: &mut Conn, p: &Prepared, in_transaction: bool, applied_files: usize) -> Result<()> {
+    if p.assertions.is_empty() {
+        return Ok(());
+    }
+    if !in_transaction {
+        conn.batch("BEGIN READ ONLY")?;
+    }
+    let res = evaluate(conn, p, in_transaction, applied_files);
+    if !in_transaction {
+        let _ = conn.batch("ROLLBACK");
+    }
+    res
+}
+
+fn evaluate(conn: &mut Conn, p: &Prepared, in_transaction: bool, applied_files: usize) -> Result<()> {
+    let bad = |a: &Assertion, message: String| Error::Directive { path: p.path.clone(), pos: a.pos, message };
+    let mut group: Vec<FailedAssertion> = Vec::new();
+    let mut group_passed = false;
+    for a in &p.assertions {
+        let rows = conn.query(&a.sql).map_err(|source| bad(a, format!("the assertion could not run: {source}")))?;
+        let value = match rows.as_slice() {
+            [row] if row.len() == 1 => match row[0].as_deref() {
+                Some("t") => Some(true),
+                Some("f") => Some(false),
+                None => None,
+                Some(other) => return Err(bad(a, format!("an assertion must return a boolean, not {other:?}"))),
+            },
+            _ => {
+                let columns = rows.first().map_or(0, Vec::len);
+                return Err(bad(
+                    a,
+                    format!("an assertion must return one row with one boolean column, not {} row(s) of {columns} column(s)", rows.len()),
+                ));
+            }
+        };
+        let failed = FailedAssertion { line: a.pos.line, statement: a.sql.clone(), value, any: a.any };
+        match (a.any, value) {
+            (false, Some(true)) => {}
+            (false, _) => return Err(assertion_error(p, vec![failed], in_transaction, applied_files)),
+            (true, Some(true)) => group_passed = true,
+            (true, _) => group.push(failed),
+        }
+    }
+    if !group.is_empty() && !group_passed {
+        return Err(assertion_error(p, group, in_transaction, applied_files));
+    }
+    Ok(())
+}
+
+fn assertion_error(p: &Prepared, failures: Vec<FailedAssertion>, in_transaction: bool, applied_files: usize) -> Error {
+    // `--tx-mode all` is the one mode that evaluates inside the run's transaction.
+    let outcome = if in_transaction { MigrationOutcome::AllRolledBack } else { MigrationOutcome::FileRolledBack };
+    Error::AssertionFailed { path: p.path.clone(), failures, outcome, applied_files, report: Box::default() }
+}
+
+pub(crate) fn assertion_message(path: &Path, failures: &[FailedAssertion], outcome: MigrationOutcome, applied_files: usize) -> String {
+    let value = |f: &FailedAssertion| if f.value.is_none() { "NULL" } else { "false" };
+    let mut out = match failures {
+        [f] if !f.any => format!("{}:{}: assertion failed: {} returned {}", path.display(), f.line, f.statement, value(f)),
+        _ => {
+            let mut m = format!("{}: none of the `-- pgmig:assert any` assertions was true:", path.display());
+            for f in failures {
+                m.push_str(&format!("\n  line {}: {} returned {}", f.line, f.statement, value(f)));
+            }
+            m
+        }
+    };
+    out.push('\n');
+    out.push_str(&match (outcome, applied_files) {
+        (MigrationOutcome::AllRolledBack, _) => "the run's transaction was rolled back: nothing was applied".to_owned(),
+        (_, 0) => "no statement of the file ran and no revisions row was written".to_owned(),
+        (_, 1) => "no statement of the file ran and no revisions row was written; 1 earlier file of this run stays applied".to_owned(),
+        (_, n) => format!("no statement of the file ran and no revisions row was written; {n} earlier files of this run stay applied"),
+    });
+    out
 }
 
 /// The `-- pgmig:txmode` and `-- pgmig:commit` directives of the file at `path`: whether it runs
@@ -832,6 +1004,7 @@ fn run(conn: &mut Conn, table: &Table, jobs: &[Job], opts: &ApplyOptions, report
                 file_started = t;
                 current = Some(i);
                 in_file = true;
+                check_assertions(conn, j.p, true, 0).map_err(|e| Failure::Assertion(Box::new(e)))?;
                 let mut rev = j.revision();
                 let mut committed = rev.clone();
                 table.replace(conn, &rev, true)?;
@@ -859,12 +1032,22 @@ fn run(conn: &mut Conn, table: &Table, jobs: &[Job], opts: &ApplyOptions, report
                 reports[i].execution_ms = elapsed(file_started);
             }
             match current {
-                Some(i) => fail(conn, table, &jobs[i], jobs[i].revision(), f, outcome, 0, file_started),
-                None => failure_error(None, f, outcome, 0),
+                // Nothing of the file ran: no row records it.
+                Some(i) if !matches!(f, Failure::Assertion(_)) => {
+                    fail(conn, table, &jobs[i], jobs[i].revision(), f, outcome, 0, file_started)
+                }
+                _ => failure_error(None, f, outcome, 0),
             }
         });
     }
     for (done, j) in jobs.iter().enumerate() {
+        if let Err(e) = check_assertions(conn, j.p, false, done) {
+            reports[done].status = FileStatus::Failed;
+            for r in &mut reports[done + 1..] {
+                r.status = FileStatus::Pending;
+            }
+            return Err(e);
+        }
         let t = Instant::now();
         let mut rev = j.revision();
         // The row as last committed, for a failure after a commit point.
@@ -901,6 +1084,7 @@ fn run(conn: &mut Conn, table: &Table, jobs: &[Job], opts: &ApplyOptions, report
                     Failure::Statement { index, source } => Some((source.to_string(), j.p.sql.statements[*index].sql.clone())),
                     Failure::Step { step, source } => Some((source.to_string(), step.clone())),
                     Failure::Revisions(e) => Some((e.to_string(), String::new())),
+                    Failure::Assertion(_) => None,
                     Failure::Record { .. } => {
                         outcome = MigrationOutcome::InFlight;
                         None
@@ -1032,6 +1216,7 @@ fn fail(
             Failure::Statement { index, source } => (source.to_string(), j.p.sql.statements[*index].sql.clone()),
             Failure::Step { step, source } => (source.to_string(), step.clone()),
             Failure::Revisions(e) | Failure::Record { source: e, .. } => (e.to_string(), String::new()),
+            Failure::Assertion(e) => (e.to_string(), String::new()),
         };
         // A rolled-back resume keeps what the earlier run, or an earlier commit point, applied.
         rev.fail(&message, &stmt);
@@ -1044,8 +1229,10 @@ fn fail(
 impl Error {
     /// A migration failure with what became of the run's files.
     fn with_report(mut self, run: MigrateApplyReport) -> Error {
-        if let Error::MigrationFailed { report, .. } | Error::MigrationStep { report, .. } | Error::MigrationRecord { report, .. } =
-            &mut self
+        if let Error::MigrationFailed { report, .. }
+        | Error::MigrationStep { report, .. }
+        | Error::MigrationRecord { report, .. }
+        | Error::AssertionFailed { report, .. } = &mut self
         {
             **report = run;
         }
@@ -1089,6 +1276,7 @@ fn failure_error(j: Option<&Job>, f: Failure, outcome: MigrationOutcome, applied
             report: Box::default(),
         },
         Failure::Revisions(e) => record(None, e),
+        Failure::Assertion(e) => *e,
         Failure::Record { index, source } => record(Some(index), source),
     }
 }

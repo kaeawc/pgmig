@@ -116,6 +116,20 @@ nothing. An editor that exits non-zero aborts both. `--edit` needs a terminal an
 `--format json` (usage error, exit `2`). The edited text is not checked against `--skip`: a statement
 the skip policy left out runs if you add it back.
 
+Pre-migration assertions: in a migration file, a `-- pgmig:assert` line directly above a statement
+makes it an assertion, and `-- pgmig:assert any` makes it part of the file's one-of group. Each is
+a single `SELECT` (or `WITH`) returning one row of one boolean column, and all of them come before
+the file's first other statement (`migrate diff` never writes them; add them by hand, e.g. with
+`migrate edit`). Before `migrate apply` runs a pending file, and again each time a run starts it
+(a resume included), it evaluates them on the target in a read-only transaction: every plain
+assertion must be true and, if the group exists, at least one `any` assertion; NULL counts as false.
+Otherwise the run stops with error code `assertion_failed`, naming the assertion and its value;
+nothing of that file runs and no revisions row is written, while earlier files of the run stay
+applied (`--tx-mode all` rolls the whole run back). Assertions are not migration statements: they
+are not counted in a revisions row, and the file's hash still covers them. Replay in the shadow
+database (`migrate diff`, drift checks, `--verify`, fingerprints) and `--dry-run`, `status` and
+`--baseline` do not evaluate them, as the shadow has no data.
+
 `--format json` (on `inspect`, `diff`, `validate` and `apply`) prints the command's response as one
 pretty-printed JSON document on stdout and nothing on stderr; a failure prints the error object
 (`code`, `message`, `sqlstate`, `file`, `line`, `col`, `apply`) on stdout instead. Bad flags are
