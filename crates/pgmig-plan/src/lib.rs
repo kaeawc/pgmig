@@ -98,12 +98,14 @@
 //!
 //! A partitioned table is `CREATE TABLE ... PARTITION BY <key>`; a partition is `CREATE TABLE ...
 //! PARTITION OF <parent> [(<its own constraints>)] <bound>` (and `PARTITION BY` when it is
-//! partitioned in turn), created after its parent and dropped before it. `DETACH PARTITION` runs
-//! before the changes to the table standing alone and to its parent's columns (which would reach
-//! it); `ATTACH PARTITION` runs after the table and its parent exist and the table's columns are
-//! those of its parent ([`graph::Object::Partition`] orders a re-bound partition's detach before
-//! its attach). An index on a partitioned table, which Postgres prints `ON ONLY`, is created on its
-//! partitions too.
+//! partitioned in turn), created after its parent and dropped before it. A `DETACH PARTITION` that
+//! leaves the table standing alone runs before the changes to it and to its parent's columns,
+//! constraints and indexes (which would reach it); `ATTACH PARTITION` runs after the table and its
+//! parent exist, the parent's changes are made, and the table's columns and checks are those of
+//! its parent. A re-bound partition (detached and attached again with a new bound) is detached
+//! after its parent's changes, which reach it while it is attached, and attached right after
+//! ([`graph::Object::Inherited`], [`graph::Object::Partition`]). An index on a partitioned table,
+//! which Postgres prints `ON ONLY`, is created on its partitions too.
 //!
 //! # Domains and composite types
 //!
@@ -320,7 +322,7 @@ pub fn plan_with(changes: &[Change], opts: &PlanOptions) -> Result<Plan, Error> 
             _ => None,
         })
         .collect();
-    let tables = Tables { whole, rekeyed };
+    let tables = Tables { whole, rekeyed, partitions: Partitions::of(changes) };
     let (adds, rest): (Vec<&Change>, Vec<&Change>) = changes.iter().partition(|c| matches!(c, Change::AddEnumValue { .. }));
     let mut plan = Plan::default();
     for step in sorted(&adds, opts, &tables)?.into_iter().flatten() {
@@ -342,6 +344,37 @@ struct Tables<'a> {
     whole: BTreeSet<&'a QualName>,
     /// Tables that lose a primary key or unique constraint (see [`plan_with`]).
     rekeyed: BTreeSet<&'a QualName>,
+    partitions: Partitions<'a>,
+}
+
+/// The partitions a plan detaches and attaches, which order the changes to their parents (see
+/// [`graph::Object::Inherited`]).
+pub(crate) struct Partitions<'a> {
+    /// Partitioned tables a partition is detached from or attached to.
+    parents: BTreeSet<&'a QualName>,
+    /// Partitions detached and attached again with a new bound.
+    rebound: BTreeSet<&'a QualName>,
+}
+
+impl<'a> Partitions<'a> {
+    pub(crate) fn of(changes: &'a [Change]) -> Partitions<'a> {
+        let (mut detached, mut attached, mut parents) = (BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
+        for c in changes {
+            match c {
+                Change::DetachPartition { table, parent, .. } => {
+                    detached.insert(table);
+                    parents.insert(parent);
+                }
+                Change::AttachPartition { table, partition_of, .. } => {
+                    attached.insert(table);
+                    parents.insert(&partition_of.parent);
+                }
+                _ => {}
+            }
+        }
+        let rebound = detached.intersection(&attached).copied().collect();
+        Partitions { parents, rebound }
+    }
 }
 
 /// A planned statement.
@@ -434,7 +467,8 @@ fn using_index(change: &Change, opts: &PlanOptions, tables: &Tables) -> Option<[
 }
 
 fn sorted(changes: &[&Change], opts: &PlanOptions, tables: &Tables) -> Result<Vec<Vec<Step>>, Error> {
-    let nodes: Vec<Node> = changes.iter().map(|c| Node { phase: phase(c), deps: deps(c) }).collect();
+    let nodes: Vec<Node> =
+        changes.iter().map(|c| Node { phase: phase(c, &tables.partitions), deps: deps(c, &tables.partitions) }).collect();
     match graph::sort(&nodes) {
         Ok(order) => Ok(order.into_iter().map(|i| steps(changes[i], opts, tables)).collect()),
         Err(graph::Cycle(steps)) => Err(Error::Cycle(steps.into_iter().map(|i| statement(changes[i], opts)).collect())),
@@ -473,8 +507,10 @@ fn unsupported(change: &Change) -> Option<String> {
 }
 
 /// The tie-break between statements the graph does not order.
-fn phase(change: &Change) -> u8 {
+fn phase(change: &Change, partitions: &Partitions) -> u8 {
     match change {
+        // After the changes to its parent, which reach it while it is attached.
+        Change::DetachPartition { table, .. } if partitions.rebound.contains(table) => 12,
         // Planned on their own, before everything else (see the module doc).
         Change::AddEnumValue { .. } | Change::UnsupportedEnumChange { .. } => 0,
         Change::UnsupportedDomainChange { .. } | Change::UnsupportedCompositeChange { .. } | Change::UnsupportedPartitionChange { .. } => 0,
@@ -482,8 +518,8 @@ fn phase(change: &Change) -> u8 {
         Change::CreateEnum(_) | Change::CreateSequence(_) | Change::CreateDomain(_) | Change::CreateCompositeType(_) => 1,
         // Before defaults that print the new name are set.
         Change::RenameEnumValue { .. } | Change::AlterSequence { .. } => 2,
-        // Before the changes to the table standing alone, and to its parent's columns, which would
-        // otherwise reach it.
+        // Before the changes to the table standing alone, and to its parent, which would otherwise
+        // reach it.
         Change::DetachPartition { .. } => 2,
         Change::CreateTable(_) => 3,
         Change::AddColumn { .. } | Change::AddAttribute { .. } => 4,
@@ -519,8 +555,13 @@ fn phase(change: &Change) -> u8 {
     }
 }
 
-fn deps(change: &Change) -> Deps {
-    let mut d = object_deps(change);
+fn deps(change: &Change, partitions: &Partitions) -> Deps {
+    let mut d = partition_deps(change, partitions).unwrap_or_else(|| object_deps(change));
+    if let Some(t) = inherited_by_partitions(change)
+        && partitions.parents.contains(t)
+    {
+        d.alters.push(Object::Inherited(t.clone()));
+    }
     // Tables, sequences and indexes share the relation namespace (see [`Object::Relation`]).
     let relations = |objects: &[Object]| -> Vec<Object> {
         objects
@@ -535,6 +576,71 @@ fn deps(change: &Change) -> Deps {
     d.creates.extend(created);
     d.drops.extend(dropped);
     d
+}
+
+/// The table whose columns, constraints or indexes `change` changes, which its partitions have
+/// from it too ([`Object::Inherited`]).
+fn inherited_by_partitions(change: &Change) -> Option<&QualName> {
+    match change {
+        Change::AddColumn { table, .. }
+        | Change::DropColumn { table, .. }
+        | Change::AlterColumnType { table, .. }
+        | Change::SetDefault { table, .. }
+        | Change::DropDefault { table, .. }
+        | Change::SetNotNull { table, .. }
+        | Change::DropNotNull { table, .. }
+        | Change::AddIdentity { table, .. }
+        | Change::AlterIdentity { table, .. }
+        | Change::DropIdentity { table, .. }
+        | Change::AddConstraint { table, .. }
+        | Change::DropConstraint { table, .. }
+        | Change::RenameConstraint { table, .. }
+        | Change::AlterConstraint { table, .. }
+        | Change::CreateIndex { table, .. }
+        | Change::DropIndex { table, .. } => Some(table),
+        _ => None,
+    }
+}
+
+/// A partition's detach or attach. A detach that leaves the table standing alone runs before the
+/// changes to its parent (which would otherwise reach it); a re-bound partition's detach after
+/// them (they reach it while it is attached), with its attach after the detach; an attach after
+/// the changes to the parent and to the table that make its columns and checks the parent's.
+fn partition_deps(change: &Change, partitions: &Partitions) -> Option<Deps> {
+    let column = |t: &QualName, c: &str| Object::Column(t.clone(), c.to_owned());
+    let of = |t: &QualName, columns: &[String]| columns.iter().map(|c| column(t, c)).collect::<Vec<_>>();
+    match change {
+        Change::DetachPartition { table, parent, .. } if partitions.rebound.contains(table) => Some(Deps {
+            drops: vec![Object::Partition(table.clone())],
+            alters: vec![Object::Inherited(parent.clone())],
+            requires: vec![Object::Table(table.clone()), Object::Table(parent.clone())],
+            releases: vec![Object::Table(parent.clone())],
+            ..Deps::default()
+        }),
+        Change::DetachPartition { table, parent, columns } => Some(Deps {
+            drops: vec![Object::Partition(table.clone())],
+            // Before the table standing alone changes, and before the parent's columns change or go.
+            alters: [of(table, columns), of(parent, columns), vec![Object::Inherited(parent.clone())]].concat(),
+            requires: vec![Object::Table(table.clone()), Object::Table(parent.clone())],
+            releases: [vec![Object::Table(parent.clone())], of(parent, columns)].concat(),
+            ..Deps::default()
+        }),
+        Change::AttachPartition { table, partition_of, columns } => {
+            let parent = &partition_of.parent;
+            // A re-bound partition's attach follows its detach (`Object::Partition`), which follows
+            // the changes to the parent.
+            let inherited = if partitions.rebound.contains(table) { vec![] } else { vec![Object::Inherited(parent.clone())] };
+            Some(Deps {
+                creates: vec![Object::Partition(table.clone())],
+                // After the table's columns are added and set as the parent's, and its checks added.
+                alters: [of(table, columns), inherited].concat(),
+                requires: [vec![Object::Table(table.clone()), Object::Table(parent.clone())], of(table, columns), of(parent, columns)]
+                    .concat(),
+                ..Deps::default()
+            })
+        }
+        _ => None,
+    }
 }
 
 fn object_deps(change: &Change) -> Deps {
@@ -577,28 +683,7 @@ fn object_deps(change: &Change) -> Deps {
             }
             Deps { drops, releases, ..Deps::default() }
         }
-        Change::DetachPartition { table, parent, columns } => {
-            let of = |t: &QualName| columns.iter().map(|c| column(t, c)).collect::<Vec<_>>();
-            Deps {
-                drops: vec![Object::Partition(table.clone())],
-                // Before the table standing alone changes, and before the parent's columns change
-                // (which would reach the partition) or go.
-                alters: [of(table), of(parent)].concat(),
-                requires: vec![in_table(table), in_table(parent)],
-                releases: [vec![in_table(parent)], of(parent)].concat(),
-                ..Deps::default()
-            }
-        }
-        Change::AttachPartition { table, partition_of, columns } => {
-            let of = |t: &QualName| columns.iter().map(|c| column(t, c)).collect::<Vec<_>>();
-            Deps {
-                creates: vec![Object::Partition(table.clone())],
-                // After the table's columns are added and set as the parent's.
-                alters: of(table),
-                requires: [vec![in_table(table), in_table(&partition_of.parent)], of(table), of(&partition_of.parent)].concat(),
-                ..Deps::default()
-            }
-        }
+        Change::DetachPartition { .. } | Change::AttachPartition { .. } => Deps::default(),
         Change::CreateSequence(s) => Deps {
             creates: vec![Object::Sequence(s.name.clone())],
             requires: vec![Object::Schema(s.name.schema.clone())],
@@ -2812,6 +2897,43 @@ mod tests {
         let (kept, skipped) = skip(&changes, &kinds, &PlanOptions::default());
         assert!(kept.is_empty(), "{kept:?}");
         assert_eq!(skipped.len(), 2);
+    }
+
+    #[test]
+    fn a_rebound_partition_is_detached_after_its_parent_changes_and_a_detached_one_before() {
+        let (c, p) = (QualName::new("public", "c"), QualName::new("public", "p"));
+        let columns = vec!["id".to_owned(), "v".to_owned()];
+        let of = pgmig_model::PartitionOf { parent: p.clone(), bound: "FOR VALUES FROM (1) TO (20)".into() };
+        let detach = Change::DetachPartition { table: c.clone(), parent: p.clone(), columns: columns.clone() };
+        let attach = Change::AttachPartition { table: c.clone(), partition_of: of, columns: [columns.clone(), vec!["w".into()]].concat() };
+        // The parent's changes, which reach the partition while it is attached.
+        let parent = [
+            Change::AddColumn { table: p.clone(), column: col("w", None) },
+            Change::SetNotNull { table: p.clone(), column: "v".into() },
+            Change::DropColumn { table: p.clone(), column: "x".into(), type_ref: None, sequences: vec![], owned_sequences: vec![] },
+            Change::AddConstraint { table: p.clone(), constraint: constraint("p_v", ConstraintKind::Check, "CHECK ((v > 0))", &["v"]) },
+            Change::DropIndex { table: p.clone(), index: index("p", "p_v_idx", "(v)", &["v"]) },
+        ];
+        let parent_sql = sql(&parent);
+        let rebound = sql(&[vec![attach.clone(), detach.clone()], parent.to_vec()].concat());
+        assert_eq!(rebound[..parent.len()], parent_sql[..], "{rebound:?}");
+        assert_eq!(
+            rebound[parent.len()..],
+            [
+                "ALTER TABLE public.p DETACH PARTITION public.c",
+                "ALTER TABLE public.p ATTACH PARTITION public.c FOR VALUES FROM (1) TO (20)"
+            ]
+        );
+        // Detached to stand alone, the partition leaves before the parent changes.
+        let detached = sql(&[parent.to_vec(), vec![detach]].concat());
+        assert_eq!(detached[0], "ALTER TABLE public.p DETACH PARTITION public.c");
+        assert_eq!(detached[1..], parent_sql[..]);
+        // Attached, it joins once the parent has changed and it has its parent's checks.
+        let check =
+            Change::AddConstraint { table: c.clone(), constraint: constraint("p_v", ConstraintKind::Check, "CHECK ((v > 0))", &["v"]) };
+        let attached = sql(&[vec![attach, check], parent.to_vec()].concat());
+        assert_eq!(attached.last().map(String::as_str), Some("ALTER TABLE public.p ATTACH PARTITION public.c FOR VALUES FROM (1) TO (20)"));
+        assert!(attached.contains(&"ALTER TABLE public.c ADD CONSTRAINT p_v CHECK ((v > 0))".to_owned()), "{attached:?}");
     }
 
     #[test]

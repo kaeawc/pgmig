@@ -118,3 +118,40 @@ fn clean_drops_partitions_before_their_parents() {
     apply(&db.conninfo, &c.plan).expect("apply");
     assert_eq!(Options::default().managed(&inspect(&mut db.connect()).expect("inspect")), Model::empty_database());
 }
+
+/// On Postgres the catalog marks what a partition has from its parent, so an index or unique
+/// constraint of the partition's own stays in its model even when it is defined like its
+/// parent's. pgmem leaves the marks unset (kaeawc/pgmem#205, #288, #289), and pgmig then takes
+/// what is defined like the parent's for the parent's.
+#[test]
+fn a_partitions_own_index_and_key_defined_like_its_parents_stay_its_own() {
+    let base = "
+        CREATE TABLE t (id int NOT NULL, v text, CONSTRAINT t_id_key UNIQUE (id)) PARTITION BY RANGE (id);
+        CREATE INDEX t_v_idx ON t (v);
+        CREATE TABLE t_1 PARTITION OF t FOR VALUES FROM (1) TO (100);";
+    let own = format!(
+        "{base}
+         CREATE INDEX t_1_dup ON t_1 (v);
+         ALTER TABLE t_1 ADD CONSTRAINT t_1_own UNIQUE (id);"
+    );
+    let m = model(&own);
+    let t_1 = &m.tables[&q("t_1")];
+    let indexes: Vec<&str> = t_1.indexes.iter().map(|i| i.name.as_str()).collect();
+    let constraints: Vec<&str> = t_1.constraints.iter().map(|c| c.name.as_str()).collect();
+    let changes = diff(&model(base), &m);
+    let mut statements = plan(&changes).expect("plan").statements;
+    statements.sort();
+    if crate::support::postgres_dsn().is_some() {
+        assert_eq!(indexes, ["t_1_dup"]);
+        assert_eq!(constraints, ["t_1_own"]);
+        assert_eq!(
+            statements,
+            ["ALTER TABLE public.t_1 ADD CONSTRAINT t_1_own UNIQUE (id)", "CREATE INDEX t_1_dup ON public.t_1 USING btree (v)"]
+        );
+    } else {
+        // kaeawc/pgmem#289 (the index), kaeawc/pgmem#205 (the constraint).
+        assert!(indexes.is_empty(), "{indexes:?}");
+        assert!(constraints.is_empty(), "{constraints:?}");
+        assert!(statements.is_empty(), "{statements:?}");
+    }
+}

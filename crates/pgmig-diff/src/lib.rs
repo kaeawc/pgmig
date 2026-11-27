@@ -100,9 +100,10 @@
 //! and attached again with the new bound ([`Change::DetachPartition`], [`Change::AttachPartition`]).
 //! A partition that becomes a standalone table is detached, and then compared as the table it is
 //! once detached (its parent's columns, checks and foreign keys are its own then). A standalone
-//! table that becomes a partition is first given its parent's columns (and keeps the constraints
-//! and indexes equal to its parent's, which Postgres adopts), then attached. A dropped partition is
-//! [`Change::DropTable`].
+//! table that becomes a partition is first given its parent's columns and checks (and keeps the
+//! constraints and indexes equal to its parent's, which Postgres adopts), then attached. A dropped
+//! partition is [`Change::DropTable`]. A comment on a partition's column is the partition's own:
+//! it is set with [`Change::SetComment`].
 //!
 //! Postgres cannot change a table's partition key, or make a table partitioned or not, in place;
 //! and a plan cannot predict the names a detached table's copies of its parent's indexes and
@@ -2786,5 +2787,41 @@ mod tests {
             assert!(changes.iter().any(|c| matches!(c, Change::UnsupportedPartitionChange { .. })), "{changes:?}");
         }
         assert!(diff(&to, &to).is_empty());
+    }
+
+    #[test]
+    fn a_comment_on_a_partitions_column_is_set_not_refused() {
+        let commented = |comment: &str| {
+            let mut m = partitioned(vec![], &[("c", LOW)]);
+            m.tables.get_mut(&QualName::new("public", "c")).expect("c").columns =
+                vec![Column { comment: Some(comment.into()), ..col("v", "text") }];
+            m
+        };
+        let target = CommentTarget::Column { table: QualName::new("public", "c"), column: "v".into() };
+        // A new partition: created without the column, then the comment.
+        let changes = diff(&partitioned(vec![], &[]), &commented("mine"));
+        let [Change::CreateTable(t), Change::SetComment { target: at, comment }] = &changes[..] else { panic!("{changes:?}") };
+        assert!(t.columns.is_empty(), "{t:?}");
+        assert_eq!((at, comment.as_deref()), (&target, Some("mine")));
+        // A changed comment, and a removed one.
+        assert_eq!(
+            diff(&commented("old"), &commented("new")),
+            [Change::SetComment { target: target.clone(), comment: Some("new".into()) }]
+        );
+        assert_eq!(diff(&commented("old"), &partitioned(vec![], &[("c", LOW)])), [Change::SetComment { target, comment: None }]);
+        assert!(diff(&commented("old"), &commented("old")).is_empty());
+    }
+
+    #[test]
+    fn a_table_is_given_its_parents_checks_before_it_is_attached() {
+        let parent_check = check("p_id_check", "CHECK ((id > 0))");
+        let mut from = partitioned(vec![parent_check.clone()], &[]);
+        standalone(&mut from, "c", vec![Column { not_null: true, ..col("id", "integer") }, col("v", "text")]);
+        let changes = diff(&from, &partitioned(vec![parent_check], &[("c", LOW)]));
+        assert!(
+            matches!(&changes[..], [Change::AddConstraint { table, constraint }, Change::AttachPartition { .. }]
+                if table.name == "c" && constraint.name == "p_id_check" && constraint.definition == "CHECK ((id > 0))"),
+            "{changes:?}"
+        );
     }
 }

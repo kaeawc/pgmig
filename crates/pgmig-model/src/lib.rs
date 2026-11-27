@@ -99,9 +99,10 @@ pub struct Table {
     /// The table is a partition (`relispartition`) of another one. A partition holds only what is
     /// its own: the columns, constraints and indexes it has from its parent are the parent's, so
     /// [`Table::columns`] lists only the columns that differ from the parent's (see
-    /// [`partition_column_differs`]), and its constraints and indexes leave out those
-    /// [`inherited_constraint`] and [`inherited_index`] match. Absent from older JSON, and left out
-    /// of it when `None`: not a partition.
+    /// [`partition_column_differs`]), and its constraints and indexes only those the catalog does
+    /// not mark as the parent's (on pgmem, which leaves the marks unset, those
+    /// [`inherited_constraint`] and [`inherited_index`] do not match). Absent from older JSON, and
+    /// left out of it when `None`: not a partition.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partition_of: Option<PartitionOf>,
 }
@@ -120,7 +121,14 @@ pub struct PartitionOf {
 /// so the partition's model lists it: a different type, `NOT NULL` or default, or a comment of its
 /// own (Postgres does not copy comments to partitions). Identity is the parent's.
 pub fn partition_column_differs(child: &Column, parent: &Column) -> bool {
-    child.type_name != parent.type_name || child.not_null != parent.not_null || child.default != parent.default || child.comment.is_some()
+    partition_column_own(child, parent) || child.comment.is_some()
+}
+
+/// Whether a partition's column `child` differs from its parent's column `parent` in what Postgres
+/// keeps in step with the parent (type, `NOT NULL`, default). A column that differs only by its
+/// comment is the parent's, with a comment of the partition's.
+pub fn partition_column_own(child: &Column, parent: &Column) -> bool {
+    child.type_name != parent.type_name || child.not_null != parent.not_null || child.default != parent.default
 }
 
 /// Whether constraint `child` of a partition is the one it has from its parent's constraint

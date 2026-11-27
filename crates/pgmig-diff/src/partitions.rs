@@ -5,9 +5,14 @@
 //! `DETACH PARTITION` or must be before `ATTACH PARTITION`: [`prepare`] puts those tables in
 //! copies of the two models, and the diff compares the copies.
 
-use pgmig_model::{Constraint, ConstraintKind, Model, PartitionOf, QualName, Table, inherited_constraint, inherited_index, quote_ident};
+use std::collections::{BTreeMap, BTreeSet};
 
-use crate::Change;
+use pgmig_model::{
+    Constraint, ConstraintKind, Model, PartitionOf, QualName, Table, inherited_constraint, inherited_index, partition_column_own,
+    quote_ident,
+};
+
+use crate::{Change, CommentTarget};
 
 /// The models to compare and the partition changes to add to what they differ in.
 pub(crate) struct Prepared {
@@ -18,10 +23,19 @@ pub(crate) struct Prepared {
 
 /// See the module doc. Partition changes that cannot be planned are
 /// [`Change::UnsupportedPartitionChange`]; the table is then compared as it is.
+///
+/// A partition's column that differs from its parent's only by a comment is the parent's: it is
+/// left out of the copies, and its comment is set with `COMMENT ON COLUMN` here.
 pub(crate) fn prepare(a: &Model, b: &Model) -> Prepared {
-    let mut out = Prepared { a: a.clone(), b: b.clone(), changes: Vec::new() };
-    for (name, new) in &b.tables {
-        let Some(old) = a.tables.get(name) else {
+    let (sa, comments_a) = split_comments(a);
+    let (sb, comments_b) = split_comments(b);
+    let mut out = Prepared { a: sa, b: sb, changes: Vec::new() };
+    let (sa, sb) = (out.a.clone(), out.b.clone());
+    for (name, new) in &sb.tables {
+        if new.partition_of.is_some() && sa.tables.get(name).is_none_or(|old| old.partition_of.is_some()) {
+            column_comments(name, &comments_a, &comments_b, &mut out.changes);
+        }
+        let Some(old) = sa.tables.get(name) else {
             if new.partition_of.is_some() && !new.columns.is_empty() {
                 out.changes.push(unsupported(
                     name,
@@ -51,6 +65,47 @@ pub(crate) fn prepare(a: &Model, b: &Model) -> Prepared {
         }
     }
     out
+}
+
+/// Comments by partition and column name.
+type Comments = BTreeMap<(QualName, String), String>;
+
+/// `m` without the partitions' columns that differ from their parent's only by a comment
+/// ([`partition_column_own`]), and those columns' comments.
+fn split_comments(m: &Model) -> (Model, Comments) {
+    let mut out = m.clone();
+    let mut comments = Comments::new();
+    for t in out.tables.values_mut() {
+        let Some(parent) = t.partition_of.as_ref().and_then(|p| m.table_columns(&p.parent)) else { continue };
+        let name = t.name.clone();
+        t.columns.retain(|c| match parent.iter().find(|p| p.name == c.name) {
+            Some(p) if !partition_column_own(c, p) => {
+                if let Some(comment) = &c.comment {
+                    comments.insert((name.clone(), c.name.clone()), comment.clone());
+                }
+                false
+            }
+            _ => true,
+        });
+    }
+    (out, comments)
+}
+
+/// `COMMENT ON COLUMN` for partition `table`'s columns whose comments differ between `a` and `b`.
+fn column_comments(table: &QualName, a: &Comments, b: &Comments, changes: &mut Vec<Change>) {
+    let of = |m: &Comments| -> BTreeMap<String, String> {
+        m.iter().filter(|((t, _), _)| t == table).map(|((_, c), comment)| (c.clone(), comment.clone())).collect()
+    };
+    let (old, new) = (of(a), of(b));
+    let columns: BTreeSet<&String> = old.keys().chain(new.keys()).collect();
+    for column in columns {
+        if old.get(column) != new.get(column) {
+            changes.push(Change::SetComment {
+                target: CommentTarget::Column { table: table.clone(), column: column.clone() },
+                comment: new.get(column).cloned(),
+            });
+        }
+    }
 }
 
 fn unsupported(name: &QualName, detail: String) -> Change {
@@ -160,8 +215,9 @@ fn detach(a: &Model, old: &Table, o: &PartitionOf, out: &mut Prepared) {
 }
 
 /// A standalone table of `a` that is a partition in `b`: the table is first made what `ATTACH
-/// PARTITION` needs (its columns those of the parent; constraints and indexes the parent gives it
-/// are kept when it has them already, as Postgres adopts them), then attached.
+/// PARTITION` needs (its columns those of the parent, its parent's checks added; constraints and
+/// indexes the parent gives it are kept when it has them already, as Postgres adopts them), then
+/// attached.
 fn attach(b: &Model, old: &Table, new: &Table, n: &PartitionOf, out: &mut Prepared) {
     let name = &new.name;
     if !new.columns.is_empty() {
@@ -183,6 +239,13 @@ fn attach(b: &Model, old: &Table, new: &Table, n: &PartitionOf, out: &mut Prepar
     for c in &old.constraints {
         if attached.constraint(&c.name).is_none() && ancestors.iter().any(|t| t.constraints.iter().any(|pc| inherited_constraint(pc, c))) {
             attached.constraints.push(c.clone());
+        }
+    }
+    // `ATTACH PARTITION` requires the table to have its parent's checks, by name and definition:
+    // those it lacks are added first.
+    for c in ancestors.iter().flat_map(|t| &t.constraints).filter(|c| c.kind == ConstraintKind::Check) {
+        if attached.constraint(&c.name).is_none() {
+            attached.constraints.push(Constraint { on_partitioned_table: new.partition_key.is_some(), ..c.clone() });
         }
     }
     for i in &old.indexes {
