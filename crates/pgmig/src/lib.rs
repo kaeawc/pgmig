@@ -780,8 +780,8 @@ struct Diffed {
     /// The changes the policy left out.
     skipped: Vec<Skipped>,
     plan: Plan,
-    /// `from`'s model, all of it but the revisions schema: what `--verify` copies
-    /// ([`Current::Model`]).
+    /// What `--verify` copies ([`Current::Model`]): `from`'s managed objects and what they need
+    /// ([`clean::with_needs`]).
     current: Model,
     /// `to`'s model, as the options manage it: what `--verify` checks the result against.
     to: Model,
@@ -794,6 +794,7 @@ fn diff_sources(from: &Source, to: &Source, shadow: &ShadowSpec, opts: &Options,
     // `from`'s shadow is wiped before `to`'s opens: a real Postgres shadow must start empty.
     let current = without_schema(&load_model(from, shadow)?, &opts.revisions_schema);
     let a = opts.managed(&current);
+    let current = clean::with_needs(&current, &a);
     let (b, mut loaded) = open_model(to, shadow)?;
     let b = opts.managed(&b);
     let (changes, skipped) = opts.apply_policy(&diff_with_casts(&a, &b, loaded.conn()), names);
@@ -865,13 +866,14 @@ fn plan_apply_changes(target: &str, desired: &Source, shadow: &ShadowSpec, opts:
 
 /// `schema apply --verify`: check that `plan` (as planned or edited), applied in a fresh shadow
 /// database to a copy of the database at `target`, makes it `desired` but for the changes the policy
-/// skips ([`verify_plan`]). The copy is rebuilt from the target's model, all of it but the
-/// revisions schema ([`Current::Model`]). `target` is only read.
+/// skips ([`verify_plan`]). The copy is the target's managed objects and what they need
+/// ([`Current::Model`]). `target` is only read.
 pub fn schema_verify(target: &str, desired: &Source, plan: &Plan, shadow: &ShadowSpec, opts: &Options) -> Result<()> {
     opts.validate()?;
     let mut conn = Conn::connect(target)?;
-    let current = without_schema(&inspect(&mut conn)?, &opts.revisions_schema);
+    let full = without_schema(&inspect(&mut conn)?, &opts.revisions_schema);
     drop(conn);
+    let current = clean::with_needs(&full, &opts.managed(&full));
     let to = opts.managed(&load_model(desired, shadow)?);
     verify_plan(Current::Model(&current), plan, &to, shadow, opts)
 }

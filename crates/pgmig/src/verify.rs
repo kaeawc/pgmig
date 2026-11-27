@@ -8,8 +8,12 @@
 //! - A migration directory (`migrate diff`) is replayed, every file executed as written, so the
 //!   copy is faithful: extensions, functions, views and anything else the files create are there.
 //! - A live database (`schema apply`) can only be rebuilt from what pgmig models: the plan from a
-//!   new database to its model (all of it but the revisions schema, not only the managed part, so
-//!   a managed table's foreign key to an unmanaged one has its target). Objects pgmig does not model
+//!   new database to a model of the objects the options manage, plus what they need (the closure
+//!   `schema clean` keeps: schemas, foreign-key target tables, enums, domains, composites and
+//!   sequences they use, transitively) and the unmanaged tables that hold a foreign key to a
+//!   managed table, with what those need. Other unmanaged objects are not copied, so one that uses
+//!   something pgmig does not model cannot break setup; and dropping a managed table an unmanaged
+//!   table references fails verification as it fails for real. Objects pgmig does not model
 //!   (extensions, functions, views, ...) are not copied; a statement that needs one fails setup
 //!   ([`Error::VerifySetup`]).
 //!
@@ -32,8 +36,8 @@ use crate::{Change, Conn, Error, MigrationDir, Model, Options, Plan, PlanOptions
 /// The current state a plan under test starts from, copied into the shadow database.
 #[derive(Debug, Clone, Copy)]
 pub enum Current<'a> {
-    /// A live database's model, rebuilt from what pgmig models: all of it but the revisions
-    /// schema ([`crate::without_schema`]), not only what the options manage.
+    /// A live database's model, rebuilt from what pgmig models: the managed objects, what they
+    /// need and the unmanaged tables referencing them ([`crate::clean::with_needs`]).
     Model(&'a Model),
     /// A migration directory, replayed file by file; `None` is a directory that does not exist
     /// yet (an empty state).
