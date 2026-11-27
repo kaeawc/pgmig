@@ -1,5 +1,6 @@
 //! The concurrent index policy (`Options::concurrent_indexes`): plans with statements outside a
-//! transaction apply, verify and become migration files, one per unit.
+//! transaction apply, verify and become migration files, one per unit; keys are added by building
+//! their index concurrently and attaching it with `USING INDEX`.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -506,4 +507,123 @@ fn a_failed_concurrent_build_in_a_migration_file_names_the_index_to_drop() {
     let err = migrate_apply(&db.conninfo, &t.dir(), &ApplyOptions::default()).expect_err("in a transaction");
     assert!(matches!(&err, Error::MigrationFailed { source, .. } if source.code.as_deref() == Some("25001")), "{err}");
     assert!(!err.to_string().contains("INVALID"), "{err}");
+}
+
+/// The primary key and unique constraints of `db` as `(constraint, index, indisvalid)`: the index
+/// each one owns (`conindid`).
+fn key_indexes(db: &TestDb) -> Vec<(String, String, bool)> {
+    let rows = db
+        .connect()
+        .query(
+            "SELECT co.conname, i.relname, x.indisvalid FROM pg_constraint co \
+             JOIN pg_class i ON i.oid = co.conindid JOIN pg_index x ON x.indexrelid = co.conindid \
+             JOIN pg_namespace n ON n.oid = i.relnamespace WHERE co.contype IN ('p', 'u') AND n.nspname = 'public' ORDER BY 1",
+        )
+        .expect("query constraints");
+    rows.into_iter().map(|r| (r[0].clone().expect("name"), r[1].clone().expect("index"), r[2].as_deref() == Some("t"))).collect()
+}
+
+#[test]
+fn schema_apply_adds_a_key_by_building_its_index_concurrently_and_attaching_it() {
+    let db = target(
+        "CREATE TABLE t (id int NOT NULL, a int); CREATE TABLE c (id int, t_a int); \
+         INSERT INTO t VALUES (1, 10), (2, 20);",
+    );
+    let t = Tmp::new();
+    let (spec, _keep) = shadow();
+    let desired = t.sql(
+        "CREATE TABLE t (id int PRIMARY KEY, a int, CONSTRAINT t_a_key UNIQUE (a));\n\
+         CREATE TABLE c (id int, t_a int CONSTRAINT c_t_a_fkey REFERENCES t (a));",
+    );
+
+    let plan = schema_plan_apply(&db.conninfo, &desired, &spec, &concurrent()).expect("plan");
+    assert_eq!(
+        plan.statements,
+        [
+            "CREATE UNIQUE INDEX CONCURRENTLY t_a_key ON public.t USING btree (a)",
+            "ALTER TABLE public.t ADD CONSTRAINT t_a_key UNIQUE USING INDEX t_a_key",
+            // After the key it uses, in the transaction that attaches it.
+            "ALTER TABLE public.c ADD CONSTRAINT c_t_a_fkey FOREIGN KEY (t_a) REFERENCES public.t(a)",
+            "CREATE UNIQUE INDEX CONCURRENTLY t_pkey ON public.t USING btree (id)",
+            "ALTER TABLE public.t ADD CONSTRAINT t_pkey PRIMARY KEY USING INDEX t_pkey",
+        ],
+        "{}",
+        plan.to_sql()
+    );
+    let units: Vec<bool> = plan.units().iter().map(|u| u.transactional).collect();
+    assert_eq!(units, [false, true, false, true]);
+
+    let report = apply(&db.conninfo, &plan).expect("apply");
+    assert_eq!((report.statements, report.batches, report.non_transactional), (5, 2, 2));
+    // Each constraint owns the index built for it, under its own name, and the index is valid.
+    assert_eq!(key_indexes(&db), [("t_a_key".into(), "t_a_key".into(), true), ("t_pkey".into(), "t_pkey".into(), true)]);
+    let again = schema_plan_apply(&db.conninfo, &desired, &spec, &concurrent()).expect("plan again");
+    assert!(again.is_empty(), "changes left after apply:\n{}", again.to_sql());
+}
+
+#[test]
+fn a_failed_key_build_says_how_to_remove_the_invalid_index_and_leaves_the_constraint_out() {
+    let db = target("CREATE TABLE t (id int, a int); INSERT INTO t VALUES (1, 7), (2, 7);");
+    let t = Tmp::new();
+    let (spec, _keep) = shadow();
+    let desired = t.sql("CREATE TABLE t (id int, a int, CONSTRAINT t_a_key UNIQUE (a));");
+    let plan = schema_plan_apply(&db.conninfo, &desired, &spec, &concurrent()).expect("plan");
+    assert_eq!(plan.non_transactional, [0], "{}", plan.to_sql());
+
+    let err = apply(&db.conninfo, &plan).expect_err("duplicates");
+    let Error::Apply { statement_index, source, outside_transaction, .. } = &err else { panic!("{err}") };
+    assert_eq!((*statement_index, *outside_transaction), (Some(0), true));
+    assert_eq!(source.code.as_deref(), Some("23505"), "{source}");
+    let msg = err.to_string();
+    assert!(msg.contains("INVALID index") && msg.contains("DROP INDEX CONCURRENTLY public.t_a_key"), "{msg}");
+    assert!(key_indexes(&db).is_empty());
+    // Postgres leaves the failed build behind, INVALID (pgmem leaves nothing, kaeawc/pgmem#279).
+    if postgres_dsn().is_some() {
+        assert_eq!(indexes(&db), [("t_a_key".into(), false)]);
+        db.connect().batch("DROP INDEX CONCURRENTLY public.t_a_key").expect("the suggested statement");
+    }
+    assert!(indexes(&db).is_empty());
+}
+
+#[test]
+fn migrate_diff_writes_a_key_as_a_file_without_a_transaction_then_a_transactional_one() {
+    let t = Tmp::new();
+    let (spec, _keep) = shadow();
+    let base = t.sql("CREATE TABLE t (id int, a int);");
+    pgmig::migrate_diff(&t.dir(), "init", &base, &spec, &Options::default()).expect("init");
+
+    let to = t.sql("CREATE TABLE t (id int, a int, CONSTRAINT t_a_key UNIQUE (a));");
+    let res = pgmig::migrate_diff_with(&t.dir(), "a key", &to, &spec, &concurrent(), None, true).expect("diff");
+    assert_eq!(res.written.len(), 2, "{}", res.sql);
+    let names: Vec<String> = res.written.iter().map(|w| w.path.file_name().expect("name").to_string_lossy().into_owned()).collect();
+    assert_eq!(
+        t.read(&names[0]),
+        "-- pgmig:txmode none\n-- Runs outside a transaction: Postgres refuses this statement inside one.\n\
+         CREATE UNIQUE INDEX CONCURRENTLY t_a_key ON public.t USING btree (a);\n"
+    );
+    assert_eq!(t.read(&names[1]), "ALTER TABLE public.t ADD CONSTRAINT t_a_key UNIQUE USING INDEX t_a_key;\n");
+    pgmig::migrate_validate(&t.dir(), None).expect("sum file matches");
+
+    let db = TestDb::new();
+    let report = migrate_apply(&db.conninfo, &t.dir(), &ApplyOptions::default()).expect("migrate apply");
+    assert_eq!(report.applied, 3);
+    assert_eq!(key_indexes(&db), [("t_a_key".into(), "t_a_key".into(), true)]);
+    assert!(pgmig::schema_diff(&Source::Database(db.conninfo.clone()), &to, &spec, &Options::default()).expect("diff").is_empty());
+}
+
+#[test]
+fn constraints_are_inspected_with_the_index_they_own() {
+    let db = TestDb::new();
+    db.connect()
+        .batch("CREATE TABLE t (id int PRIMARY KEY, a int UNIQUE, b int CHECK (b > 0)); CREATE TABLE p (id int, UNIQUE (id)) PARTITION BY RANGE (id);")
+        .expect("tables");
+    let model = pgmig::inspect(&mut db.connect()).expect("inspect");
+    let t = &model.tables[&pgmig_model::QualName::new("public", "t")];
+    let index = |name: &str| t.constraint(name).expect("constraint").index_definition.clone();
+    assert_eq!(index("t_pkey").as_deref(), Some("CREATE UNIQUE INDEX t_pkey ON public.t USING btree (id)"));
+    assert_eq!(index("t_a_key").as_deref(), Some("CREATE UNIQUE INDEX t_a_key ON public.t USING btree (a)"));
+    assert_eq!(index("t_b_check"), None);
+    assert!(t.constraints.iter().all(|c| !c.on_partitioned_table));
+    let p = &model.tables[&pgmig_model::QualName::new("public", "p")];
+    assert!(p.constraints.iter().all(|c| c.on_partitioned_table), "{:?}", p.constraints);
 }

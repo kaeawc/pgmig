@@ -169,6 +169,9 @@ pub fn canonical(model: &Model) -> String {
                 columns: _,
                 references: _,
                 comment,
+                // The definition already says what the index is; the table says it is partitioned.
+                index_definition: _,
+                on_partitioned_table: _,
             } = c;
             w.tag("constraint").str(name).raw(kind(*k)).str(definition).opt(comment).end();
         }
@@ -329,6 +332,8 @@ mod tests {
             columns: vec!["id".into()],
             references: None,
             comment: Some("the key".into()),
+            index_definition: None,
+            on_partitioned_table: false,
         };
         let fk = Constraint {
             name: "users_team_fkey".into(),
@@ -340,6 +345,8 @@ mod tests {
             columns: vec!["team".into()],
             references: Some(References { table: t(), columns: vec!["id".into()], constraint: Some("users_pkey".into()) }),
             comment: None,
+            index_definition: None,
+            on_partitioned_table: false,
         };
         let indexes = vec![
             Index {

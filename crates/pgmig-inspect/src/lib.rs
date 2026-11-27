@@ -224,7 +224,8 @@ fn inspect_catalog(conn: &mut Conn) -> Result<Model> {
     // `NOT NULL` constraints (`n`, Postgres 18) are `attnotnull`; inherited ones are the parent's.
     let constraints = format!(
         "SELECT n.nspname, cl.relname, co.conname, co.contype, pg_get_constraintdef(co.oid), co.condeferrable, co.condeferred, \
-                co.convalidated, co.conkey, fn.nspname, fc.relname, co.confkey, ci.relname, obj_description(co.oid, 'pg_constraint') \
+                co.convalidated, co.conkey, fn.nspname, fc.relname, co.confkey, ci.relname, obj_description(co.oid, 'pg_constraint'), \
+                CASE WHEN co.contype IN ('p', 'u') THEN pg_get_indexdef(co.conindid) END, cl.relkind = 'p' \
          FROM pg_constraint co \
          JOIN pg_class cl ON cl.oid = co.conrelid \
          JOIN pg_namespace n ON n.oid = cl.relnamespace \
@@ -265,6 +266,8 @@ fn inspect_catalog(conn: &mut Conn) -> Result<Model> {
             columns: names(&table, 8),
             references,
             comment: row.get(13).cloned().flatten(),
+            index_definition: row.get(14).cloned().flatten(),
+            on_partitioned_table: text(&row, 15, what)? == "t",
         };
         if let Some(t) = model.tables.get_mut(&table) {
             t.constraints.push(constraint);

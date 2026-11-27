@@ -3,6 +3,7 @@
 sequences/drop_owner_of_shared_sequence  # kaeawc/pgmem#203
 constraints/check_no_inherit  # kaeawc/pgmem#215
 constraints/unique_nulls_not_distinct_include  # kaeawc/pgmem#214
+constraints/concurrent_unique_include  # kaeawc/pgmem#214
 indexes/access_methods  # kaeawc/pgmem#192
 indexes/covering  # kaeawc/pgmem#148
 indexes/key_options  # kaeawc/pgmem#248
