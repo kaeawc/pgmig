@@ -45,6 +45,7 @@ fn a_cleaned_database_equals_a_new_one() {
     let db = target(POPULATED);
     let c = clean(&db, &Options::default());
     assert!(!c.database.is_empty());
+    assert!(c.local, "the test database is on this machine (server address {:?})", c.server_address);
     assert!(c.kept.is_empty(), "{:?}", c.kept);
     assert_eq!(managed(&db), Model::empty_database());
     assert_eq!(fingerprint(&db), fingerprint(&TestDb::new()));
