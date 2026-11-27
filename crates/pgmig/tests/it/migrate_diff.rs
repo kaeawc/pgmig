@@ -252,3 +252,61 @@ fn api_reports_the_file_written() {
     let new = api::migrate_new(&api::MigrateNewRequest { dir: t.dir(), name: "next".into() }).expect("new");
     assert!(new.file.ends_with(format!("{}_next.sql", new.version)));
 }
+
+/// A directory of the given migrations, hashed, replayed as a source.
+fn replay_files(t: &Tmp, files: &[(&str, &str)], spec: &ShadowSpec) -> pgmig::Result<pgmig::Plan> {
+    for (name, sql) in files {
+        t.migration(name, sql);
+    }
+    pgmig::migrate_hash(&t.dir()).expect("hash");
+    let to = t.desired("");
+    pgmig::schema_diff(&Source::Migrations(t.dir()), &to, spec, &Options::default())
+}
+
+const ENUM: &str = "CREATE TYPE mood AS ENUM ('sad');\n";
+const ADD_AND_USE: &str = "ALTER TYPE mood ADD VALUE 'ok';\nCREATE TABLE t (m mood DEFAULT 'ok');\n";
+
+/// What `migrate apply` refuses in one transaction, replay refuses too; a commit point fixes it.
+#[test]
+fn replay_runs_a_file_in_one_transaction_split_at_commit_points() {
+    let (spec, _db) = shadow();
+    let t = Tmp::new();
+    let one = replay_files(&t, &[("1_mood.sql", ENUM), ("2_use.sql", ADD_AND_USE)], &spec);
+    let split = "ALTER TYPE mood ADD VALUE 'ok';\n-- pgmig:commit\nCREATE TABLE t (m mood DEFAULT 'ok');\n";
+    let t2 = Tmp::new();
+    let two = replay_files(&t2, &[("1_mood.sql", ENUM), ("2_use.sql", split)], &spec);
+    two.expect("a commit point lets the new value be used");
+    if postgres_dsn().is_some() {
+        match one.expect_err("55P04 in one transaction") {
+            Error::Load { path, source, .. } => {
+                assert!(path.ends_with("2_use.sql"), "{path:?}");
+                assert_eq!(source.code.as_deref(), Some("55P04"), "{source}");
+            }
+            e => panic!("{e}"),
+        }
+    } else {
+        // pgmem allows using a value added in the same transaction (kaeawc/pgmem#181).
+        one.expect("pgmem does not raise 55P04");
+    }
+}
+
+/// Without a transaction a statement that cannot run in one replays; in one it does not.
+#[test]
+fn replay_honours_txmode_none() {
+    let (spec, _db) = shadow();
+    let cic = "CREATE TABLE t (id int);\nCREATE INDEX CONCURRENTLY t_id ON t (id);\n";
+    let t = Tmp::new();
+    replay_files(&t, &[("1_t.sql", &format!("-- pgmig:txmode none\n\n{cic}"))], &spec).expect("txmode none replays");
+    let t2 = Tmp::new();
+    let r = replay_files(&t2, &[("1_t.sql", cic)], &spec);
+    let err = r.expect_err("CREATE INDEX CONCURRENTLY in a transaction");
+    assert!(matches!(&err, Error::Load { source, .. } if source.code.as_deref() == Some("25001")), "{err}");
+}
+
+#[test]
+fn replay_refuses_a_misplaced_directive_like_migrate_apply() {
+    let (spec, _db) = shadow();
+    let t = Tmp::new();
+    let r = replay_files(&t, &[("1_t.sql", "CREATE TABLE a (id int);\n-- pgmig:txmode none\nCREATE TABLE b (id int);\n")], &spec);
+    assert!(matches!(r, Err(Error::Directive { .. })), "{r:?}");
+}
