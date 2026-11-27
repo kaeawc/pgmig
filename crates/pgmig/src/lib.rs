@@ -20,6 +20,7 @@ pub mod filter;
 pub mod migrate_apply;
 pub mod migrate_maintain;
 pub mod migrate_status;
+pub mod saved_plan;
 pub mod verify;
 
 pub use clean::{Kept, SchemaClean, clean_confirmed, clean_desired, schema_plan_clean};
@@ -49,6 +50,7 @@ pub use pgmig_migrate::{Dir as MigrationDir, SUM_FILE, SumFile, SumLine, Validat
 pub use pgmig_model::{Model, fingerprint};
 pub use pgmig_plan::{Cause as SkipCause, Plan, PlanOptions, Skipped, Unit as PlanUnit, plan, plan_with};
 pub use pgmig_shadow::{PUBLIC_COMMENT as PUBLIC_SCHEMA_COMMENT_SQL, Shadow};
+pub use saved_plan::{SavedApplied, SavedPlan, apply_saved, check_saved, schema_plan_saved};
 pub use verify::{Current, verify_migration_sql, verify_plan};
 
 #[derive(Debug, thiserror::Error)]
@@ -226,6 +228,29 @@ pub enum Error {
          the target was not changed"
     )]
     VerifySetup { statement: String, source: pgmig_conn::Error },
+    /// A saved plan file that cannot be used: not a plan file, a format this version does not
+    /// read, or SQL that is not the plan's statements.
+    #[error("saved plan: {0}")]
+    SavedPlan(String),
+    /// `schema apply --plan`: the target's managed schema is not what the plan was made from.
+    #[error(
+        "the plan is stale: it was made from a schema with fingerprint {expected}, but the target's managed schema now has {actual}; \
+         nothing was applied; plan again to review what would change now{note}"
+    )]
+    PlanStale {
+        expected: String,
+        actual: String,
+        /// Empty, or why the fingerprint may differ without the schema changing: the plan was made
+        /// by another version of pgmig.
+        note: String,
+    },
+    /// `schema apply --plan`: the plan was applied, and the target's managed schema is not the one
+    /// it was planned to make.
+    #[error(
+        "applied {statements} statements, but the target's managed schema now has fingerprint {actual}, not the planned {expected}; \
+         the changes stay applied: compare the target with the desired state to see what differs"
+    )]
+    PlanDiverged { expected: String, actual: String, statements: usize },
 }
 
 fn apply_message(
@@ -978,6 +1003,8 @@ struct Diffed {
     current: Model,
     /// `to`'s model, as the options manage it: what `--verify` checks the result against.
     to: Model,
+    /// The fingerprint of `from`'s managed objects, as inspected for this diff.
+    from_fingerprint: String,
 }
 
 /// The changes that turn `from` into `to` for the objects `opts` manages, under its policy, and
@@ -992,7 +1019,7 @@ fn diff_sources(from: &Source, to: &Source, shadow: &ShadowSpec, opts: &Options,
     let b = opts.managed(&b);
     let (changes, skipped) = opts.apply_policy(&diff_with_casts(&a, &b, loaded.conn()), names);
     let plan = plan_with(&changes, names)?;
-    Ok(Diffed { changes, skipped, plan, current, to: b })
+    Ok(Diffed { changes, skipped, plan, current, to: b, from_fingerprint: pgmig_model::fingerprint(&a) })
 }
 
 /// `diff(a, b)`, with each type change that has no assignment cast converting `USING` an explicit

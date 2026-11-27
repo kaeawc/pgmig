@@ -20,6 +20,7 @@ mod migrate_status;
 mod policy;
 mod quoting;
 mod revisions;
+mod saved_plan;
 mod search_path;
 mod support;
 mod types;

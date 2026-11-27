@@ -8,6 +8,18 @@ and versions follow [Semantic Versioning](https://semver.org/). Add entries unde
 
 ### Added
 
+- Saved plans: `pgmig schema plan --url <db> --to <desired> --out plan.json` writes the plan
+  `schema apply` would run (same flags, `--verify` included) as a versioned JSON file with its SQL
+  and the `h1:` fingerprints of the database it was planned for (`from`) and of the desired state
+  (`to`), plus the options that scope them. `pgmig schema apply --url <db> --plan plan.json` runs it
+  only if the database's managed schema still has fingerprint `from`: otherwise it is refused with
+  `plan_stale` (naming both fingerprints) and nothing is applied. A file whose `sql` is not its
+  plan's script is refused (`saved_plan`), so the reviewed SQL is the SQL that runs; after applying,
+  a result that is not `to` fails with `plan_diverged`. `--plan` conflicts with `--to`, the filter,
+  schema and policy flags, `--verify` and `--edit`. Library: `pgmig::SavedPlan`, `schema_plan_saved`,
+  `check_saved`, `apply_saved`; `api::schema_plan`, `api::apply_saved` (`SchemaPlanRequest`,
+  `ApplySavedRequest`).
+
 - `pgmig drift check --url <db>`: compare a live database with the migration directory at the
   version its revisions table records (`--dir`, or `[migrations] dir`: the applied files are replayed
   in the shadow database in the order they ran, a file that stopped part way only as far as it was

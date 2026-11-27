@@ -11,4 +11,5 @@ mod filters;
 mod json;
 mod migrate;
 mod policy;
+mod saved_plan;
 mod support;

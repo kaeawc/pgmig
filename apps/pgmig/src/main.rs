@@ -469,6 +469,31 @@ enum SchemaCommand {
         #[command(flatten)]
         format: FormatArg,
     },
+    /// Plan what `schema apply` would do and save it as a plan file: the SQL, and the fingerprints
+    /// of the database it was planned for and of the desired state. `schema apply --plan` runs the
+    /// file only if the database still has that fingerprint, so the SQL that was reviewed is the SQL
+    /// that runs. The database is only read. Prints the file to stdout without --out.
+    Plan {
+        /// The database to plan for.
+        #[arg(long)]
+        url: Option<String>,
+        /// SQL file, directory of SQL files, migration directory, or database URL.
+        #[arg(long)]
+        to: Option<String>,
+        #[command(flatten)]
+        shadow: ShadowArg,
+        #[command(flatten)]
+        scope: ScopeArgs,
+        #[command(flatten)]
+        skip: PolicyArg,
+        #[command(flatten)]
+        verify: VerifyArg,
+        /// Write the plan file here instead of printing it.
+        #[arg(long, value_name = "FILE")]
+        out: Option<PathBuf>,
+        #[command(flatten)]
+        format: FormatArg,
+    },
     /// Change a live database to match a desired state: show the plan, ask, execute.
     Apply {
         /// The database to change.
@@ -477,6 +502,17 @@ enum SchemaCommand {
         /// SQL file, directory of SQL files, migration directory, or database URL.
         #[arg(long)]
         to: Option<String>,
+        /// Run a plan file written by `schema plan` instead of planning: refused, with nothing
+        /// applied, when the database's managed schema is no longer the one the file was planned
+        /// for. The file carries its own filters, schema mode and policy, so none of those flags,
+        /// nor --to, --edit or --verify, can be given. Between the check and the first statement
+        /// the database is not locked.
+        #[arg(
+            long,
+            value_name = "FILE",
+            conflicts_with_all = ["to", "shadow", "include", "exclude", "schema", "skip", "concurrent_indexes", "no_concurrent_indexes", "edit", "verify", "no_verify"]
+        )]
+        plan: Option<PathBuf>,
         #[command(flatten)]
         shadow: ShadowArg,
         #[command(flatten)]
@@ -764,6 +800,7 @@ impl Cli {
                 SchemaCommand::Diff { format, .. }
                 | SchemaCommand::Inspect { format, .. }
                 | SchemaCommand::Fingerprint { format, .. }
+                | SchemaCommand::Plan { format, .. }
                 | SchemaCommand::Apply { format, .. }
                 | SchemaCommand::Clean { format, .. }
                 | SchemaCommand::Validate { format, .. },
@@ -933,7 +970,24 @@ fn run(cli: Cli, loaded: &Loaded, format: Format) -> anyhow::Result<ExitCode> {
     };
     let s = settings;
     match command {
-        SchemaCommand::Apply { url, to, shadow, scope, skip, dry_run, auto_approve, edit, verify, format: _, exit_code } => {
+        SchemaCommand::Plan { url, to, shadow, scope, skip, verify, out, format: _ } => {
+            let (target, shown) = target(url, loaded)?;
+            let req = api::SchemaPlanRequest {
+                target,
+                desired: Source::parse(&need(to, s.to.clone(), "--to", "to")?),
+                shadow: shadow.spec(s),
+                options: skip.add_to(scope.options(s)?, s)?,
+                verify: verify.on(s),
+            };
+            return schema_plan(&req, &shown, out.as_deref(), format);
+        }
+        SchemaCommand::Apply { url, to, plan: Some(file), dry_run, auto_approve, format: _, exit_code, .. } => {
+            debug_assert!(to.is_none());
+            let (target, shown) = target(url, loaded)?;
+            let saved = pgmig::SavedPlan::read(&file).map_err(ApiError::from)?;
+            return schema_apply_saved(api::ApplySavedRequest { target, plan: saved }, &shown, dry_run, auto_approve, exit_code, format);
+        }
+        SchemaCommand::Apply { url, to, plan: None, shadow, scope, skip, dry_run, auto_approve, edit, verify, format: _, exit_code } => {
             if edit {
                 check_edit(format)?;
             }
@@ -1424,6 +1478,140 @@ struct ApplyFlags {
     exit_code: bool,
 }
 
+/// Asks before a plan of `n` statements is applied, unless `auto_approve`; an error when it cannot
+/// ask (no terminal, or JSON output) or the answer is not yes.
+fn confirm_apply(n: usize, auto_approve: bool, json: bool) -> anyhow::Result<()> {
+    if auto_approve {
+        return Ok(());
+    }
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!("stdin is not a terminal, so pgmig cannot ask before applying; pass --auto-approve to apply without asking");
+    }
+    if json {
+        anyhow::bail!("--format json never asks before applying; pass --auto-approve to apply without asking, or --dry-run");
+    }
+    eprint!("Apply these {n} statements to this database? [y/N] ");
+    std::io::stderr().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().lock().read_line(&mut answer)?;
+    if !matches!(answer.trim(), "y" | "Y" | "yes" | "Yes" | "YES") {
+        anyhow::bail!("not applied");
+    }
+    Ok(())
+}
+
+/// `schema plan`: saves the plan to `out`, or prints the file's text.
+fn schema_plan(req: &api::SchemaPlanRequest, target: &Target, out: Option<&Path>, format: Format) -> anyhow::Result<ExitCode> {
+    let saved = api::schema_plan(req)?;
+    let text = saved.to_json();
+    if format == Format::Text {
+        print_skipped(&saved.skipped);
+        if req.verify {
+            eprintln!("verified: in the shadow database the plan makes the desired state");
+        }
+    }
+    match out {
+        Some(path) => {
+            std::fs::write(path, &text).map_err(|e| anyhow::anyhow!("writing {}: {e}", path.display()))?;
+            if format == Format::Json {
+                print!("{text}");
+            } else {
+                let n = saved.plan.statements.len();
+                eprintln!(
+                    "wrote {}: {n} statement{} planned for {} ({} -> {})",
+                    path.display(),
+                    if n == 1 { "" } else { "s" },
+                    target.display,
+                    saved.from,
+                    saved.to
+                );
+            }
+        }
+        None => print!("{text}"),
+    }
+    std::io::stdout().flush()?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// What `schema apply --plan --format json` prints.
+#[derive(Serialize)]
+struct SavedApplyOutput<'a> {
+    target: &'a Target,
+    from: &'a str,
+    to: &'a str,
+    plan: &'a pgmig::Plan,
+    sql: &'a str,
+    applied: bool,
+    report: Option<pgmig::ApplyReport>,
+    /// The target's fingerprint after applying.
+    fingerprint: Option<String>,
+}
+
+/// `schema apply --plan`: checks the target against the file, shows its SQL, asks (unless told not
+/// to), applies it and checks the result.
+fn schema_apply_saved(
+    req: api::ApplySavedRequest,
+    target: &Target,
+    dry_run: bool,
+    auto_approve: bool,
+    exit_code: bool,
+    format: Format,
+) -> anyhow::Result<ExitCode> {
+    let json = format == Format::Json;
+    api::schema_check_saved(&req)?;
+    let saved = &req.plan;
+    let output = |applied, applied_to: Option<api::ApplySavedResponse>| SavedApplyOutput {
+        target,
+        from: &saved.from,
+        to: &saved.to,
+        plan: &saved.plan,
+        sql: &saved.sql,
+        applied,
+        fingerprint: applied_to.as_ref().map(|a| a.fingerprint.clone()),
+        report: applied_to.map(|a| a.report),
+    };
+    if saved.plan.is_empty() {
+        if json {
+            print_json(&output(false, None))?;
+        } else {
+            eprintln!("no changes");
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    if !json {
+        print!("{}", saved.sql);
+        std::io::stdout().flush()?;
+        eprintln!("Target: {} (from {})", target.display, target.source);
+        eprintln!("checked: the target still has the fingerprint the plan was made from ({})", saved.from);
+    }
+    if dry_run {
+        if json {
+            print_json(&output(false, None))?;
+        }
+        return Ok(if exit_code { ExitCode::from(CHANGES) } else { ExitCode::SUCCESS });
+    }
+    confirm_apply(saved.plan.statements.len(), auto_approve, json)?;
+    let done = api::apply_saved(&req)?;
+    let report = done.report;
+    if json {
+        print_json(&output(true, Some(done)))?;
+    } else {
+        match report.non_transactional {
+            0 => eprintln!("applied {} statements in {} transaction(s)", report.statements, report.batches),
+            k => eprintln!(
+                "applied {} statements: {} in {} transaction(s), {k} outside a transaction",
+                report.statements,
+                report.statements - k,
+                report.batches
+            ),
+        }
+        if done.compared {
+            eprintln!("the target now has the planned schema ({})", saved.to);
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 /// Shows the plan (with --edit, as edited), asks (unless told not to), then applies it. In JSON
 /// mode it never asks and prints one document at the end.
 fn schema_apply(req: api::PlanApplyRequest, target: &Target, flags: ApplyFlags, format: Format) -> anyhow::Result<ExitCode> {
@@ -1478,22 +1666,7 @@ fn schema_apply(req: api::PlanApplyRequest, target: &Target, flags: ApplyFlags, 
         }
         return Ok(dry_code);
     }
-    let n = res.plan.statements.len();
-    if !auto_approve {
-        if !std::io::stdin().is_terminal() {
-            anyhow::bail!("stdin is not a terminal, so pgmig cannot ask before applying; pass --auto-approve to apply without asking");
-        }
-        if json {
-            anyhow::bail!("--format json never asks before applying; pass --auto-approve to apply without asking, or --dry-run");
-        }
-        eprint!("Apply these {n} statements to this database? [y/N] ");
-        std::io::stderr().flush()?;
-        let mut answer = String::new();
-        std::io::stdin().lock().read_line(&mut answer)?;
-        if !matches!(answer.trim(), "y" | "Y" | "yes" | "Yes" | "YES") {
-            anyhow::bail!("not applied");
-        }
-    }
+    confirm_apply(res.plan.statements.len(), auto_approve, json)?;
     let report = api::apply(&api::ApplyRequest { target: req.target, plan: res.plan.clone() })?;
     if json {
         print_json(&ApplyOutput { target, plan: res, applied: true, report: Some(report) })?;
